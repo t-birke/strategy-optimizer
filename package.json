@@ -1,0 +1,19 @@
+{
+  "name": "strategy-optimizer",
+  "version": "1.0.0",
+  "description": "Standalone GA optimizer for trading strategies with local backtesting",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "ingest": "node data/ingest.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@duckdb/node-api": "^1.5.1-r.2",
+    "express": "^5.2.1",
+    "ga-island": "^3.1.1",
+    "ws": "^8.20.0"
+  }
+}

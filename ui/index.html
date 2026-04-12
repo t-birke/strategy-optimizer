@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Strategy Optimizer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <nav>
+    <h1>Strategy Optimizer</h1>
+    <a href="#data" class="nav-link active" data-page="data">Data</a>
+    <a href="#optimizer" class="nav-link" data-page="optimizer">Optimizer</a>
+  </nav>
+
+  <!-- ═══════════ DATA PAGE ═══════════ -->
+  <div id="page-data" class="page active">
+    <div class="card">
+      <h2>Add Symbol</h2>
+      <div class="form-row">
+        <input type="text" id="new-symbol" placeholder="BTCUSDT" style="width:160px">
+        <button id="btn-check">Check Binance</button>
+        <button id="btn-ingest" class="primary" disabled>Ingest</button>
+        <span id="check-result" style="font-size:13px;color:#8b949e"></span>
+      </div>
+      <div class="progress-bar" id="ingest-progress" style="display:none">
+        <div class="fill" style="width:0%"></div>
+      </div>
+      <div id="ingest-status" style="font-size:12px;color:#8b949e"></div>
+    </div>
+
+    <div class="card">
+      <h2 style="display:flex;align-items:center;justify-content:space-between">
+        Stored Data
+        <button id="btn-update-all">Update All</button>
+      </h2>
+      <table id="symbols-table">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>First Date</th>
+            <th>Last Date</th>
+            <th class="num">Candles</th>
+            <th class="num">Gap</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div id="no-data" style="padding:20px;text-align:center;color:#8b949e;display:none">
+        No data ingested yet. Add a symbol above to get started.
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ OPTIMIZER PAGE ═══════════ -->
+  <div id="page-optimizer" class="page">
+    <div style="display:flex;gap:16px;margin-bottom:16px">
+      <button id="btn-new-run" class="primary">New Run</button>
+    </div>
+
+    <!-- Live progress panel -->
+    <div class="live-panel" id="live-panel">
+      <div class="title" id="live-title">-</div>
+      <div class="progress-bar">
+        <div class="fill" id="live-progress-fill" style="width:0%"></div>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="value" id="live-gen">-</div><div class="label">Generation</div></div>
+        <div class="stat"><div class="value positive" id="live-best">-</div><div class="label">Best Profit</div></div>
+        <div class="stat"><div class="value" id="live-pf">-</div><div class="label">PF</div></div>
+        <div class="stat"><div class="value" id="live-wr">-</div><div class="label">Win Rate</div></div>
+        <div class="stat"><div class="value neutral" id="live-dd">-</div><div class="label">Max DD</div></div>
+        <div class="stat"><div class="value" id="live-trades">-</div><div class="label">Trades</div></div>
+        <div class="stat"><div class="value" id="live-evals">-</div><div class="label">Evaluations</div></div>
+        <div class="stat"><div class="value" id="live-time">-</div><div class="label">Elapsed</div></div>
+        <div class="stat" id="live-islands-stat" style="display:none"><div class="value" id="live-islands">-</div><div class="label">Islands</div></div>
+        <div class="stat" id="live-migrations-stat" style="display:none"><div class="value" id="live-migrations">-</div><div class="label">Migrations</div></div>
+      </div>
+      <div id="live-config" style="font-size:12px;color:#8b949e;margin-top:8px"></div>
+      <div id="island-viz" style="display:none;margin-top:12px">
+        <svg id="island-svg" width="100%" height="200"></svg>
+      </div>
+    </div>
+
+    <!-- Queue -->
+    <div class="card" id="queue-card" style="display:none">
+      <h2>Queue</h2>
+      <div id="queue-list"></div>
+    </div>
+
+    <!-- Results -->
+    <div class="card">
+      <h2>Results</h2>
+      <table id="runs-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Symbol</th>
+            <th>TF</th>
+            <th>Status</th>
+            <th class="num">Profit</th>
+            <th class="num">PF</th>
+            <th class="num">WR</th>
+            <th class="num">DD</th>
+            <th class="num">Trades</th>
+            <th class="num">Gens</th>
+            <th>Time</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div id="no-runs" style="padding:20px;text-align:center;color:#8b949e;display:none">
+        No optimization runs yet. Click "New Run" to start.
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ NEW RUN MODAL ═══════════ -->
+  <div class="modal-overlay" id="modal-new-run">
+    <div class="modal">
+      <h2>New Optimization Run</h2>
+      <div class="form-row">
+        <label>Symbols</label>
+        <div class="checkbox-group" id="modal-symbols"></div>
+      </div>
+      <div class="form-row">
+        <label>Interval</label>
+        <div class="checkbox-group" id="modal-intervals">
+          <label><input type="checkbox" value="1m">1m</label>
+          <label><input type="checkbox" value="3m">3m</label>
+          <label><input type="checkbox" value="5m">5m</label>
+          <label><input type="checkbox" value="15m">15m</label>
+          <label><input type="checkbox" value="30m">30m</label>
+          <label><input type="checkbox" value="1H">1H</label>
+          <label><input type="checkbox" value="2H">2H</label>
+          <label><input type="checkbox" value="3H">3H</label>
+          <label><input type="checkbox" value="4H" checked>4H</label>
+          <label><input type="checkbox" value="6H">6H</label>
+          <label><input type="checkbox" value="8H">8H</label>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Backtest Period</label>
+        <select id="modal-period" style="width:120px">
+          <option value="5y" selected>5 years</option>
+          <option value="4y">4 years</option>
+          <option value="3y">3 years</option>
+          <option value="2y">2 years</option>
+          <option value="1y">1 year</option>
+          <option value="6M">6 months</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Population</label>
+        <input type="number" id="modal-pop" value="80" min="10" max="200" style="width:80px">
+      </div>
+      <div class="form-row">
+        <label>Generations</label>
+        <input type="number" id="modal-gen" value="80" min="5" max="500" style="width:80px">
+      </div>
+      <div class="form-row">
+        <label>Islands</label>
+        <input type="number" id="modal-islands" value="4" min="1" max="16" style="width:80px">
+        <span style="font-size:12px;color:#8b949e">1 = classic, 4-8 recommended</span>
+      </div>
+      <div id="island-options">
+        <div class="form-row">
+          <label>Migration Interval</label>
+          <input type="number" id="modal-mig-interval" value="0" min="0" max="200" style="width:80px">
+          <span style="font-size:12px;color:#8b949e">0 = auto (25% of gens, rare is better)</span>
+        </div>
+        <div class="form-row">
+          <label>Migration Count</label>
+          <input type="number" id="modal-mig-count" value="3" min="1" max="20" style="width:80px">
+          <span style="font-size:12px;color:#8b949e">individuals per event</span>
+        </div>
+        <div class="form-row">
+          <label>Topology</label>
+          <select id="modal-topology" style="width:120px">
+            <option value="ring">Ring (best for diversity)</option>
+            <option value="torus">Torus (balanced)</option>
+            <option value="random">Random</option>
+          </select>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="modal-cancel">Cancel</button>
+        <button id="modal-start" class="primary">Start</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
