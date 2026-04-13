@@ -141,7 +141,7 @@ router.delete('/api/symbols/:symbol', async (req, res) => {
 router.get('/api/runs', async (req, res) => {
   try {
     const runs = await query(
-      'SELECT id, symbol, timeframe, start_date, status, best_metrics, best_gene, generations_completed, total_evaluations, error, started_at, completed_at, created_at FROM runs ORDER BY id DESC'
+      'SELECT id, symbol, timeframe, start_date, config, status, best_metrics, best_gene, generations_completed, total_evaluations, error, started_at, completed_at, created_at FROM runs ORDER BY id DESC'
     );
     res.json({ runs });
   } catch (err) {
@@ -170,7 +170,7 @@ router.get('/api/runs/:id', async (req, res) => {
 router.post('/api/runs', async (req, res) => {
   try {
     const {
-      symbols, intervals, period = '5y',
+      symbols, intervals, period, startDate: rawStart, endDate: rawEnd,
       populationSize = 80, generations = 80, mutationRate = 0.4,
       numIslands = 4, migrationInterval = 0, migrationCount = 3, migrationTopology = 'ring',
     } = req.body;
@@ -179,19 +179,22 @@ router.post('/api/runs', async (req, res) => {
       return res.status(400).json({ error: 'symbols and intervals required' });
     }
 
-    // Interval label → minutes
     const INTERVAL_MAP = {
       '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
       '1H': 60, '2H': 120, '3H': 180, '4H': 240, '6H': 360, '8H': 480,
     };
 
-    // Period → start date
-    const PERIOD_MAP = {
-      '6M': 0.5, '1y': 1, '2y': 2, '3y': 3, '4y': 4, '5y': 5,
-    };
-    const yearsBack = PERIOD_MAP[period] || 5;
-    const startDate = new Date(Date.now() - yearsBack * 365.25 * 24 * 60 * 60 * 1000)
-      .toISOString().split('T')[0];
+    let startDate, endDate;
+    if (rawStart) {
+      startDate = rawStart;
+      endDate = rawEnd || null;
+    } else {
+      const PERIOD_MAP = { '3M': 0.25, '6M': 0.5, '1y': 1, '2y': 2, '3y': 3, '4y': 4, '5y': 5 };
+      const yearsBack = PERIOD_MAP[period] || 5;
+      startDate = new Date(Date.now() - yearsBack * 365.25 * 24 * 60 * 60 * 1000)
+        .toISOString().split('T')[0];
+      endDate = null;
+    }
 
     const runConfigs = [];
     for (const symbol of symbols) {
@@ -199,18 +202,18 @@ router.post('/api/runs', async (req, res) => {
         const tf = INTERVAL_MAP[ivLabel];
         if (!tf) continue;
         runConfigs.push({
-          symbol, timeframe: tf, startDate,
-          label: ivLabel, period,
+          symbol, timeframe: tf, startDate, endDate,
+          label: ivLabel,
           populationSize, generations, mutationRate,
           numIslands, migrationInterval, migrationCount, migrationTopology,
         });
       }
     }
 
-    // Create run records in DB
     const runIds = [];
     for (const rc of runConfigs) {
-      await exec(`INSERT INTO runs (symbol, timeframe, start_date, status, config) VALUES ('${rc.symbol}', ${rc.timeframe}, '${rc.startDate}', 'pending', '${JSON.stringify({ populationSize: rc.populationSize, generations: rc.generations, mutationRate: rc.mutationRate, numIslands: rc.numIslands, migrationInterval: rc.migrationInterval, migrationCount: rc.migrationCount, migrationTopology: rc.migrationTopology })}')`);
+      const configJson = JSON.stringify({ populationSize: rc.populationSize, generations: rc.generations, mutationRate: rc.mutationRate, numIslands: rc.numIslands, migrationInterval: rc.migrationInterval, migrationCount: rc.migrationCount, migrationTopology: rc.migrationTopology, endDate: rc.endDate });
+      await exec(`INSERT INTO runs (symbol, timeframe, start_date, status, config) VALUES ('${rc.symbol}', ${rc.timeframe}, '${rc.startDate}', 'pending', '${configJson}')`);
       const rows = await query('SELECT MAX(id) AS id FROM runs');
       const runId = rows[0].id;
       runIds.push(runId);
@@ -269,11 +272,50 @@ router.get('/api/tv/status', async (req, res) => {
 
 router.post('/api/tv/send', async (req, res) => {
   try {
-    const { gene, symbol, timeframe } = req.body;
+    const { gene, symbol, timeframe, startDate, endDate } = req.body;
     if (!gene) return res.status(400).json({ error: 'gene config required' });
 
-    const result = await sendToTradingView(gene, symbol, timeframe);
-    res.json(result);
+    // Re-run JS strategy with current code to get fresh metrics
+    let jsMetrics = null;
+    try {
+      const startTs = startDate
+        ? new Date(startDate).getTime()
+        : Date.now() - 5 * 365.25 * 24 * 60 * 60 * 1000;
+      const endTs = endDate ? new Date(endDate).getTime() : Infinity;
+      const WARMUP_BARS = 200;
+      const preloadTs = startTs - WARMUP_BARS * (timeframe || 240) * 60000;
+      let candles = await loadCandles(symbol || 'BTCUSDT', timeframe || 240, preloadTs);
+
+      if (endTs < Infinity) {
+        let lastIdx = candles.close.length;
+        for (let i = 0; i < candles.close.length; i++) {
+          if (candles.ts[i] > endTs) { lastIdx = i; break; }
+        }
+        if (lastIdx < candles.close.length) {
+          candles = {
+            ts: candles.ts.slice(0, lastIdx),
+            open: candles.open.slice(0, lastIdx),
+            high: candles.high.slice(0, lastIdx),
+            low: candles.low.slice(0, lastIdx),
+            close: candles.close.slice(0, lastIdx),
+            volume: candles.volume.slice(0, lastIdx),
+          };
+        }
+      }
+
+      let tradingStartBar = 0;
+      for (let i = 0; i < candles.close.length; i++) {
+        if (candles.ts[i] >= startTs) { tradingStartBar = i; break; }
+      }
+
+      jsMetrics = runStrategy(candles, gene, { tradingStartBar });
+    } catch (e) {
+      console.warn('[tv/send] JS re-evaluation failed:', e.message);
+    }
+
+    const dateRange = { startDate, endDate };
+    const result = await sendToTradingView(gene, symbol, timeframe, dateRange);
+    res.json({ ...result, jsMetrics });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

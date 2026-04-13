@@ -82,13 +82,20 @@ export function runStrategy(candles, params, opts = {}) {
   let entryBar = 0;
   let entryAtr = 0;
   let tp1Hit = false;
+  let tp2Hit = false;
   let remainingUnits = 0;
 
   // Pending entry — signals on bar N, fill at bar N+1's open (matches TV)
   let pendingEntry = null;  // { isLong, atr }
 
-  // Pending SL exit — close crosses SL on bar N, exit fills at bar N+1's open
-  let pendingSLExit = null; // { isLong }
+  // Pending exits — all strategy.close() equivalents defer to next bar's open
+  // to match PineScript's execution model where strategy.close() fills at next open.
+  let pendingClose = null;  // { isLong } — structural, time, or SL exits
+
+  // Close-based SL uses 2-step deferral matching Pine's slTriggered pattern:
+  // Bar N: close crosses SL → slTriggered = true
+  // Bar N+1: slTriggered → pendingClose set (strategy.close placed) → fills at bar N+2 open
+  let slTriggered = false;
 
   // Metrics accumulators
   let totalTrades = 0;    // Each partial exit counts as a trade (matches TV)
@@ -130,10 +137,14 @@ export function runStrategy(candles, params, opts = {}) {
   }
 
   // ─── Main loop — bar by bar ────────────────────────────────
-  // Start from a safe offset where all indicators have values
+  // Start from whichever is later: indicator warmup or trading start bar.
+  // When pre-warmed data is loaded before the start date, tradingStartBar
+  // will be >= warmup, so indicators are fully ready by the time we trade.
   const warmup = Math.max(stochLen + stochSmth * 2, rsiLen + 1, emaSlow, bbLen + 100, atrLen) + 5;
+  const tradingStartBar = opts.tradingStartBar ?? 0;
+  const startBar = Math.max(warmup, tradingStartBar);
 
-  for (let i = warmup; i < len; i++) {
+  for (let i = startBar; i < len; i++) {
     const c = candles.close[i];
     const h = candles.high[i];
     const l = candles.low[i];
@@ -141,6 +152,17 @@ export function runStrategy(candles, params, opts = {}) {
 
     // Skip if indicators are NaN
     if (isNaN(stochK[i]) || isNaN(emaF[i]) || isNaN(emaS[i]) || isNaN(atrArr[i])) continue;
+
+    // ─── Execute pending close at this bar's open ──────
+    // Matches Pine's strategy.close() which fills at next bar's open.
+    // Must execute BEFORE pending entry so reversals work:
+    // close fills → position flat → entry fills (both at same bar's open).
+    if (pendingClose && posSize !== 0) {
+      closeTrade(Math.abs(remainingUnits), o, pendingClose.isLong);
+      posSize = 0;
+      remainingUnits = 0;
+      pendingClose = null;
+    }
 
     // ─── Execute pending entry at this bar's open ────────
     if (pendingEntry && posSize === 0) {
@@ -160,17 +182,18 @@ export function runStrategy(candles, params, opts = {}) {
           entryBar = i;
           entryAtr = pe.atr;
           tp1Hit = false;
+          tp2Hit = false;
         }
       }
     }
 
-    // ─── Execute pending SL exit at this bar's open ──────
-    if (pendingSLExit && posSize !== 0) {
-      closeTrade(Math.abs(remainingUnits), o, pendingSLExit.isLong);
-      posSize = 0;
-      remainingUnits = 0;
-      pendingSLExit = null;
+    // ─── slTriggered → place close order (2nd step of close-based SL) ──
+    // Matches Pine: slTriggered set on bar N → strategy.close() on bar N+1 → fills bar N+2
+    if (slTriggered && posSize !== 0) {
+      pendingClose = { isLong: posSize > 0 };
+      slTriggered = false;
     }
+    if (posSize === 0) slTriggered = false;
 
     // ─── Exit checks ────────────────────────────────────
     if (posSize !== 0) {
@@ -211,7 +234,7 @@ export function runStrategy(candles, params, opts = {}) {
           }
         }
 
-        if (remainingUnits !== 0) {
+        if (!tp2Hit && remainingUnits !== 0) {
           const tp2Reached = isLong ? h >= tp2Price : l <= tp2Price;
           if (tp2Reached) {
             const currentAbs = Math.abs(remainingUnits);
@@ -220,6 +243,7 @@ export function runStrategy(candles, params, opts = {}) {
             remainingUnits = isLong
               ? remainingUnits - tp2Units
               : remainingUnits + tp2Units;
+            tp2Hit = true;
           }
         }
 
@@ -239,41 +263,44 @@ export function runStrategy(candles, params, opts = {}) {
         }
       }
 
-      // --- 3. Time-based exit (at close) ---
+      // --- 3. Time-based exit (deferred to next bar's open, matches Pine strategy.close()) ---
       if (!fullExit && posSize !== 0 && barsHeld >= maxBars) {
-        closeTrade(Math.abs(remainingUnits), c, isLong);
-        posSize = 0;
-        remainingUnits = 0;
+        pendingClose = { isLong };
         fullExit = true;
       }
 
-      // --- 4. Structural exits (at close) ---
+      // --- 4. Structural exits (deferred to next bar's open, matches Pine strategy.close()) ---
       if (!fullExit && posSize !== 0) {
         let structuralExit = false;
+        let oppSignalFired = false;
         if (isLong) {
           const stochExit = stochCrossDown[i] && stochK[i] > 60;
           const rsiExit = rsiArr[i] < 40 && i >= 3 && rsiArr[i - 3] > 55;
-          const oppSignal = computeShortScore(i) >= minEntry;
-          structuralExit = stochExit || rsiExit || oppSignal;
+          oppSignalFired = computeShortScore(i) >= minEntry;
+          structuralExit = stochExit || rsiExit || oppSignalFired;
         } else {
           const stochExit = stochCrossUp[i] && stochK[i] < 40;
           const rsiExit = rsiArr[i] > 60 && i >= 3 && rsiArr[i - 3] < 45;
-          const oppSignal = computeLongScore(i) >= minEntry;
-          structuralExit = stochExit || rsiExit || oppSignal;
+          oppSignalFired = computeLongScore(i) >= minEntry;
+          structuralExit = stochExit || rsiExit || oppSignalFired;
         }
 
         if (structuralExit) {
-          closeTrade(Math.abs(remainingUnits), c, isLong);
-          posSize = 0;
-          remainingUnits = 0;
+          pendingClose = { isLong };
           fullExit = true;
+
+          // Pine reversal: entry("S") fires on same bar as close("L") when
+          // goShort and position_size >= 0. Both fill at next bar's open.
+          if (oppSignalFired) {
+            pendingEntry = { isLong: !isLong, atr: atrArr[i] };
+          }
         }
       }
 
-      // --- 5. Close-based SL (check at close, exit at next bar's open) ---
-      // Only triggers when the candle CLOSES beyond the SL level;
-      // wicks past SL that recover by close are ignored.
-      if (!fullExit && posSize !== 0 && barsHeld >= 1) {
+      // --- 5. Close-based SL (2-step deferral matching Pine's slTriggered pattern) ---
+      // Bar N: close crosses SL → slTriggered = true
+      // Bar N+1: slTriggered → pendingClose (strategy.close) → fills bar N+2 open
+      if (!fullExit && posSize !== 0 && barsHeld >= 1 && !slTriggered) {
         let slPrice;
         if (isLong) {
           slPrice = tp1Hit ? ep * 1.003 : ep - entryAtr * atrSL;
@@ -282,13 +309,13 @@ export function runStrategy(candles, params, opts = {}) {
         }
 
         if (isLong ? c <= slPrice : c >= slPrice) {
-          pendingSLExit = { isLong };
+          slTriggered = true;
         }
       }
     }
 
-    // ─── Entry checks (if flat — includes post-exit flips) ──
-    if (posSize === 0 && !pendingEntry && !pendingSLExit) {
+    // ─── Entry checks (if flat and no pending close/entry/SL) ──
+    if (posSize === 0 && !pendingEntry && !pendingClose && !slTriggered) {
       const longScore = computeLongScore(i);
       const shortScore = computeShortScore(i);
 
@@ -312,7 +339,7 @@ export function runStrategy(candles, params, opts = {}) {
     const lastClose = candles.close[len - 1];
     closeTrade(Math.abs(remainingUnits), lastClose, posSize > 0);
     posSize = 0;
-    pendingSLExit = null;
+    pendingClose = null;
   }
 
   // ─── Compute final metrics ────────────────────────────────

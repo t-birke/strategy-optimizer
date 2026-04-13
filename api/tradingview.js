@@ -7,25 +7,26 @@
 const CDP_PORT = 9222;
 
 // Pine input ID mapping for JM Simple 3TP
+// in_0 = startDate (time), in_1 = endDate (time), then gene params from in_2+
 const GENE_TO_INPUT = {
-  minEntry:  'in_1',
-  stochLen:  'in_2',
-  stochSmth: 'in_3',
-  rsiLen:    'in_4',
-  emaFast:   'in_5',
-  emaSlow:   'in_6',
-  bbLen:     'in_7',
-  bbMult:    'in_8',
-  atrLen:    'in_9',
-  atrSL:     'in_10',
-  tp1Mult:   'in_11',
-  tp2Mult:   'in_12',
-  tp3Mult:   'in_13',
-  tp1Pct:    'in_14',
-  tp2Pct:    'in_15',
-  riskPct:        'in_16',
-  maxBars:        'in_17',
-  emergencySlPct: 'in_19',
+  minEntry:  'in_2',
+  stochLen:  'in_3',
+  stochSmth: 'in_4',
+  rsiLen:    'in_5',
+  emaFast:   'in_6',
+  emaSlow:   'in_7',
+  bbLen:     'in_8',
+  bbMult:    'in_9',
+  atrLen:    'in_10',
+  atrSL:     'in_11',
+  tp1Mult:   'in_12',
+  tp2Mult:   'in_13',
+  tp3Mult:   'in_14',
+  tp1Pct:    'in_15',
+  tp2Pct:    'in_16',
+  riskPct:        'in_17',
+  maxBars:        'in_18',
+  emergencySlPct: 'in_20',
 };
 
 /**
@@ -33,9 +34,10 @@ const GENE_TO_INPUT = {
  * @param {Object} gene - Gene config with keys like minEntry, stochLen, etc.
  * @param {string} [symbol] - Optional symbol to switch to (e.g. 'BINANCE:BTCUSDT')
  * @param {number} [timeframe] - Optional timeframe in minutes (e.g. 240 for 4H)
+ * @param {Object} [dateRange] - { startDate: 'YYYY-MM-DD', endDate: 'YYYY-MM-DD' }
  * @returns {{ tvMetrics, chartInfo, inputsChanged }}
  */
-export async function sendToTradingView(gene, symbol, timeframe) {
+export async function sendToTradingView(gene, symbol, timeframe, dateRange) {
   // 1. Find TradingView chart tab
   const resp = await fetch(`http://localhost:${CDP_PORT}/json/list`);
   const targets = await resp.json();
@@ -122,9 +124,19 @@ export async function sendToTradingView(gene, symbol, timeframe) {
     if (!strategy) throw new Error('JM Simple 3TP strategy not found on chart. Studies: ' + studies.map(s => s.name).join(', '));
 
     // 6. Build input overrides from gene
-    const inputs = { in_18: 1 }; // ALWAYS force leverage to 1x
+    const inputs = { in_19: 1 }; // ALWAYS force leverage to 1x (in_19 after ID shift)
     for (const [geneName, inputId] of Object.entries(GENE_TO_INPUT)) {
       if (gene[geneName] !== undefined) inputs[inputId] = gene[geneName];
+    }
+
+    // Set date range — Pine input.time() expects Unix timestamp in seconds * 1000
+    if (dateRange?.startDate) {
+      inputs.in_0 = new Date(dateRange.startDate).getTime();
+    }
+    if (dateRange?.endDate) {
+      inputs.in_1 = new Date(dateRange.endDate).getTime();
+    } else {
+      inputs.in_1 = new Date('2099-12-31').getTime();
     }
 
     // 7. Read current inputs and track changes

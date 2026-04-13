@@ -18,7 +18,8 @@ strategy("JM Simple 3TP", "JM3", true,
 
 GRP_DATE    = "Date Filter"
 i_startDate = input.time(timestamp("2021-04-11"), "Start Date", group=GRP_DATE)
-inDateRange = time >= i_startDate
+i_endDate   = input.time(timestamp("2099-12-31"), "End Date",   group=GRP_DATE)
+inDateRange = time >= i_startDate and time <= i_endDate
 
 GRP_CORE    = "Core"
 i_minEntry  = input.int(2,       "Min Entry (of 3)", minval=1, maxval=3, group=GRP_CORE)
@@ -213,6 +214,10 @@ if strategy.position_size > 0 and not na(longBar) and bar_index - longBar >= i_m
     strategy.close("L", comment="time")
 if strategy.position_size < 0 and not na(shortBar) and bar_index - shortBar >= i_maxBars
     strategy.close("S", comment="time")
+
+// End-of-range exit: close any open position once past the end date
+if time > i_endDate and strategy.position_size != 0
+    strategy.close_all(comment="END_DATE")
 
 // ============================================================================
 // VISUALIZATION

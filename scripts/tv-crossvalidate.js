@@ -4,24 +4,24 @@
  */
 // Winner config: E2 St39/6 R16 EMA14/135 BB40x3 ATR24 SL3.25 TP2.5/6/7 @10/10/80% R5% T25b
 const WINNER_INPUTS = {
-  in_1:  2,      // minEntry
-  in_2:  39,     // stochLen
-  in_3:  6,      // stochSmth
-  in_4:  16,     // rsiLen
-  in_5:  14,     // emaFast
-  in_6:  135,    // emaSlow
-  in_7:  40,     // bbLen
-  in_8:  3,      // bbMult
-  in_9:  24,     // atrLen
-  in_10: 3.25,   // atrSL
-  in_11: 2.5,    // tp1Mult
-  in_12: 6,      // tp2Mult
-  in_13: 7,      // tp3Mult
-  in_14: 10,     // tp1Pct
-  in_15: 10,     // tp2Pct
-  in_16: 5,      // riskPct
-  in_17: 25,     // maxBars
-  in_18: 1,      // leverage — FORCE TO 1x to avoid leverage leak
+  in_2:  2,      // minEntry
+  in_3:  39,     // stochLen
+  in_4:  6,      // stochSmth
+  in_5:  16,     // rsiLen
+  in_6:  14,     // emaFast
+  in_7:  135,    // emaSlow
+  in_8:  40,     // bbLen
+  in_9:  3,      // bbMult
+  in_10: 24,     // atrLen
+  in_11: 3.25,   // atrSL
+  in_12: 2.5,    // tp1Mult
+  in_13: 6,      // tp2Mult
+  in_14: 7,      // tp3Mult
+  in_15: 10,     // tp1Pct
+  in_16: 10,     // tp2Pct
+  in_17: 5,      // riskPct
+  in_18: 25,     // maxBars
+  in_19: 1,      // leverage — FORCE TO 1x to avoid leverage leak
 };
 
 async function main() {

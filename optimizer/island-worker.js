@@ -14,7 +14,7 @@ import {
 } from './params.js';
 
 const {
-  candleBuffer, candleLength,
+  candleBuffer, candleLength, tradingStartBar,
   populationSize, mutationRate, perGeneMut,
   islandIdx,
 } = workerData;
@@ -39,7 +39,7 @@ function fitness(gene) {
   if (fitnessCache.has(key)) return fitnessCache.get(key).fitness;
 
   evalCount++;
-  const metrics = runStrategy(candles, gene);
+  const metrics = runStrategy(candles, gene, { tradingStartBar });
   let score;
 
   if (!metrics || metrics.error) score = -10000;

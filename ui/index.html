@@ -147,16 +147,34 @@
           <label><input type="checkbox" value="8H">8H</label>
         </div>
       </div>
-      <div class="form-row">
-        <label>Backtest Period</label>
-        <select id="modal-period" style="width:120px">
-          <option value="5y" selected>5 years</option>
-          <option value="4y">4 years</option>
-          <option value="3y">3 years</option>
-          <option value="2y">2 years</option>
-          <option value="1y">1 year</option>
-          <option value="6M">6 months</option>
-        </select>
+      <div class="form-row" style="flex-direction:column;align-items:stretch">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+          <label style="margin:0">Backtest Period</label>
+          <select id="modal-period" style="width:120px">
+            <option value="5y">5 years</option>
+            <option value="4y">4 years</option>
+            <option value="3y">3 years</option>
+            <option value="2y">2 years</option>
+            <option value="1y">1 year</option>
+            <option value="6M">6 months</option>
+            <option value="3M">3 months</option>
+          </select>
+        </div>
+        <div class="tl-widget" id="tl-widget">
+          <div class="tl-track" id="tl-track">
+            <div class="tl-warmup" id="tl-warmup"></div>
+            <div class="tl-bar" id="tl-bar">
+              <div class="tl-bar-label" id="tl-bar-label"></div>
+            </div>
+          </div>
+          <div class="tl-dates">
+            <span id="tl-date-start"></span>
+            <span id="tl-date-assess-start" class="tl-date-accent"></span>
+            <span id="tl-date-assess-end" class="tl-date-accent"></span>
+            <span id="tl-date-end"></span>
+          </div>
+          <div class="tl-hint" id="tl-hint">Select a symbol to see available data range</div>
+        </div>
       </div>
       <div class="form-row">
         <label>Population</label>

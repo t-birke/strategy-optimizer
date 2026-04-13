@@ -234,8 +234,8 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
   border: 1px solid #30363d;
   border-radius: 12px;
   padding: 24px;
-  min-width: 400px;
-  max-width: 500px;
+  min-width: 520px;
+  max-width: 580px;
 }
 
 .modal h2 {
@@ -278,6 +278,108 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
 }
 
 .checkbox-group input { display: none; }
+
+/* Timeline widget */
+.tl-widget {
+  position: relative;
+  user-select: none;
+}
+
+.tl-track {
+  position: relative;
+  height: 36px;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.tl-warmup {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  background: repeating-linear-gradient(
+    -45deg,
+    #21262d,
+    #21262d 4px,
+    #161b22 4px,
+    #161b22 8px
+  );
+  border-right: 1px dashed #484f58;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.tl-bar {
+  position: absolute;
+  top: 3px;
+  height: calc(100% - 6px);
+  background: linear-gradient(135deg, #1f6feb, #388bfd);
+  border-radius: 4px;
+  cursor: grab;
+  z-index: 2;
+  min-width: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: box-shadow 0.15s;
+}
+
+.tl-bar:hover {
+  box-shadow: 0 0 0 2px rgba(56, 139, 253, 0.4);
+}
+
+.tl-bar.dragging {
+  cursor: grabbing;
+  box-shadow: 0 0 0 2px rgba(56, 139, 253, 0.6);
+  background: linear-gradient(135deg, #388bfd, #58a6ff);
+}
+
+.tl-bar-label {
+  font-size: 11px;
+  color: #fff;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0 6px;
+  opacity: 0.9;
+  pointer-events: none;
+}
+
+.tl-dates {
+  position: relative;
+  height: 16px;
+  font-size: 11px;
+  color: #8b949e;
+  margin-top: 4px;
+}
+
+.tl-dates span {
+  position: absolute;
+  white-space: nowrap;
+}
+
+.tl-date-accent {
+  color: #58a6ff;
+  font-weight: 500;
+}
+
+.tl-hint {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #484f58;
+  font-size: 12px;
+  pointer-events: none;
+  z-index: 3;
+}
 
 /* TV button */
 .btn-tv { background: #1f6feb; border-color: #1f6feb; }

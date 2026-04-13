@@ -4,6 +4,41 @@ Reference: `pine/jm_simple_3tp.pine` (current) vs `engine/strategy.js` (updated)
 
 ---
 
+## Change 0: Add End Date Input & Date Range Filtering
+
+The strategy now accepts an End Date alongside the existing Start Date, so the
+backtest window can be precisely controlled via CDP when comparing JS vs TV.
+
+### Current (line 20–21):
+
+```pine
+GRP_DATE    = "Date Filter"
+i_startDate = input.time(timestamp("2021-04-11"), "Start Date", group=GRP_DATE)
+inDateRange = time >= i_startDate
+```
+
+### Replace with:
+
+```pine
+GRP_DATE    = "Date Filter"
+i_startDate = input.time(timestamp("2021-04-11"), "Start Date", group=GRP_DATE)
+i_endDate   = input.time(timestamp("2099-12-31"), "End Date",   group=GRP_DATE)
+inDateRange = time >= i_startDate and time <= i_endDate
+```
+
+Also add end-of-range exit after the time-based exit block to close any open
+position once past the end date:
+
+```pine
+if time > i_endDate and strategy.position_size != 0
+    strategy.close_all(comment="END_DATE")
+```
+
+**Important:** Adding `i_endDate` as `in_1` shifts ALL subsequent input IDs
+by +1. See the Input ID Reference table below for the new mapping.
+
+---
+
 ## Change 1: Add Emergency SL Input
 
 Add after the leverage input (line 43):
@@ -215,28 +250,29 @@ Emergency SL → TPs → Time → Structural → Close-based SL → Entry signal
 
 ## Input ID Reference (CDP Mapping)
 
-| Pine variable | Input ID | Gene | Added/Changed |
+| Pine variable | Input ID | Gene / Source | Added/Changed |
 |---|---|---|---|
-| `i_startDate` | `in_0` | *(not mapped)* | |
-| `i_minEntry` | `in_1` | minEntry | |
-| `i_stochLen` | `in_2` | stochLen | |
-| `i_stochSmth` | `in_3` | stochSmth | |
-| `i_rsiLen` | `in_4` | rsiLen | |
-| `i_emaFast` | `in_5` | emaFast | |
-| `i_emaSlow` | `in_6` | emaSlow | |
-| `i_bbLen` | `in_7` | bbLen | |
-| `i_bbMult` | `in_8` | bbMult | |
-| `i_atrLen` | `in_9` | atrLen | |
-| `i_atrSL` | `in_10` | atrSL | |
-| `i_tp1Mult` | `in_11` | tp1Mult | |
-| `i_tp2Mult` | `in_12` | tp2Mult | |
-| `i_tp3Mult` | `in_13` | tp3Mult | |
-| `i_tp1Pct` | `in_14` | tp1Pct | |
-| `i_tp2Pct` | `in_15` | tp2Pct | |
-| `i_riskPct` | `in_16` | riskPct | |
-| `i_maxBars` | `in_17` | maxBars | |
-| `i_leverage` | `in_18` | *(forced to 1)* | |
-| `i_emergSL` | `in_19` | emergencySlPct | **NEW** |
+| `i_startDate` | `in_0` | run `start_date` (timestamp) | |
+| `i_endDate` | `in_1` | run `config.endDate` (timestamp) | **NEW** |
+| `i_minEntry` | `in_2` | minEntry | **shifted +1** |
+| `i_stochLen` | `in_3` | stochLen | **shifted +1** |
+| `i_stochSmth` | `in_4` | stochSmth | **shifted +1** |
+| `i_rsiLen` | `in_5` | rsiLen | **shifted +1** |
+| `i_emaFast` | `in_6` | emaFast | **shifted +1** |
+| `i_emaSlow` | `in_7` | emaSlow | **shifted +1** |
+| `i_bbLen` | `in_8` | bbLen | **shifted +1** |
+| `i_bbMult` | `in_9` | bbMult | **shifted +1** |
+| `i_atrLen` | `in_10` | atrLen | **shifted +1** |
+| `i_atrSL` | `in_11` | atrSL | **shifted +1** |
+| `i_tp1Mult` | `in_12` | tp1Mult | **shifted +1** |
+| `i_tp2Mult` | `in_13` | tp2Mult | **shifted +1** |
+| `i_tp3Mult` | `in_14` | tp3Mult | **shifted +1** |
+| `i_tp1Pct` | `in_15` | tp1Pct | **shifted +1** |
+| `i_tp2Pct` | `in_16` | tp2Pct | **shifted +1** |
+| `i_riskPct` | `in_17` | riskPct | **shifted +1** |
+| `i_maxBars` | `in_18` | maxBars | **shifted +1** |
+| `i_leverage` | `in_19` | *(forced to 1)* | **shifted +1** |
+| `i_emergSL` | `in_20` | emergencySlPct | **shifted +1** |
 
 ---
 

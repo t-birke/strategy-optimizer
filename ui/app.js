@@ -431,8 +431,8 @@ async function loadRuns() {
       const elapsed = startMs && endMs ? fmtDuration((endMs - startMs) / 1000) : '-';
 
       const testFrom = r.start_date || '-';
-      const createdMs = toMs(r.created_at);
-      const testTo = createdMs ? new Date(createdMs).toISOString().split('T')[0] : '-';
+      const cfg = typeof r.config === 'string' ? (() => { try { return JSON.parse(r.config); } catch { return {}; } })() : (r.config || {});
+      const testTo = cfg.endDate || new Date(toMs(r.created_at)).toISOString().split('T')[0];
       const testDays = (testFrom !== '-' && testTo !== '-')
         ? Math.round((new Date(testTo) - new Date(testFrom)) / 86400000)
         : '-';
@@ -575,10 +575,215 @@ window.cancelRun = async (id) => {
 // ─── New Run Modal ──────────────────────────────────────────
 const $modal = document.getElementById('modal-new-run');
 
+const PERIOD_DAYS = { '3M': 91, '6M': 183, '1y': 365, '2y': 730, '3y': 1096, '4y': 1461, '5y': 1826 };
+const WARMUP_BARS = 200;
+const INTERVAL_MINS = {
+  '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
+  '1H': 60, '2H': 120, '3H': 180, '4H': 240, '6H': 360, '8H': 480,
+};
+
+let tlState = null; // { dataStartMs, dataEndMs, warmupMs, assessStartMs, assessEndMs }
+let symbolsData = [];
+
+function getSelectedTimeframeMins() {
+  const checked = document.querySelector('#modal-intervals input:checked');
+  return checked ? INTERVAL_MINS[checked.value] || 240 : 240;
+}
+
+function getWarmupMs() {
+  return WARMUP_BARS * getSelectedTimeframeMins() * 60000;
+}
+
+function fmtDate(ms) {
+  return new Date(ms).toISOString().split('T')[0];
+}
+
+function getSelectedSymbolRange() {
+  const checked = [...document.querySelectorAll('#modal-symbols input:checked')];
+  if (!checked.length || !symbolsData.length) return null;
+  const selected = checked.map(c => symbolsData.find(s => s.symbol === c.value)).filter(Boolean);
+  if (!selected.length) return null;
+  return {
+    startMs: Math.min(...selected.map(s => s.first_ts)),
+    endMs: Math.max(...selected.map(s => s.last_ts)),
+  };
+}
+
+function initTimeline() {
+  const range = getSelectedSymbolRange();
+  const $hint = document.getElementById('tl-hint');
+  const $warmup = document.getElementById('tl-warmup');
+  const $bar = document.getElementById('tl-bar');
+
+  if (!range) {
+    $hint.style.display = '';
+    $warmup.style.width = '0';
+    $bar.style.display = 'none';
+    tlState = null;
+    return;
+  }
+  $hint.style.display = 'none';
+  $bar.style.display = '';
+
+  const warmupMs = getWarmupMs();
+  const dataStartMs = range.startMs;
+  const dataEndMs = range.endMs;
+  const totalMs = dataEndMs - dataStartMs;
+
+  const periodKey = document.getElementById('modal-period').value;
+  const periodMs = PERIOD_DAYS[periodKey] * 86400000;
+  const availableStartMs = dataStartMs + warmupMs;
+
+  let assessEndMs = dataEndMs;
+  let assessStartMs = Math.max(availableStartMs, assessEndMs - periodMs);
+
+  if (assessStartMs < availableStartMs) assessStartMs = availableStartMs;
+  if (assessEndMs - assessStartMs > totalMs - warmupMs) {
+    assessEndMs = dataEndMs;
+    assessStartMs = availableStartMs;
+  }
+
+  tlState = { dataStartMs, dataEndMs, warmupMs, assessStartMs, assessEndMs };
+  renderTimeline();
+}
+
+function renderTimeline() {
+  if (!tlState) return;
+  const { dataStartMs, dataEndMs, warmupMs, assessStartMs, assessEndMs } = tlState;
+  const totalMs = dataEndMs - dataStartMs;
+  if (totalMs <= 0) return;
+
+  const $track = document.getElementById('tl-track');
+  const trackW = $track.offsetWidth;
+  if (!trackW) return;
+
+  const warmupPct = (warmupMs / totalMs) * 100;
+  document.getElementById('tl-warmup').style.width = warmupPct + '%';
+
+  const barLeftPct = ((assessStartMs - dataStartMs) / totalMs) * 100;
+  const barWidthPct = ((assessEndMs - assessStartMs) / totalMs) * 100;
+
+  const $bar = document.getElementById('tl-bar');
+  $bar.style.left = barLeftPct + '%';
+  $bar.style.width = barWidthPct + '%';
+
+  document.getElementById('tl-bar-label').textContent = fmtDate(assessStartMs) + ' \u2192 ' + fmtDate(assessEndMs);
+
+  const $ds = document.getElementById('tl-date-start');
+  const $as = document.getElementById('tl-date-assess-start');
+  const $ae = document.getElementById('tl-date-assess-end');
+  const $de = document.getElementById('tl-date-end');
+
+  $ds.textContent = fmtDate(dataStartMs);
+  $ds.style.left = '0';
+
+  $as.textContent = fmtDate(assessStartMs);
+  $as.style.left = barLeftPct + '%';
+
+  $ae.textContent = fmtDate(assessEndMs);
+  $ae.style.left = (barLeftPct + barWidthPct) + '%';
+  $ae.style.transform = 'translateX(-100%)';
+
+  $de.textContent = fmtDate(dataEndMs);
+  $de.style.right = '0';
+
+  // Hide edge labels when they overlap with the bar labels
+  $ds.style.display = barLeftPct > 12 ? '' : 'none';
+  $de.style.display = (barLeftPct + barWidthPct) < 88 ? '' : 'none';
+}
+
+// Drag logic
+(function setupDrag() {
+  const $bar = document.getElementById('tl-bar');
+  const $track = document.getElementById('tl-track');
+  let dragging = false;
+  let dragStartX = 0;
+  let dragStartLeft = 0;
+
+  $bar.addEventListener('mousedown', (e) => {
+    if (!tlState) return;
+    e.preventDefault();
+    dragging = true;
+    dragStartX = e.clientX;
+    const trackW = $track.offsetWidth;
+    const totalMs = tlState.dataEndMs - tlState.dataStartMs;
+    dragStartLeft = tlState.assessStartMs - tlState.dataStartMs;
+    $bar.classList.add('dragging');
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging || !tlState) return;
+    const trackW = $track.offsetWidth;
+    const totalMs = tlState.dataEndMs - tlState.dataStartMs;
+    const pxPerMs = totalMs / trackW;
+    const deltaMs = (e.clientX - dragStartX) * pxPerMs;
+
+    const barDurationMs = tlState.assessEndMs - tlState.assessStartMs;
+    const minStartMs = tlState.dataStartMs + tlState.warmupMs;
+    const maxStartMs = tlState.dataEndMs - barDurationMs;
+
+    let newStartMs = tlState.dataStartMs + dragStartLeft + deltaMs;
+    newStartMs = Math.max(minStartMs, Math.min(maxStartMs, newStartMs));
+
+    tlState.assessStartMs = newStartMs;
+    tlState.assessEndMs = newStartMs + barDurationMs;
+    renderTimeline();
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (dragging) {
+      dragging = false;
+      $bar.classList.remove('dragging');
+    }
+  });
+})();
+
+function updateTimelineOnChange() {
+  if (!tlState) { initTimeline(); return; }
+
+  const warmupMs = getWarmupMs();
+  const periodKey = document.getElementById('modal-period').value;
+  const periodMs = PERIOD_DAYS[periodKey] * 86400000;
+  const range = getSelectedSymbolRange();
+  if (!range) { initTimeline(); return; }
+
+  tlState.dataStartMs = range.startMs;
+  tlState.dataEndMs = range.endMs;
+  tlState.warmupMs = warmupMs;
+
+  const availableStartMs = tlState.dataStartMs + warmupMs;
+  const maxDuration = tlState.dataEndMs - availableStartMs;
+  const barDuration = Math.min(periodMs, maxDuration);
+
+  if (tlState.assessStartMs < availableStartMs) {
+    tlState.assessStartMs = availableStartMs;
+  }
+  tlState.assessEndMs = tlState.assessStartMs + barDuration;
+  if (tlState.assessEndMs > tlState.dataEndMs) {
+    tlState.assessEndMs = tlState.dataEndMs;
+    tlState.assessStartMs = tlState.assessEndMs - barDuration;
+  }
+  if (tlState.assessStartMs < availableStartMs) {
+    tlState.assessStartMs = availableStartMs;
+  }
+
+  renderTimeline();
+}
+
+document.getElementById('modal-period').addEventListener('change', updateTimelineOnChange);
+
+document.getElementById('modal-intervals').addEventListener('change', () => {
+  updateTimelineOnChange();
+});
+
+document.getElementById('modal-symbols').addEventListener('change', () => {
+  initTimeline();
+});
+
 document.getElementById('btn-new-run').addEventListener('click', async () => {
-  // Populate symbol checkboxes from ingested data
   const res = await fetch('/api/symbols');
   const data = await res.json();
+  symbolsData = data.symbols;
   const container = document.getElementById('modal-symbols');
 
   if (data.symbols.length === 0) {
@@ -591,13 +796,18 @@ document.getElementById('btn-new-run').addEventListener('click', async () => {
   ).join('');
 
   $modal.classList.add('active');
+  requestAnimationFrame(() => {
+    initTimeline();
+    const periodKey = document.getElementById('modal-period').value;
+    if (!PERIOD_DAYS[periodKey]) document.getElementById('modal-period').value = '5y';
+    initTimeline();
+  });
 });
 
 document.getElementById('modal-cancel').addEventListener('click', () => {
   $modal.classList.remove('active');
 });
 
-// Show/hide island options when islands > 1
 document.getElementById('modal-islands').addEventListener('input', (e) => {
   document.getElementById('island-options').style.display =
     parseInt(e.target.value) > 1 ? '' : 'none';
@@ -606,7 +816,6 @@ document.getElementById('modal-islands').addEventListener('input', (e) => {
 document.getElementById('modal-start').addEventListener('click', async () => {
   const symbols = [...document.querySelectorAll('#modal-symbols input:checked')].map(i => i.value);
   const intervals = [...document.querySelectorAll('#modal-intervals input:checked')].map(i => i.value);
-  const period = document.getElementById('modal-period').value;
   const populationSize = parseInt(document.getElementById('modal-pop').value) || 80;
   const generations = parseInt(document.getElementById('modal-gen').value) || 80;
   const numIslands = parseInt(document.getElementById('modal-islands').value) || 4;
@@ -619,13 +828,21 @@ document.getElementById('modal-start').addEventListener('click', async () => {
     return;
   }
 
+  if (!tlState) {
+    alert('No valid date range. Check symbol data.');
+    return;
+  }
+
+  const startDate = fmtDate(tlState.assessStartMs);
+  const endDate = fmtDate(tlState.assessEndMs);
+
   $modal.classList.remove('active');
 
   try {
     const res = await fetch('/api/runs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbols, intervals, period, populationSize, generations, numIslands, migrationInterval, migrationCount, migrationTopology }),
+      body: JSON.stringify({ symbols, intervals, startDate, endDate, populationSize, generations, numIslands, migrationInterval, migrationCount, migrationTopology }),
     });
     const data = await res.json();
     console.log('Queued', data.totalRuns, 'runs:', data.runIds);
@@ -636,7 +853,6 @@ document.getElementById('modal-start').addEventListener('click', async () => {
   }
 });
 
-// Close modal on overlay click
 $modal.addEventListener('click', (e) => {
   if (e.target === $modal) $modal.classList.remove('active');
 });
@@ -668,7 +884,7 @@ window.sendToTV = async (runId) => {
     const res = await fetch('/api/tv/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ gene, symbol: run.symbol, timeframe: run.timeframe }),
+      body: JSON.stringify({ gene, symbol: run.symbol, timeframe: run.timeframe, startDate: run.start_date, endDate: run.config?.endDate }),
     });
     const data = await res.json();
 
@@ -679,7 +895,8 @@ window.sendToTV = async (runId) => {
 
     if (data.tvMetrics) {
       const tv = data.tvMetrics;
-      let gaMetrics = run.best_metrics;
+      // Use live JS re-evaluation if available, fall back to cached GA metrics
+      let gaMetrics = data.jsMetrics || run.best_metrics;
       if (typeof gaMetrics === 'string') gaMetrics = JSON.parse(gaMetrics);
 
       const gaProfit = gaMetrics?.netProfit;

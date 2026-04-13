@@ -41,7 +41,7 @@ const WORKER_URL = new URL('./island-worker.js', import.meta.url);
  */
 export async function runOptimization(config) {
   const {
-    symbol, timeframe, startDate,
+    symbol, timeframe, startDate, endDate,
     populationSize = 80,
     generations = 80,
     mutationRate = 0.4,
@@ -60,9 +60,38 @@ export async function runOptimization(config) {
     : generations;
 
   // 1. Load candles once on main thread
+  //    Load extra bars BEFORE startDate so indicators warm up before trading begins
+  //    (matches PineScript behavior where historical data pre-seeds indicators).
   const startTs = new Date(startDate).getTime();
-  const candles = await loadCandles(symbol, timeframe, startTs);
+  const endTs = endDate ? new Date(endDate).getTime() : Infinity;
+  const WARMUP_BARS = 200;
+  const preloadTs = startTs - WARMUP_BARS * timeframe * 60000;
+  let candles = await loadCandles(symbol, timeframe, preloadTs);
+
+  // Trim candles to endDate if specified
+  if (endTs < Infinity) {
+    let lastIdx = candles.close.length;
+    for (let i = 0; i < candles.close.length; i++) {
+      if (candles.ts[i] > endTs) { lastIdx = i; break; }
+    }
+    if (lastIdx < candles.close.length) {
+      candles = {
+        ts: candles.ts.slice(0, lastIdx),
+        open: candles.open.slice(0, lastIdx),
+        high: candles.high.slice(0, lastIdx),
+        low: candles.low.slice(0, lastIdx),
+        close: candles.close.slice(0, lastIdx),
+        volume: candles.volume.slice(0, lastIdx),
+      };
+    }
+  }
+
   const len = candles.close.length;
+
+  let tradingStartBar = 0;
+  for (let i = 0; i < len; i++) {
+    if (candles.ts[i] >= startTs) { tradingStartBar = i; break; }
+  }
 
   if (len < 100) {
     throw new Error(`Insufficient data: ${len} bars for ${symbol} ${timeframe}min from ${startDate}`);
@@ -76,6 +105,8 @@ export async function runOptimization(config) {
   new Float64Array(sab, len * 2 * 8, len).set(candles.low);
   new Float64Array(sab, len * 3 * 8, len).set(candles.close);
   new Float64Array(sab, len * 4 * 8, len).set(candles.volume);
+
+  console.log(`[runner] Loaded ${len} bars, tradingStartBar=${tradingStartBar} (pre-warmed ${tradingStartBar} bars before ${startDate})`);
 
   // 3. Spawn worker threads — one per island
   const workers = [];
@@ -92,6 +123,7 @@ export async function runOptimization(config) {
       workerData: {
         candleBuffer: sab,
         candleLength: len,
+        tradingStartBar,
         populationSize,
         mutationRate: Math.min(islandMutRate, 0.9),
         perGeneMut,
