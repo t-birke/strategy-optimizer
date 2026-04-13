@@ -59,6 +59,16 @@ export async function getLastTimestamp(symbol) {
 }
 
 /**
+ * Get the first stored timestamp for a symbol.
+ */
+export async function getFirstTimestamp(symbol) {
+  const rows = await query(
+    `SELECT MIN(ts) AS first_ts FROM candles WHERE symbol = '${symbol}'`
+  );
+  return rows[0]?.first_ts ?? null;
+}
+
+/**
  * Load candles aggregated to a given timeframe as columnar Float64Arrays.
  * timeframeMin: timeframe in minutes (e.g., 240 for 4H)
  * startTs: start timestamp in milliseconds

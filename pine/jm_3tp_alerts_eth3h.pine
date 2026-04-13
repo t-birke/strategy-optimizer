@@ -1,0 +1,368 @@
+// JM 3TP Alerts — Webhook indicator for ETHUSDT 3H (Run #35)
+// Mirrors the JM Simple 3TP strategy logic but as an indicator with alerts.
+// Sends JSON webhook payloads for every open and close event.
+//
+// Parameters hard-coded from optimizer Run #35:
+//   E2 St37/4 R8 EMA25/150 BB27x2 ATR13 SL2.5 TP3/6/9 @10/10/80% R5% T30b
+
+//@version=5
+indicator("JM 3TP Alerts ETH 3H", "JM3A-ETH", true, max_labels_count=500)
+
+// ============================================================================
+// INPUTS (locked to Run #35 optimised values, with overrides available)
+// ============================================================================
+
+GRP_CORE    = "Core"
+i_minEntry  = input.int(2,       "Min Entry (of 3)", minval=1, maxval=3, group=GRP_CORE)
+i_stochLen  = input.int(37,      "Stoch Length",     minval=5, maxval=50, group=GRP_CORE)
+i_stochSmth = input.int(4,       "Stoch Smooth",     minval=1, maxval=10, group=GRP_CORE)
+i_rsiLen    = input.int(8,       "RSI Length",        minval=5, maxval=30, group=GRP_CORE)
+i_emaFast   = input.int(25,      "EMA Fast",          minval=5, maxval=50, group=GRP_CORE)
+i_emaSlow   = input.int(150,     "EMA Slow",          minval=20, maxval=200, group=GRP_CORE)
+i_bbLen     = input.int(27,      "BB Length",         minval=5, maxval=50, group=GRP_CORE)
+i_bbMult    = input.float(2.0,   "BB Mult",           minval=0.5, maxval=4.0, step=0.5, group=GRP_CORE)
+i_atrLen    = input.int(13,      "ATR Length",        minval=5, maxval=50, group=GRP_CORE)
+
+GRP_RISK    = "Risk Management"
+i_atrSL     = input.float(2.5,   "ATR SL Mult",      minval=0.25, maxval=5.0, step=0.25, group=GRP_RISK)
+i_tp1Mult   = input.float(3.0,   "TP1 ATR Mult",     minval=0.25, maxval=15.0, step=0.25, group=GRP_RISK)
+i_tp2Mult   = input.float(6.0,   "TP2 ATR Mult",     minval=0.5, maxval=15.0, step=0.25, group=GRP_RISK)
+i_tp3Mult   = input.float(9.0,   "TP3 ATR Mult",     minval=1.0, maxval=15.0, step=0.5, group=GRP_RISK)
+i_tp1Pct    = input.int(10,      "TP1 Exit %",        minval=5, maxval=60, step=5, group=GRP_RISK)
+i_tp2Pct    = input.int(10,      "TP2 Exit %",        minval=5, maxval=60, step=5, group=GRP_RISK)
+i_riskPct   = input.float(5.0,   "Risk Per Trade %",  minval=0.5, maxval=15.0, step=0.5, group=GRP_RISK)
+i_maxBars   = input.int(30,      "Max Bars in Trade", minval=5, maxval=60, step=1, group=GRP_RISK)
+i_emergSL   = input.int(13,      "Emergency SL %",    minval=5, maxval=50, step=1, group=GRP_RISK)
+
+GRP_WH      = "Webhook"
+i_tickerOverride = input.string("", "Ticker Override", tooltip="Leave empty to use chart ticker. Set e.g. 'SOLUSDT.P' for exchange-specific routing.", group=GRP_WH)
+
+// ============================================================================
+// INDICATORS
+// ============================================================================
+
+stochRaw    = ta.stoch(close, high, low, i_stochLen)
+stochK      = ta.sma(stochRaw, i_stochSmth)
+stochD      = ta.sma(stochK, i_stochSmth)
+
+rsiVal      = ta.rsi(close, i_rsiLen)
+
+emaF        = ta.ema(close, i_emaFast)
+emaS        = ta.ema(close, i_emaSlow)
+
+bbBasis     = ta.sma(close, i_bbLen)
+bbDev       = i_bbMult * ta.stdev(close, i_bbLen)
+bbUpper     = bbBasis + bbDev
+bbLower     = bbBasis - bbDev
+bbWidth     = (bbUpper - bbLower) / bbBasis * 100
+bbSqueeze   = ta.percentrank(bbWidth, 100) < 25
+
+atrVal      = ta.atr(i_atrLen)
+
+// ============================================================================
+// ENTRY CONDITIONS
+// ============================================================================
+
+stochBullX  = ta.crossover(stochK, stochD) and stochK < 40
+stochBearX  = ta.crossunder(stochK, stochD) and stochK > 60
+
+emaBull     = emaF > emaS
+emaBear     = emaF < emaS
+
+bbBullSetup = (bbSqueeze or bbSqueeze[1] or bbSqueeze[2]) and close > bbBasis
+bbBearSetup = (bbSqueeze or bbSqueeze[1] or bbSqueeze[2]) and close < bbBasis
+
+int bullScore = 0
+bullScore += stochBullX  ? 1 : 0
+bullScore += emaBull     ? 1 : 0
+bullScore += bbBullSetup ? 1 : 0
+
+int bearScore = 0
+bearScore += stochBearX  ? 1 : 0
+bearScore += emaBear     ? 1 : 0
+bearScore += bbBearSetup ? 1 : 0
+
+bool goLong  = bullScore >= i_minEntry
+bool goShort = bearScore >= i_minEntry
+
+// ============================================================================
+// STRUCTURAL EXIT CONDITIONS
+// ============================================================================
+
+stochBullExit = ta.crossunder(stochK, stochD) and stochK > 60
+stochBearExit = ta.crossover(stochK, stochD) and stochK < 40
+
+rsiBullExit   = rsiVal < 40 and rsiVal[3] > 55
+rsiBearExit   = rsiVal > 60 and rsiVal[3] < 45
+
+longStructExit  = stochBullExit or rsiBullExit or goShort
+shortStructExit = stochBearExit or rsiBearExit or goLong
+
+// ============================================================================
+// POSITION STATE MACHINE (mirrors strategy logic bar-by-bar)
+// ============================================================================
+
+// Position state
+var int   posDir       = 0       // +1 long, -1 short, 0 flat
+var float entryPrice   = na
+var float entryAtr     = na
+var int   entryBar     = na
+var bool  tp1Hit       = false
+var bool  tp1Sub       = false   // TP1 sub closed
+var bool  tp2Sub       = false   // TP2 sub closed
+var bool  tp3Sub       = false   // TP3 sub closed
+var bool  slTriggered  = false
+
+// Pending signals (next-bar execution, matching strategy.close/entry)
+var int   pendingEntry = 0       // +1 long, -1 short, 0 none
+var float pendingAtr   = na
+var int   pendingClose = 0       // +1 close long, -1 close short, 0 none
+var string pendingCloseReason = ""
+
+// Alert state for this bar
+var bool  alertFired   = false
+alertFired := false
+
+string ticker = i_tickerOverride != "" ? i_tickerOverride : syminfo.ticker
+
+// Helper: timestamp string
+f_ts() =>
+    str.tostring(year) + '-' + str.tostring(month, "00") + '-' + str.tostring(dayofmonth, "00") + 'T' + str.tostring(hour, "00") + ':' + str.tostring(minute, "00") + 'Z'
+
+// Helper: build JSON webhook payloads (single-line to satisfy Pine v5 => syntax)
+f_json(string action, string dir, string reason, float price, float sl, float tp1, float tp2, float tp3) =>
+    '{"action":"' + action + '","ticker":"' + ticker + '","direction":"' + dir + '","reason":"' + reason + '","price":' + str.tostring(price, "#.####") + ',"sl":' + str.tostring(sl, "#.####") + ',"tp1":' + str.tostring(tp1, "#.####") + ',"tp2":' + str.tostring(tp2, "#.####") + ',"tp3":' + str.tostring(tp3, "#.####") + ',"tp1_pct":' + str.tostring(i_tp1Pct) + ',"tp2_pct":' + str.tostring(i_tp2Pct) + ',"tp3_pct":' + str.tostring(100 - i_tp1Pct - i_tp2Pct) + ',"time":"' + f_ts() + '"}'
+
+f_close_json(string reason, float exitPrice) =>
+    '{"action":"close","ticker":"' + ticker + '","direction":"' + (posDir > 0 ? "long" : "short") + '","reason":"' + reason + '","entry_price":' + str.tostring(entryPrice, "#.####") + ',"exit_price":' + str.tostring(exitPrice, "#.####") + ',"bars_held":' + str.tostring(bar_index - entryBar) + ',"time":"' + f_ts() + '"}'
+
+f_partial_json(string tpLevel, float tpPrice, int pct) =>
+    '{"action":"partial_close","ticker":"' + ticker + '","direction":"' + (posDir > 0 ? "long" : "short") + '","reason":"' + tpLevel + '","entry_price":' + str.tostring(entryPrice, "#.####") + ',"exit_price":' + str.tostring(tpPrice, "#.####") + ',"close_pct":' + str.tostring(pct) + ',"bars_held":' + str.tostring(bar_index - entryBar) + ',"time":"' + f_ts() + '"}'
+
+// ─── Execute pending close at this bar's open ──────────────────
+if pendingClose != 0 and posDir != 0
+    alert(f_close_json(pendingCloseReason, open), alert.freq_once_per_bar)
+    posDir       := 0
+    entryPrice   := na
+    entryAtr     := na
+    entryBar     := na
+    tp1Hit       := false
+    tp1Sub       := false
+    tp2Sub       := false
+    tp3Sub       := false
+    slTriggered  := false
+    alertFired   := true
+
+pendingClose := 0
+pendingCloseReason := ""
+
+// If position went flat (all TPs hit) while SL was pending, clear it
+if posDir == 0
+    slTriggered := false
+
+// ─── Execute pending entry at this bar's open ──────────────────
+if pendingEntry != 0 and posDir == 0
+    float fillPrice = open
+    float slDist = pendingAtr * i_atrSL
+    if slDist > 0 and fillPrice > 0
+        bool isLong = pendingEntry > 0
+        float slPrice = isLong ? fillPrice - pendingAtr * i_atrSL : fillPrice + pendingAtr * i_atrSL
+        float tp1Price = isLong ? fillPrice + pendingAtr * i_tp1Mult : fillPrice - pendingAtr * i_tp1Mult
+        float tp2Price = isLong ? fillPrice + pendingAtr * i_tp2Mult : fillPrice - pendingAtr * i_tp2Mult
+        float tp3Price = isLong ? fillPrice + pendingAtr * i_tp3Mult : fillPrice - pendingAtr * i_tp3Mult
+        string dir = isLong ? "long" : "short"
+
+        alert(f_json("open", dir, "signal", fillPrice, slPrice, tp1Price, tp2Price, tp3Price), alert.freq_once_per_bar)
+        alertFired   := true
+
+        posDir       := isLong ? 1 : -1
+        entryPrice   := fillPrice
+        entryAtr     := pendingAtr
+        entryBar     := bar_index
+        tp1Hit       := false
+        tp1Sub       := false
+        tp2Sub       := false
+        tp3Sub       := false
+        slTriggered  := false
+
+pendingEntry := 0
+pendingAtr   := na
+
+// ─── slTriggered → queue close for next bar ────────────────────
+if slTriggered and posDir != 0
+    pendingClose := posDir
+    pendingCloseReason := "SL"
+    slTriggered := false
+if posDir == 0
+    slTriggered := false
+
+// ─── Exit checks (intra-bar) ──────────────────────────────────
+if posDir != 0
+    bool isLong = posDir > 0
+    float ep = entryPrice
+    int barsHeld = bar_index - entryBar
+    bool fullExit = false
+
+    // 1. Emergency SL (intra-bar, any bar)
+    float emergPrice = isLong ? ep * (1 - i_emergSL / 100.0) : ep * (1 + i_emergSL / 100.0)
+    if (isLong ? low <= emergPrice : high >= emergPrice)
+        alert(f_close_json("ESL", emergPrice), alert.freq_once_per_bar)
+        alertFired := true
+        posDir       := 0
+        entryPrice   := na
+        entryAtr     := na
+        entryBar     := na
+        tp1Hit       := false
+        tp1Sub       := false
+        tp2Sub       := false
+        tp3Sub       := false
+        fullExit     := true
+
+    // 2. TP checks (intra-bar, skip entry bar)
+    if not fullExit and barsHeld >= 1
+        float tp1Price = isLong ? ep + entryAtr * i_tp1Mult : ep - entryAtr * i_tp1Mult
+        float tp2Price = isLong ? ep + entryAtr * i_tp2Mult : ep - entryAtr * i_tp2Mult
+        float tp3Price = isLong ? ep + entryAtr * i_tp3Mult : ep - entryAtr * i_tp3Mult
+
+        if not tp1Sub and (isLong ? high >= tp1Price : low <= tp1Price)
+            alert(f_partial_json("TP1", tp1Price, i_tp1Pct), alert.freq_once_per_bar)
+            tp1Sub := true
+            tp1Hit := true
+            alertFired := true
+
+        if not tp2Sub and (isLong ? high >= tp2Price : low <= tp2Price)
+            alert(f_partial_json("TP2", tp2Price, i_tp2Pct), alert.freq_once_per_bar)
+            tp2Sub := true
+            alertFired := true
+
+        if not tp3Sub and (isLong ? high >= tp3Price : low <= tp3Price)
+            alert(f_partial_json("TP3", tp3Price, 100 - i_tp1Pct - i_tp2Pct), alert.freq_once_per_bar)
+            tp3Sub := true
+            alertFired := true
+
+        // All TPs hit → position fully closed
+        if tp1Sub and tp2Sub and tp3Sub
+            posDir     := 0
+            entryPrice := na
+            entryAtr   := na
+            entryBar   := na
+            tp1Hit     := false
+            tp1Sub     := false
+            tp2Sub     := false
+            tp3Sub     := false
+            fullExit   := true
+
+    // 3. Time-based exit (deferred)
+    if not fullExit and posDir != 0 and pendingClose == 0 and barsHeld >= i_maxBars - 1
+        pendingClose := posDir
+        pendingCloseReason := "TIME"
+        fullExit := true
+
+    // 4. Structural exits (deferred)
+    if not fullExit and posDir != 0 and pendingClose == 0
+        bool structExit = false
+        bool oppSignal = false
+        if isLong
+            oppSignal := goShort
+            structExit := stochBullExit or rsiBullExit or oppSignal
+        else
+            oppSignal := goLong
+            structExit := stochBearExit or rsiBearExit or oppSignal
+
+        if structExit
+            pendingClose := posDir
+            pendingCloseReason := oppSignal ? "REVERSAL" : "STRUCTURAL"
+            fullExit := true
+
+            if oppSignal
+                pendingEntry := isLong ? -1 : 1
+                pendingAtr   := atrVal
+
+    // 5. Close-based SL (2-step deferral)
+    if posDir != 0 and not slTriggered
+        float slPrice = na
+        if isLong
+            slPrice := tp1Hit ? ep * 1.003 : ep - entryAtr * i_atrSL
+        else
+            slPrice := tp1Hit ? ep * 0.997 : ep + entryAtr * i_atrSL
+        if (isLong ? close <= slPrice : close >= slPrice)
+            slTriggered := true
+
+// ─── Entry checks (if flat) ───────────────────────────────────
+if posDir == 0 and pendingEntry == 0 and pendingClose == 0 and not slTriggered
+    if goLong
+        pendingEntry := 1
+        pendingAtr   := atrVal
+    else if goShort
+        pendingEntry := -1
+        pendingAtr   := atrVal
+
+// ============================================================================
+// VISUALIZATION
+// ============================================================================
+
+// Entry signals
+plotshape(posDir > 0 and posDir[1] <= 0, "Long Entry",
+     shape.triangleup, location.belowbar, color.lime, size=size.small)
+plotshape(posDir < 0 and posDir[1] >= 0, "Short Entry",
+     shape.triangledown, location.abovebar, color.red, size=size.small)
+
+// TP/SL levels
+float tpLine1 = posDir > 0 ? entryPrice + entryAtr * i_tp1Mult : posDir < 0 ? entryPrice - entryAtr * i_tp1Mult : na
+float tpLine2 = posDir > 0 ? entryPrice + entryAtr * i_tp2Mult : posDir < 0 ? entryPrice - entryAtr * i_tp2Mult : na
+float tpLine3 = posDir > 0 ? entryPrice + entryAtr * i_tp3Mult : posDir < 0 ? entryPrice - entryAtr * i_tp3Mult : na
+float slLine  = posDir > 0 ? (tp1Hit ? entryPrice * 1.003 : entryPrice - entryAtr * i_atrSL) : posDir < 0 ? (tp1Hit ? entryPrice * 0.997 : entryPrice + entryAtr * i_atrSL) : na
+
+plot(tpLine1, "TP1", color.new(#3fb950, tp1Sub ? 80 : 30), 1, plot.style_linebr)
+plot(tpLine2, "TP2", color.new(#58a6ff, tp2Sub ? 80 : 30), 1, plot.style_linebr)
+plot(tpLine3, "TP3", color.new(#d2a8ff, tp3Sub ? 80 : 30), 1, plot.style_linebr)
+plot(slLine,  "SL",  color.new(#f85149, 30), 1, plot.style_linebr)
+plot(entryPrice, "Entry", posDir != 0 ? color.new(color.white, 50) : na, 1, plot.style_linebr)
+
+// BB bands
+p1 = plot(bbUpper, "BB+", color.new(color.blue, 80))
+p2 = plot(bbLower, "BB-", color.new(color.blue, 80))
+fill(p1, p2, color=bbSqueeze ? color.new(color.yellow, 92) : color.new(color.blue, 96))
+
+// EMAs
+plot(emaF, "EMA Fast", color.new(color.green, 60), 1)
+plot(emaS, "EMA Slow", color.new(color.red, 60), 1)
+
+// ============================================================================
+// INFO TABLE
+// ============================================================================
+
+var table tbl = table.new(position.top_right, 2, 5,
+     bgcolor=color.new(#0f1729, 0), border_width=1,
+     border_color=color.new(color.gray, 60), frame_width=2,
+     frame_color=color.new(color.white, 40))
+
+if barstate.islastconfirmedhistory or barstate.islast
+    cW = color.white
+    cG = color.lime
+    cD = color.new(color.gray, 50)
+    sz = size.small
+    hBg = color.new(#1a3a6e, 0)
+
+    int tp3Pct = 100 - i_tp1Pct - i_tp2Pct
+    string posStr = posDir > 0 ? "LONG" : posDir < 0 ? "SHORT" : "FLAT"
+    color posCol = posDir > 0 ? cG : posDir < 0 ? color.red : cD
+
+    table.cell(tbl, 0, 0, "JM 3TP Alerts", text_color=color.yellow, text_size=size.normal, text_halign=text.align_center, bgcolor=hBg)
+    table.cell(tbl, 1, 0, "Run #35", text_color=color.yellow, text_size=sz, text_halign=text.align_center, bgcolor=hBg)
+
+    table.cell(tbl, 0, 1, "Position", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 1, posStr + (posDir != 0 ? " (" + str.tostring(bar_index - entryBar) + "b)" : ""),
+         text_color=posCol, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 2, "Entry", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 2, posDir != 0 ? str.tostring(entryPrice, "#.####") : "—",
+         text_color=cW, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 3, "SL / TPs", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 3, str.tostring(i_atrSL, "#.##") + " | " + str.tostring(i_tp1Mult, "#.##") + "/" + str.tostring(i_tp2Mult, "#.##") + "/" + str.tostring(i_tp3Mult, "#.##") + " @" + str.tostring(i_tp1Pct) + "/" + str.tostring(i_tp2Pct) + "/" + str.tostring(tp3Pct) + "%",
+         text_color=cW, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 4, "Risk / Bars", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 4, str.tostring(i_riskPct, "#.#") + "% | " + str.tostring(i_maxBars) + "b | ESL" + str.tostring(i_emergSL) + "%",
+         text_color=cW, text_size=sz, text_halign=text.align_right)

@@ -116,7 +116,8 @@ document.getElementById('btn-update-all').addEventListener('click', async () => 
 function updateIngestProgress(msg) {
   $ingestProgress.style.display = 'block';
   $ingestProgress.querySelector('.fill').style.width = msg.pct + '%';
-  $ingestStatus.textContent = `${msg.symbol}: ${msg.fetched.toLocaleString()} / ~${msg.total.toLocaleString()} candles (${msg.pct}%)`;
+  const phase = msg.phase === 'backfill' ? ' [backfill]' : '';
+  $ingestStatus.textContent = `${msg.symbol}${phase}: ${msg.fetched.toLocaleString()} / ~${msg.total.toLocaleString()} candles (${msg.pct}%)`;
 }
 
 function onIngestComplete(msg) {

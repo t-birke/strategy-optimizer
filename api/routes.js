@@ -55,17 +55,15 @@ router.post('/api/symbols/:symbol/ingest', async (req, res) => {
 
     res.json({ status: 'started', symbol });
 
-    // Run ingestion in background
-    const fiveYearsAgo = Date.now() - 5 * 365.25 * 24 * 60 * 60 * 1000;
-    const startTs = Math.max(info.earliestTs, fiveYearsAgo);
-
-    ingestSymbol(symbol, startTs, ({ fetched, estimatedTotal }) => {
+    // Run ingestion in background — newest data first, then backfill
+    ingestSymbol(symbol, info.earliestTs, ({ fetched, estimatedTotal, phase }) => {
       broadcast({
         type: 'ingest_progress',
         symbol,
         fetched,
         total: estimatedTotal,
-        pct: Math.round(fetched / estimatedTotal * 100),
+        pct: estimatedTotal > 0 ? Math.round(fetched / estimatedTotal * 100) : 0,
+        phase,
       });
     }).then(count => {
       broadcast({ type: 'ingest_complete', symbol, candles: count });
@@ -82,13 +80,14 @@ router.post('/api/symbols/:symbol/update', async (req, res) => {
   try {
     res.json({ status: 'started', symbol });
 
-    updateSymbol(symbol, ({ fetched, estimatedTotal }) => {
+    updateSymbol(symbol, ({ fetched, estimatedTotal, phase }) => {
       broadcast({
         type: 'ingest_progress',
         symbol,
         fetched,
         total: estimatedTotal,
-        pct: Math.round(fetched / estimatedTotal * 100),
+        pct: estimatedTotal > 0 ? Math.round(fetched / estimatedTotal * 100) : 0,
+        phase,
       });
     }).then(count => {
       broadcast({ type: 'ingest_complete', symbol, candles: count });
@@ -107,14 +106,15 @@ router.post('/api/symbols/update-all', async (req, res) => {
 
     for (const s of stats) {
       try {
-        broadcast({ type: 'ingest_progress', symbol: s.symbol, fetched: 0, total: 0, pct: 0 });
-        const count = await updateSymbol(s.symbol, ({ fetched, estimatedTotal }) => {
+        broadcast({ type: 'ingest_progress', symbol: s.symbol, fetched: 0, total: 0, pct: 0, phase: 'recent' });
+        const count = await updateSymbol(s.symbol, ({ fetched, estimatedTotal, phase }) => {
           broadcast({
             type: 'ingest_progress',
             symbol: s.symbol,
             fetched,
             total: estimatedTotal,
-            pct: Math.round(fetched / estimatedTotal * 100),
+            pct: estimatedTotal > 0 ? Math.round(fetched / estimatedTotal * 100) : 0,
+            phase,
           });
         });
         broadcast({ type: 'ingest_complete', symbol: s.symbol, candles: count });
