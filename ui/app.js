@@ -224,6 +224,21 @@ function onGeneration(msg) {
     document.getElementById('live-migrations').textContent = msg.totalMigrations;
     if (msg.islands) renderIslandViz(msg);
   }
+
+  // Abort status feedback
+  if (msg.aborting) {
+    const btn = document.getElementById('btn-abort');
+    btn.disabled = true;
+    btn.textContent = 'Aborting...';
+    const titleEl = document.getElementById('live-title');
+    if (!titleEl.textContent.includes('ABORTING')) {
+      titleEl.textContent += ' — ABORTING';
+    }
+    // Show abort status in the generation field
+    if (msg.abortStatus) {
+      document.getElementById('live-gen').textContent = msg.abortStatus;
+    }
+  }
 }
 
 function onRunCompleted(msg) {

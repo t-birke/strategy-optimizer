@@ -208,15 +208,44 @@ export async function runOptimization(config) {
     g = end + 1;
   }
 
+  let cancelSent = false;
+
   for (const batch of batches) {
     if (shouldCancel?.()) {
-      for (const w of workers) w.postMessage({ type: 'cancel' });
+      if (!cancelSent) {
+        for (const w of workers) w.postMessage({ type: 'cancel' });
+        cancelSent = true;
+      }
       break;
     }
 
     // Send 'evolve' to all workers and collect results
     const batchDone = new Array(numIslands);
     const batchPromises = [];
+
+    // Poll for cancel mid-batch — send cancel to workers immediately
+    let cancelPoller = null;
+    if (shouldCancel) {
+      cancelPoller = setInterval(() => {
+        if (!cancelSent && shouldCancel()) {
+          cancelSent = true;
+          for (const w of workers) w.postMessage({ type: 'cancel' });
+          if (onProgress) {
+            onProgress({
+              gen: Math.max(...islandGen),
+              totalGens: generations,
+              aborting: true,
+              abortStatus: 'Stopping workers — waiting for current generation to finish',
+              abortIslands: islandGen.map((g, i) => ({ idx: i, gen: g })),
+              best: Math.max(...islandBest.map(ib => ib?.fitness ?? -Infinity)),
+              metrics: islandBest.reduce((best, ib) => (ib && ib.fitness > (best?.fitness ?? -Infinity)) ? ib : best, null)?.metrics,
+              elapsedMs: Date.now() - startTime,
+              numIslands,
+            });
+          }
+        }
+      }, 200);
+    }
 
     for (let idx = 0; idx < numIslands; idx++) {
       const w = workers[idx];
@@ -258,7 +287,7 @@ export async function runOptimization(config) {
             if (onProgress) {
               const minGen = Math.min(...islandGen.filter(g => g > 0));
               const maxGen = Math.max(...islandGen);
-              onProgress({
+              const progressMsg = {
                 gen: maxGen,
                 minGen: isFinite(minGen) ? minGen : 0,
                 maxGen,
@@ -282,7 +311,16 @@ export async function runOptimization(config) {
                   evals: workerEvals[i],
                 })),
                 edges: numIslands > 1 ? buildEdges() : [],
-              });
+              };
+
+              // If aborting, add abort status
+              if (cancelSent) {
+                progressMsg.aborting = true;
+                progressMsg.abortStatus = 'Stopping workers — finishing current generation';
+                progressMsg.abortIslands = islandGen.map((g, i) => ({ idx: i, gen: g }));
+              }
+
+              onProgress(progressMsg);
             }
           } else if (msg.type === 'batch_done') {
             batchDone[idx] = msg;
@@ -303,10 +341,14 @@ export async function runOptimization(config) {
     }
 
     await Promise.all(batchPromises);
+    if (cancelPoller) clearInterval(cancelPoller);
 
     // Check cancel between batches
     if (shouldCancel?.()) {
-      for (const w of workers) w.postMessage({ type: 'cancel' });
+      if (!cancelSent) {
+        for (const w of workers) w.postMessage({ type: 'cancel' });
+        cancelSent = true;
+      }
       break;
     }
 
@@ -348,6 +390,17 @@ export async function runOptimization(config) {
   }
 
   // 6. Collect final results from all workers
+  if (cancelSent && onProgress) {
+    onProgress({
+      gen: Math.max(...islandGen),
+      totalGens: generations,
+      aborting: true,
+      abortStatus: 'Collecting partial results from workers',
+      elapsedMs: Date.now() - startTime,
+      numIslands,
+    });
+  }
+
   const resultPromises = workers.map((w, idx) => new Promise(resolve => {
     const handler = (msg) => {
       if (msg.type === 'results' && msg.islandIdx === idx) {
@@ -360,6 +413,17 @@ export async function runOptimization(config) {
   }));
 
   const finalResults = await Promise.all(resultPromises);
+
+  if (cancelSent && onProgress) {
+    onProgress({
+      gen: Math.max(...islandGen),
+      totalGens: generations,
+      aborting: true,
+      abortStatus: 'Terminating worker threads',
+      elapsedMs: Date.now() - startTime,
+      numIslands,
+    });
+  }
 
   // Terminate all workers
   await Promise.all(workers.map(w => w.terminate()));

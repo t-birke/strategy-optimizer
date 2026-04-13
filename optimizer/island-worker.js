@@ -100,10 +100,8 @@ parentPort.on('message', async (msg) => {
           cacheSize: fitnessCache.size,
         });
 
-        // Yield every 5 gens to process incoming messages (cancel)
-        if (gen % 5 === 0) {
-          await new Promise(r => setImmediate(r));
-        }
+        // Yield every generation to process incoming messages (cancel)
+        await new Promise(r => setImmediate(r));
       }
 
       // Return top individuals for migration
