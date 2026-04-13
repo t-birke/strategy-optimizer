@@ -278,3 +278,7 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
 }
 
 .checkbox-group input { display: none; }
+
+/* TV button */
+.btn-tv { background: #1f6feb; border-color: #1f6feb; }
+.btn-tv:hover { background: #388bfd; }

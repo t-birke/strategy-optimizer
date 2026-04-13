@@ -30,6 +30,9 @@ function handleWsMessage(msg) {
       onRunError(msg);
       break;
     case 'run_cancelled':
+      activeRunId = null;
+      document.getElementById('btn-abort').disabled = true;
+      document.getElementById('btn-abort').textContent = 'Aborted';
       loadRuns();
       loadQueue();
       break;
@@ -179,11 +182,15 @@ window.deleteSymbol = async (symbol) => {
 
 // ─── Optimizer Page ─────────────────────────────────────────
 const $livePanel = document.getElementById('live-panel');
+let activeRunId = null;
 
 function onRunStarted(msg) {
+  activeRunId = msg.runId;
   $livePanel.classList.add('active');
   document.getElementById('live-title').textContent = `${msg.symbol} ${msg.label || tfLabel(msg.timeframe)}`;
   document.getElementById('live-progress-fill').style.width = '0%';
+  document.getElementById('btn-abort').disabled = false;
+  document.getElementById('btn-abort').textContent = 'Abort';
   resetLiveStats();
   loadRuns();
   loadQueue();
@@ -192,7 +199,10 @@ function onRunStarted(msg) {
 function onGeneration(msg) {
   const pct = Math.round(msg.gen / msg.totalGens * 100);
   document.getElementById('live-progress-fill').style.width = pct + '%';
-  document.getElementById('live-gen').textContent = `${msg.gen}/${msg.totalGens}`;
+  const genText = (msg.minGen != null && msg.minGen !== msg.maxGen)
+    ? `${msg.minGen}-${msg.maxGen} / ${msg.totalGens}`
+    : `${msg.gen} / ${msg.totalGens}`;
+  document.getElementById('live-gen').textContent = genText;
   document.getElementById('live-best').textContent = '$' + Math.round(msg.best).toLocaleString();
   document.getElementById('live-evals').textContent = msg.evalCount;
   document.getElementById('live-time').textContent = (msg.elapsedMs / 1000).toFixed(1) + 's';
@@ -217,7 +227,9 @@ function onGeneration(msg) {
 }
 
 function onRunCompleted(msg) {
+  activeRunId = null;
   document.getElementById('live-progress-fill').style.width = '100%';
+  document.getElementById('btn-abort').disabled = true;
   loadRuns();
   loadQueue();
   // Hide live panel after a delay if no more runs
@@ -231,10 +243,26 @@ function onRunCompleted(msg) {
 }
 
 function onRunError(msg) {
+  activeRunId = null;
   document.getElementById('live-title').textContent += ' - FAILED';
+  document.getElementById('btn-abort').disabled = true;
   loadRuns();
   loadQueue();
 }
+
+window.abortRun = async () => {
+  if (!activeRunId) return;
+  const btn = document.getElementById('btn-abort');
+  btn.disabled = true;
+  btn.textContent = 'Aborting...';
+  try {
+    await fetch(`/api/runs/${activeRunId}/cancel`, { method: 'POST' });
+  } catch (err) {
+    console.error('Abort failed:', err);
+    btn.disabled = false;
+    btn.textContent = 'Abort';
+  }
+};
 
 function resetLiveStats() {
   for (const id of ['live-gen', 'live-best', 'live-pf', 'live-wr', 'live-dd', 'live-trades', 'live-evals', 'live-time']) {
@@ -258,14 +286,14 @@ function renderIslandViz(msg) {
   if (n < 2) { container.style.display = 'none'; return; }
 
   const W = svg.clientWidth || 500;
-  const H = 200;
+  const H = 220;
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
 
   const cx = W / 2;
   const cy = H / 2;
   const rx = Math.min(W * 0.38, 190);
   const ry = Math.min(H * 0.38, 70);
-  const nodeR = 30;
+  const nodeR = 34;
 
   // Compute node positions in an ellipse
   const nodes = msg.islands.map((isl, i) => {
@@ -334,12 +362,14 @@ function renderIslandViz(msg) {
     const fill = isBest ? '#1f6feb33' : '#21262d';
     const stroke = isBest ? '#58a6ff' : '#30363d';
     const profitStr = nd.profit != null ? '$' + Math.round(nd.profit).toLocaleString() : '-';
+    const genStr = nd.gen != null ? 'g' + nd.gen : '';
     const tradesStr = nd.trades != null ? nd.trades + 't' : '';
 
     html += `<circle cx="${nd.x}" cy="${nd.y}" r="${nodeR}" fill="${fill}" stroke="${stroke}" stroke-width="${isBest ? 2 : 1}"/>`;
-    html += `<text x="${nd.x}" y="${nd.y - 6}" text-anchor="middle" fill="${isBest ? '#58a6ff' : '#8b949e'}" font-size="10" font-weight="600">#${nd.idx}</text>`;
-    html += `<text x="${nd.x}" y="${nd.y + 8}" text-anchor="middle" fill="${nd.profit > 0 ? '#3fb950' : nd.profit != null && nd.profit < 0 ? '#f85149' : '#8b949e'}" font-size="10" font-weight="700">${profitStr}</text>`;
-    html += `<text x="${nd.x}" y="${nd.y + 20}" text-anchor="middle" fill="#8b949e" font-size="8">${tradesStr}</text>`;
+    html += `<text x="${nd.x}" y="${nd.y - 12}" text-anchor="middle" fill="${isBest ? '#58a6ff' : '#8b949e'}" font-size="10" font-weight="600">#${nd.idx}</text>`;
+    html += `<text x="${nd.x}" y="${nd.y + 2}" text-anchor="middle" fill="${nd.profit > 0 ? '#3fb950' : nd.profit != null && nd.profit < 0 ? '#f85149' : '#8b949e'}" font-size="10" font-weight="700">${profitStr}</text>`;
+    html += `<text x="${nd.x}" y="${nd.y + 14}" text-anchor="middle" fill="#8b949e" font-size="8">${tradesStr}</text>`;
+    html += `<text x="${nd.x}" y="${nd.y + 24}" text-anchor="middle" fill="#6e7681" font-size="8">${genStr}</text>`;
   }
 
   // Topology label
@@ -349,12 +379,30 @@ function renderIslandViz(msg) {
   svg.innerHTML = html;
 }
 
+let expandedRunId = null; // currently expanded row — survives table refreshes
+
+function fmtDuration(totalSec) {
+  const d = Math.floor(totalSec / 86400);
+  const h = Math.floor((totalSec % 86400) / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = Math.floor(totalSec % 60);
+  const parts = [];
+  if (d) parts.push(d + 'd');
+  if (h) parts.push(h + 'h');
+  if (m) parts.push(m + 'm');
+  if (s || parts.length === 0) parts.push(s + 's');
+  return parts.join(' ');
+}
+
 function tfLabel(minutes) {
   if (minutes >= 60) return (minutes / 60) + 'H';
   return minutes + 'm';
 }
 
 async function loadRuns() {
+  // Skip rebuild while a row is expanded — preserves expand content + TV results
+  if (expandedRunId !== null) return;
+
   try {
     const res = await fetch('/api/runs');
     const data = await res.json();
@@ -377,8 +425,16 @@ async function loadRuns() {
       const dd = m?.maxDDPct;
       const trades = m?.trades;
 
-      const elapsed = r.started_at && r.completed_at
-        ? ((new Date(r.completed_at) - new Date(r.started_at)) / 1000).toFixed(1) + 's'
+      const toMs = (v) => v?.micros ? Number(v.micros) / 1000 : (typeof v === 'string' ? new Date(v).getTime() : NaN);
+      const startMs = toMs(r.started_at);
+      const endMs = toMs(r.completed_at);
+      const elapsed = startMs && endMs ? fmtDuration((endMs - startMs) / 1000) : '-';
+
+      const testFrom = r.start_date || '-';
+      const createdMs = toMs(r.created_at);
+      const testTo = createdMs ? new Date(createdMs).toISOString().split('T')[0] : '-';
+      const testDays = (testFrom !== '-' && testTo !== '-')
+        ? Math.round((new Date(testTo) - new Date(testFrom)) / 86400000)
         : '-';
 
       return `
@@ -386,6 +442,9 @@ async function loadRuns() {
           <td>${r.id}</td>
           <td><strong>${r.symbol}</strong></td>
           <td>${tfLabel(r.timeframe)}</td>
+          <td>${testFrom}</td>
+          <td>${testTo}</td>
+          <td class="num">${testDays !== '-' ? testDays + 'd' : '-'}</td>
           <td><span class="badge ${r.status}">${r.status}</span></td>
           <td class="num ${profit > 0 ? 'positive' : profit < 0 ? 'negative' : ''}">${profit != null ? '$' + Math.round(profit).toLocaleString() : '-'}</td>
           <td class="num">${pf != null ? pf.toFixed(2) : '-'}</td>
@@ -395,7 +454,7 @@ async function loadRuns() {
           <td class="num">${r.generations_completed || '-'}</td>
           <td>${elapsed}</td>
         </tr>
-        <tr class="expand-row" id="expand-${r.id}"><td colspan="11" id="expand-content-${r.id}">Loading...</td></tr>
+        <tr class="expand-row" id="expand-${r.id}"><td colspan="14" id="expand-content-${r.id}">Loading...</td></tr>
       `;
     }).join('');
   } catch (err) {
@@ -405,13 +464,18 @@ async function loadRuns() {
 
 window.toggleRunDetails = async (id) => {
   const row = document.getElementById(`expand-${id}`);
+
+  // Clicking the already-expanded row collapses it
   if (row.classList.contains('visible')) {
     row.classList.remove('visible');
+    expandedRunId = null;
     return;
   }
 
-  // Close other expansions
+  // Close any other expanded row
   document.querySelectorAll('.expand-row.visible').forEach(r => r.classList.remove('visible'));
+
+  expandedRunId = id;
   row.classList.add('visible');
 
   const content = document.getElementById(`expand-content-${id}`);
@@ -428,19 +492,26 @@ window.toggleRunDetails = async (id) => {
     let gene = run.best_gene;
     if (typeof gene === 'string') try { gene = JSON.parse(gene); } catch { gene = null; }
 
-    let html = '';
+    let html = `<div style="display:flex;justify-content:flex-end;margin:-8px -8px 8px 0">
+      <button onclick="closeExpand(event)" style="background:none;border:none;color:#8b949e;font-size:18px;cursor:pointer;padding:4px 8px;line-height:1" title="Close">&times;</button>
+    </div>`;
 
     if (gene) {
       const tp3Pct = 100 - (gene.tp1Pct || 0) - (gene.tp2Pct || 0);
-      html += `<div style="margin-bottom:12px;font-size:13px">
-        <strong>Winner config:</strong>
-        E${gene.minEntry} St${gene.stochLen}/${gene.stochSmth} R${gene.rsiLen}
-        EMA${gene.emaFast}/${gene.emaSlow} BB${gene.bbLen}x${gene.bbMult}
-        ATR${gene.atrLen} SL${gene.atrSL}
-        TP${gene.tp1Mult}/${gene.tp2Mult}/${gene.tp3Mult}
-        @${gene.tp1Pct}/${gene.tp2Pct}/${tp3Pct}%
-        R${gene.riskPct}% T${gene.maxBars}b
-      </div>`;
+      html += `<div style="margin-bottom:12px;font-size:13px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <span>
+          <strong>Winner config:</strong>
+          E${gene.minEntry} St${gene.stochLen}/${gene.stochSmth} R${gene.rsiLen}
+          EMA${gene.emaFast}/${gene.emaSlow} BB${gene.bbLen}x${gene.bbMult}
+          ATR${gene.atrLen} SL${gene.atrSL}
+          TP${gene.tp1Mult}/${gene.tp2Mult}/${gene.tp3Mult}
+          @${gene.tp1Pct}/${gene.tp2Pct}/${tp3Pct}%
+          R${gene.riskPct}% T${gene.maxBars}b
+        </span>
+        <button onclick="sendToTV(${id})" class="primary btn-tv" id="btn-tv-${id}" style="font-size:11px;padding:3px 10px;white-space:nowrap">Send to TV</button>
+        <span id="tv-status-${id}" style="font-size:12px"></span>
+      </div>
+      <div id="tv-result-${id}" style="display:none;margin-bottom:12px"></div>`;
     }
 
     if (top.length > 0) {
@@ -461,11 +532,17 @@ window.toggleRunDetails = async (id) => {
       html += '</tbody></table>';
     }
 
-    if (!html) html = '<em>No detailed results available</em>';
+    if (!gene && top.length === 0) html += '<em>No detailed results available</em>';
     content.innerHTML = html;
   } catch (err) {
     content.textContent = 'Error loading details: ' + err.message;
   }
+};
+
+window.closeExpand = (event) => {
+  event.stopPropagation();
+  document.querySelectorAll('.expand-row.visible').forEach(r => r.classList.remove('visible'));
+  expandedRunId = null;
 };
 
 async function loadQueue() {
@@ -563,6 +640,109 @@ document.getElementById('modal-start').addEventListener('click', async () => {
 $modal.addEventListener('click', (e) => {
   if (e.target === $modal) $modal.classList.remove('active');
 });
+
+// ─── TradingView Bridge ────────────────────────────────────
+
+window.sendToTV = async (runId) => {
+  const btn = document.getElementById(`btn-tv-${runId}`);
+  const status = document.getElementById(`tv-status-${runId}`);
+  const resultDiv = document.getElementById(`tv-result-${runId}`);
+
+  btn.disabled = true;
+  btn.textContent = 'Connecting...';
+  status.textContent = '';
+  status.style.color = '#8b949e';
+  resultDiv.style.display = 'none';
+
+  try {
+    // Fetch run details to get gene + symbol
+    const runRes = await fetch(`/api/runs/${runId}`);
+    const run = await runRes.json();
+
+    let gene = run.best_gene;
+    if (typeof gene === 'string') gene = JSON.parse(gene);
+    if (!gene) throw new Error('No gene config found for this run');
+
+    btn.textContent = 'Setting inputs...';
+
+    const res = await fetch('/api/tv/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gene, symbol: run.symbol, timeframe: run.timeframe }),
+    });
+    const data = await res.json();
+
+    if (!res.ok) throw new Error(data.error || 'Failed to send to TV');
+
+    btn.textContent = 'Send to TV';
+    btn.disabled = false;
+
+    if (data.tvMetrics) {
+      const tv = data.tvMetrics;
+      let gaMetrics = run.best_metrics;
+      if (typeof gaMetrics === 'string') gaMetrics = JSON.parse(gaMetrics);
+
+      const gaProfit = gaMetrics?.netProfit;
+      const tvProfit = tv.netProfit;
+      const diff = gaProfit ? ((tvProfit - gaProfit) / Math.abs(gaProfit) * 100).toFixed(1) : null;
+      const diffColor = Math.abs(diff) < 15 ? '#3fb950' : Math.abs(diff) < 30 ? '#d29922' : '#f85149';
+
+      status.innerHTML = `<span style="color:${tvProfit >= 0 ? '#3fb950' : '#f85149'}">TV: $${Math.round(tvProfit).toLocaleString()}</span>` +
+        (diff ? ` <span style="color:${diffColor}">(${diff > 0 ? '+' : ''}${diff}%)</span>` : '');
+
+      resultDiv.style.display = 'block';
+      resultDiv.innerHTML = `
+        <table style="font-size:12px;max-width:600px">
+          <thead><tr><th>Metric</th><th class="num">GA Optimizer</th><th class="num">TradingView</th><th class="num">Delta</th></tr></thead>
+          <tbody>
+            ${compareRow('Net Profit', gaProfit, tvProfit, v => '$' + Math.round(v).toLocaleString())}
+            ${compareRow('Total Trades', gaMetrics?.trades, tv.totalTrades, v => v)}
+            ${compareRow('Win Rate', gaMetrics?.winRate, tv.percentProfitable, v => (v * 100).toFixed(1) + '%')}
+            ${compareRow('Profit Factor', gaMetrics?.pf, tv.profitFactor, v => v?.toFixed(2))}
+            ${compareRow('Max Drawdown', gaMetrics?.maxDDPct, tv.maxDrawDownPercent, v => (v * 100).toFixed(1) + '%')}
+            ${compareRow('Sharpe Ratio', gaMetrics?.sharpe, tv.sharpeRatio, v => v?.toFixed(2))}
+          </tbody>
+        </table>
+        <div style="font-size:11px;color:#8b949e;margin-top:6px">Chart: ${data.chartInfo?.symbol} @ ${data.chartInfo?.resolution} | ${data.inputsChanged?.length || 0} inputs changed</div>
+      `;
+    } else {
+      status.textContent = 'Inputs set, but could not read metrics';
+      status.style.color = '#d29922';
+    }
+  } catch (err) {
+    btn.textContent = 'Send to TV';
+    btn.disabled = false;
+    status.textContent = err.message;
+    status.style.color = '#f85149';
+  }
+};
+
+function compareRow(label, gaVal, tvVal, fmt) {
+  const gaStr = gaVal != null ? fmt(gaVal) : '-';
+  const tvStr = tvVal != null ? fmt(tvVal) : '-';
+  let delta = '-';
+  let deltaColor = '#8b949e';
+  if (gaVal != null && tvVal != null && gaVal !== 0) {
+    const pct = ((tvVal - gaVal) / Math.abs(gaVal) * 100).toFixed(1);
+    delta = (pct > 0 ? '+' : '') + pct + '%';
+    deltaColor = Math.abs(pct) < 15 ? '#3fb950' : Math.abs(pct) < 30 ? '#d29922' : '#f85149';
+  }
+  return `<tr><td>${label}</td><td class="num">${gaStr}</td><td class="num">${tvStr}</td><td class="num" style="color:${deltaColor}">${delta}</td></tr>`;
+}
+
+// Check TV connection on load
+(async () => {
+  try {
+    const res = await fetch('/api/tv/status');
+    const data = await res.json();
+    const badge = document.getElementById('tv-badge');
+    if (badge) {
+      badge.style.display = '';
+      badge.textContent = data.connected ? 'TV Connected' : 'TV Offline';
+      badge.className = 'badge ' + (data.connected ? 'completed' : 'failed');
+    }
+  } catch {}
+})();
 
 // ─── Init ───────────────────────────────────────────────────
 loadSymbols();

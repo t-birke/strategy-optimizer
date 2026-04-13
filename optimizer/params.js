@@ -1,5 +1,5 @@
 /**
- * 17-gene parameter space for JM Simple 3TP strategy.
+ * 18-gene parameter space for JM Simple 3TP strategy.
  * Extracted from optimize-full.js — standalone, no TradingView dependencies.
  */
 
@@ -14,13 +14,14 @@ export const PARAMS = [
   { id: 'bbMult',    type: 'float', min: 1.0,  max: 3.5,  step: 0.5  },
   { id: 'atrLen',    type: 'int',   min: 5,    max: 30,   step: 1    },
   { id: 'atrSL',     type: 'float', min: 0.5,  max: 4.0,  step: 0.25 },
-  { id: 'tp1Mult',   type: 'float', min: 0.5,  max: 3.0,  step: 0.25 },
+  { id: 'tp1Mult',   type: 'float', min: 1.5,  max: 3.0,  step: 0.25 },
   { id: 'tp2Mult',   type: 'float', min: 1.5,  max: 6.0,  step: 0.25 },
   { id: 'tp3Mult',   type: 'float', min: 3.0,  max: 12.0, step: 0.5  },
   { id: 'tp1Pct',    type: 'int',   min: 10,   max: 50,   step: 5    },
   { id: 'tp2Pct',    type: 'int',   min: 10,   max: 50,   step: 5    },
-  { id: 'riskPct',   type: 'float', min: 0.5,  max: 5.0,  step: 0.5  },
-  { id: 'maxBars',   type: 'int',   min: 5,    max: 40,   step: 5    },
+  { id: 'riskPct',      type: 'float', min: 0.5,  max: 5.0,  step: 0.5  },
+  { id: 'maxBars',      type: 'int',   min: 5,    max: 40,   step: 5    },
+  { id: 'emergencySlPct', type: 'int', min: 5,    max: 25,   step: 1    },
 ];
 
 const P = id => PARAMS.find(p => p.id === id);
@@ -89,5 +90,6 @@ export function geneShort(gene) {
     `@${gene.tp1Pct}/${gene.tp2Pct}/${tp3Pct}%`,
     `R${gene.riskPct}%`,
     `T${gene.maxBars}b`,
+    `ESL${gene.emergencySlPct}%`,
   ].join(' ');
 }

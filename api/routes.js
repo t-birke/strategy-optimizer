@@ -9,6 +9,9 @@ import { checkSymbol, ingestSymbol, updateSymbol } from '../data/ingest.js';
 import { runOptimization } from '../optimizer/runner.js';
 import { geneShort } from '../optimizer/params.js';
 import { broadcast } from './websocket.js';
+import { sendToTradingView, checkTradingViewConnection } from './tradingview.js';
+import { loadCandles } from '../db/candles.js';
+import { runStrategy } from '../engine/strategy.js';
 
 const router = Router();
 
@@ -253,6 +256,74 @@ router.get('/api/queue', (req, res) => {
   });
 });
 
+// ─── TradingView bridge ────────────────────────────────────
+
+router.get('/api/tv/status', async (req, res) => {
+  try {
+    const status = await checkTradingViewConnection();
+    res.json(status);
+  } catch (err) {
+    res.json({ connected: false, error: err.message });
+  }
+});
+
+router.post('/api/tv/send', async (req, res) => {
+  try {
+    const { gene, symbol, timeframe } = req.body;
+    if (!gene) return res.status(400).json({ error: 'gene config required' });
+
+    const result = await sendToTradingView(gene, symbol, timeframe);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Diagnostics ────────────────────────────────────────────
+
+router.get('/api/diagnose/:symbol/:tf', async (req, res) => {
+  try {
+    const { symbol, tf } = req.params;
+    const tfMin = parseInt(tf);
+    const startTs = new Date('2021-04-12').getTime();
+    const candles = await loadCandles(symbol, tfMin, startTs);
+    const len = candles.close.length;
+
+    // Check timestamp gaps
+    const tfMs = tfMin * 60000;
+    let gaps = 0, bigGaps = [];
+    for (let i = 1; i < len; i++) {
+      const diff = Number(candles.ts[i] - candles.ts[i - 1]);
+      if (diff !== tfMs) {
+        gaps++;
+        if (diff > tfMs * 3) {
+          bigGaps.push({ bar: i, diffMin: diff / 60000, date: new Date(Number(candles.ts[i])).toISOString().slice(0, 16) });
+        }
+      }
+    }
+
+    // Sample candles
+    const samples = [];
+    for (let i = 100; i < Math.min(106, len); i++) {
+      samples.push({
+        ts: new Date(Number(candles.ts[i])).toISOString().slice(0, 16),
+        o: candles.open[i], h: candles.high[i], l: candles.low[i], c: candles.close[i],
+      });
+    }
+
+    res.json({
+      bars: len,
+      expected: Math.round(5 * 365.25 * 24 * 60 / tfMin),
+      first: new Date(Number(candles.ts[0])).toISOString(),
+      last: new Date(Number(candles.ts[len - 1])).toISOString(),
+      gaps, bigGaps: bigGaps.slice(0, 20),
+      samples,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Queue processor ────────────────────────────────────────
 
 async function processQueue() {
@@ -281,16 +352,17 @@ async function processQueue() {
         shouldCancel: () => cancelRequested,
       });
 
-      // Store results
+      // Store results (including partial results from aborted runs)
+      const finalStatus = cancelRequested ? 'cancelled' : 'completed';
       const bestGene = JSON.stringify(result.bestGene).replace(/'/g, "''");
       const bestMetrics = JSON.stringify(result.bestMetrics).replace(/'/g, "''");
       const topResults = JSON.stringify(result.topResults).replace(/'/g, "''");
       const genLog = JSON.stringify(result.generationLog).replace(/'/g, "''");
 
-      await exec(`UPDATE runs SET status = 'completed', best_gene = '${bestGene}', best_metrics = '${bestMetrics}', top_results = '${topResults}', generation_log = '${genLog}', generations_completed = ${result.completedGens}, total_evaluations = ${result.totalEvaluations}, completed_at = current_timestamp WHERE id = ${runId}`);
+      await exec(`UPDATE runs SET status = '${finalStatus}', best_gene = '${bestGene}', best_metrics = '${bestMetrics}', top_results = '${topResults}', generation_log = '${genLog}', generations_completed = ${result.completedGens}, total_evaluations = ${result.totalEvaluations}, completed_at = current_timestamp WHERE id = ${runId}`);
 
       broadcast({
-        type: 'run_completed',
+        type: cancelRequested ? 'run_cancelled' : 'run_completed',
         runId,
         bestScore: result.bestScore,
         bestMetrics: result.bestMetrics,

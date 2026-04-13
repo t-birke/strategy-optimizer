@@ -16,10 +16,10 @@ const COMMISSION_PCT = 0.06 / 100; // 0.06% per side
  * Run the JM Simple 3TP strategy on columnar candle data.
  *
  * @param {Object} candles — { open, high, low, close, volume, ts } Float64Arrays
- * @param {Object} params — strategy parameters (17 genes)
+ * @param {Object} params — strategy parameters (18 genes)
  *   minEntry, stochLen, stochSmth, rsiLen, emaFast, emaSlow,
  *   bbLen, bbMult, atrLen, atrSL, tp1Mult, tp2Mult, tp3Mult,
- *   tp1Pct, tp2Pct, riskPct, maxBars
+ *   tp1Pct, tp2Pct, riskPct, maxBars, emergencySlPct
  * @param {Object} [opts] — { initialCapital: 100000, leverage: 1 }
  * @returns {Object} metrics
  */
@@ -29,6 +29,8 @@ export function runStrategy(candles, params, opts = {}) {
     bbLen, bbMult, atrLen, atrSL, tp1Mult, tp2Mult, tp3Mult,
     tp1Pct, tp2Pct, riskPct, maxBars,
   } = params;
+
+  const emergencySlPct = params.emergencySlPct ?? 25;
 
   const initialCapital = opts.initialCapital ?? 100000;
   const leverage = opts.leverage ?? 1;
@@ -82,6 +84,12 @@ export function runStrategy(candles, params, opts = {}) {
   let tp1Hit = false;
   let remainingUnits = 0;
 
+  // Pending entry — signals on bar N, fill at bar N+1's open (matches TV)
+  let pendingEntry = null;  // { isLong, atr }
+
+  // Pending SL exit — close crosses SL on bar N, exit fills at bar N+1's open
+  let pendingSLExit = null; // { isLong }
+
   // Metrics accumulators
   let totalTrades = 0;    // Each partial exit counts as a trade (matches TV)
   let wins = 0;
@@ -134,153 +142,160 @@ export function runStrategy(candles, params, opts = {}) {
     // Skip if indicators are NaN
     if (isNaN(stochK[i]) || isNaN(emaF[i]) || isNaN(emaS[i]) || isNaN(atrArr[i])) continue;
 
-    // ─── Exit checks (before entry) ─────────────────────
+    // ─── Execute pending entry at this bar's open ────────
+    if (pendingEntry && posSize === 0) {
+      const pe = pendingEntry;
+      pendingEntry = null;
+      const fillPrice = o;
+      const slDist = pe.atr * atrSL;
+      if (slDist > 0 && fillPrice > 0) {
+        const riskAmt = equity * riskPct / 100;
+        let units = riskAmt / slDist;
+        const maxUnits = equity * leverage / fillPrice;
+        units = Math.min(units, maxUnits);
+        if (units > 0) {
+          posSize = pe.isLong ? units : -units;
+          remainingUnits = posSize;
+          entryPrice = fillPrice;
+          entryBar = i;
+          entryAtr = pe.atr;
+          tp1Hit = false;
+        }
+      }
+    }
+
+    // ─── Execute pending SL exit at this bar's open ──────
+    if (pendingSLExit && posSize !== 0) {
+      closeTrade(Math.abs(remainingUnits), o, pendingSLExit.isLong);
+      posSize = 0;
+      remainingUnits = 0;
+      pendingSLExit = null;
+    }
+
+    // ─── Exit checks ────────────────────────────────────
     if (posSize !== 0) {
       const isLong = posSize > 0;
       const ep = entryPrice;
       const barsHeld = i - entryBar;
 
-      // Current SL level
-      let slPrice;
-      if (isLong) {
-        slPrice = tp1Hit ? ep * 1.003 : ep - entryAtr * atrSL;
-      } else {
-        slPrice = tp1Hit ? ep * 0.997 : ep + entryAtr * atrSL;
-      }
+      let fullExit = false;
 
-      // TP levels
-      const tp1Price = isLong ? ep + entryAtr * tp1Mult : ep - entryAtr * tp1Mult;
-      const tp2Price = isLong ? ep + entryAtr * tp2Mult : ep - entryAtr * tp2Mult;
-      const tp3Price = isLong ? ep + entryAtr * tp3Mult : ep - entryAtr * tp3Mult;
+      // --- 1. Emergency SL (intra-bar, fires on ANY bar including entry bar) ---
+      // Hard circuit-breaker against catastrophic liquidity events.
+      const emergencyPrice = isLong
+        ? ep * (1 - emergencySlPct / 100)
+        : ep * (1 + emergencySlPct / 100);
 
-      // --- 1. Time-based exit ---
-      if (barsHeld >= maxBars) {
-        closeTrade(Math.abs(remainingUnits), c, isLong);
+      if (isLong ? l <= emergencyPrice : h >= emergencyPrice) {
+        closeTrade(Math.abs(remainingUnits), emergencyPrice, isLong);
         posSize = 0;
         remainingUnits = 0;
-        continue; // skip to next bar
+        fullExit = true;
       }
 
-      // --- 2. Structural exits ---
-      let structuralExit = false;
-      if (isLong) {
-        // stochBullExit: K crosses below D while K > 60
-        const stochExit = stochCrossDown[i] && stochK[i - 1] > 60;
-        // rsiBullExit: RSI < 40 and RSI[3] > 55
-        const rsiExit = rsiArr[i] < 40 && i >= 3 && rsiArr[i - 3] > 55;
-        // goShort signal
-        const oppSignal = computeShortScore(i) >= minEntry;
-        structuralExit = stochExit || rsiExit || oppSignal;
-      } else {
-        const stochExit = stochCrossUp[i] && stochK[i - 1] < 40;
-        const rsiExit = rsiArr[i] > 60 && i >= 3 && rsiArr[i - 3] < 45;
-        const oppSignal = computeLongScore(i) >= minEntry;
-        structuralExit = stochExit || rsiExit || oppSignal;
-      }
+      // --- 2. TP checks (intra-bar, skip entry bar) ---
+      if (!fullExit && barsHeld >= 1) {
+        const tp1Price = isLong ? ep + entryAtr * tp1Mult : ep - entryAtr * tp1Mult;
+        const tp2Price = isLong ? ep + entryAtr * tp2Mult : ep - entryAtr * tp2Mult;
+        const tp3Price = isLong ? ep + entryAtr * tp3Mult : ep - entryAtr * tp3Mult;
 
-      if (structuralExit) {
-        closeTrade(Math.abs(remainingUnits), c, isLong);
-        posSize = 0;
-        remainingUnits = 0;
-        continue;
-      }
-
-      // --- 3. SL check ---
-      const slHit = isLong ? l <= slPrice : h >= slPrice;
-      if (slHit) {
-        closeTrade(Math.abs(remainingUnits), slPrice, isLong);
-        posSize = 0;
-        remainingUnits = 0;
-        continue;
-      }
-
-      // --- 4. TP checks (SL-first convention: SL already checked above) ---
-      if (!tp1Hit) {
-        const tp1Reached = isLong ? h >= tp1Price : l <= tp1Price;
-        if (tp1Reached) {
-          const tp1Units = Math.abs(remainingUnits) * tp1Pct / 100;
-          closeTrade(tp1Units, tp1Price, isLong);
-          remainingUnits = isLong
-            ? remainingUnits - tp1Units
-            : remainingUnits + tp1Units;
-          tp1Hit = true;
-          // SL now moves to breakeven (handled next bar)
+        if (!tp1Hit) {
+          const tp1Reached = isLong ? h >= tp1Price : l <= tp1Price;
+          if (tp1Reached) {
+            const tp1Units = Math.abs(remainingUnits) * tp1Pct / 100;
+            closeTrade(tp1Units, tp1Price, isLong);
+            remainingUnits = isLong
+              ? remainingUnits - tp1Units
+              : remainingUnits + tp1Units;
+            tp1Hit = true;
+          }
         }
-      }
 
-      // TP2
-      if (remainingUnits !== 0) {
-        const tp2Reached = isLong ? h >= tp2Price : l <= tp2Price;
-        if (tp2Reached) {
-          const currentAbs = Math.abs(remainingUnits);
-          const tp2Units = currentAbs * tp2Pct / (tp2Pct + (100 - tp1Pct - tp2Pct));
-          // TP2 is a fraction of remaining after TP1
-          const actualTp2 = Math.min(tp2Units, currentAbs);
-          closeTrade(actualTp2, tp2Price, isLong);
-          remainingUnits = isLong
-            ? remainingUnits - actualTp2
-            : remainingUnits + actualTp2;
+        if (remainingUnits !== 0) {
+          const tp2Reached = isLong ? h >= tp2Price : l <= tp2Price;
+          if (tp2Reached) {
+            const currentAbs = Math.abs(remainingUnits);
+            const tp2Units = currentAbs * tp2Pct / 100;
+            closeTrade(tp2Units, tp2Price, isLong);
+            remainingUnits = isLong
+              ? remainingUnits - tp2Units
+              : remainingUnits + tp2Units;
+          }
         }
-      }
 
-      // TP3 (remainder)
-      if (remainingUnits !== 0) {
-        const tp3Reached = isLong ? h >= tp3Price : l <= tp3Price;
-        if (tp3Reached) {
-          closeTrade(Math.abs(remainingUnits), tp3Price, isLong);
+        if (remainingUnits !== 0) {
+          const tp3Reached = isLong ? h >= tp3Price : l <= tp3Price;
+          if (tp3Reached) {
+            closeTrade(Math.abs(remainingUnits), tp3Price, isLong);
+            remainingUnits = 0;
+          }
+        }
+
+        posSize = remainingUnits;
+        if (Math.abs(posSize) < 0.0001) {
+          posSize = 0;
           remainingUnits = 0;
+          fullExit = true;
         }
       }
 
-      // Update position
-      posSize = remainingUnits;
-      if (Math.abs(posSize) < 0.0001) {
+      // --- 3. Time-based exit (at close) ---
+      if (!fullExit && posSize !== 0 && barsHeld >= maxBars) {
+        closeTrade(Math.abs(remainingUnits), c, isLong);
         posSize = 0;
         remainingUnits = 0;
+        fullExit = true;
+      }
+
+      // --- 4. Structural exits (at close) ---
+      if (!fullExit && posSize !== 0) {
+        let structuralExit = false;
+        if (isLong) {
+          const stochExit = stochCrossDown[i] && stochK[i] > 60;
+          const rsiExit = rsiArr[i] < 40 && i >= 3 && rsiArr[i - 3] > 55;
+          const oppSignal = computeShortScore(i) >= minEntry;
+          structuralExit = stochExit || rsiExit || oppSignal;
+        } else {
+          const stochExit = stochCrossUp[i] && stochK[i] < 40;
+          const rsiExit = rsiArr[i] > 60 && i >= 3 && rsiArr[i - 3] < 45;
+          const oppSignal = computeLongScore(i) >= minEntry;
+          structuralExit = stochExit || rsiExit || oppSignal;
+        }
+
+        if (structuralExit) {
+          closeTrade(Math.abs(remainingUnits), c, isLong);
+          posSize = 0;
+          remainingUnits = 0;
+          fullExit = true;
+        }
+      }
+
+      // --- 5. Close-based SL (check at close, exit at next bar's open) ---
+      // Only triggers when the candle CLOSES beyond the SL level;
+      // wicks past SL that recover by close are ignored.
+      if (!fullExit && posSize !== 0 && barsHeld >= 1) {
+        let slPrice;
+        if (isLong) {
+          slPrice = tp1Hit ? ep * 1.003 : ep - entryAtr * atrSL;
+        } else {
+          slPrice = tp1Hit ? ep * 0.997 : ep + entryAtr * atrSL;
+        }
+
+        if (isLong ? c <= slPrice : c >= slPrice) {
+          pendingSLExit = { isLong };
+        }
       }
     }
 
-    // ─── Entry checks (only if flat) ────────────────────
-    if (posSize === 0) {
+    // ─── Entry checks (if flat — includes post-exit flips) ──
+    if (posSize === 0 && !pendingEntry && !pendingSLExit) {
       const longScore = computeLongScore(i);
       const shortScore = computeShortScore(i);
 
       if (longScore >= minEntry) {
-        // Enter long
-        const curAtr = atrArr[i];
-        const slDist = curAtr * atrSL;
-        if (slDist <= 0 || c <= 0) continue;
-
-        const riskAmt = equity * riskPct / 100;
-        let units = riskAmt / slDist;
-        const maxUnits = equity * leverage / c;
-        units = Math.min(units, maxUnits);
-        if (units <= 0) continue;
-
-        posSize = units;
-        remainingUnits = units;
-        entryPrice = c;  // enter at close of signal bar
-        entryBar = i;
-        entryAtr = curAtr;
-        tp1Hit = false;
+        pendingEntry = { isLong: true, atr: atrArr[i] };
       } else if (shortScore >= minEntry) {
-        // Enter short
-        const curAtr = atrArr[i];
-        const slDist = curAtr * atrSL;
-        if (slDist <= 0 || c <= 0) continue;
-
-        const riskAmt = equity * riskPct / 100;
-        let units = riskAmt / slDist;
-        const maxUnits = equity * leverage / c;
-        units = Math.min(units, maxUnits);
-        if (units <= 0) continue;
-
-        posSize = -units;
-        remainingUnits = -units;
-        entryPrice = c;
-        entryBar = i;
-        entryAtr = curAtr;
-        tp1Hit = false;
+        pendingEntry = { isLong: false, atr: atrArr[i] };
       }
     }
 
@@ -297,6 +312,7 @@ export function runStrategy(candles, params, opts = {}) {
     const lastClose = candles.close[len - 1];
     closeTrade(Math.abs(remainingUnits), lastClose, posSize > 0);
     posSize = 0;
+    pendingSLExit = null;
   }
 
   // ─── Compute final metrics ────────────────────────────────

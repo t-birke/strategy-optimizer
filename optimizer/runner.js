@@ -164,6 +164,7 @@ export async function runOptimization(config) {
 
   // Track per-island state for global best computation
   const islandBest = new Array(numIslands).fill(null);
+  const islandGen = new Array(numIslands).fill(0);
   const workerEvals = new Array(numIslands).fill(0);
   const workerCaches = new Array(numIslands).fill(0);
 
@@ -199,6 +200,7 @@ export async function runOptimization(config) {
               gene: msg.bestGene,
               metrics: msg.metrics,
             };
+            islandGen[idx] = msg.gen;
             workerEvals[idx] = msg.evalCount;
             workerCaches[idx] = msg.cacheSize;
 
@@ -208,7 +210,7 @@ export async function runOptimization(config) {
               if (ib && ib.fitness > globalBest.fitness) globalBest = ib;
             }
 
-            completedGens = msg.gen;
+            completedGens = Math.max(...islandGen);
 
             // Log first report per generation
             if (!generationLog.find(e => e.gen === msg.gen)) {
@@ -222,8 +224,12 @@ export async function runOptimization(config) {
             }
 
             if (onProgress) {
+              const minGen = Math.min(...islandGen.filter(g => g > 0));
+              const maxGen = Math.max(...islandGen);
               onProgress({
-                gen: msg.gen,
+                gen: maxGen,
+                minGen: isFinite(minGen) ? minGen : 0,
+                maxGen,
                 totalGens: generations,
                 best: globalBest.fitness,
                 metrics: globalBest.metrics,
@@ -237,6 +243,7 @@ export async function runOptimization(config) {
                 topology: migrationTopology,
                 islands: islandBest.map((ib, i) => ({
                   idx: i,
+                  gen: islandGen[i],
                   profit: ib?.metrics?.netProfit ?? null,
                   trades: ib?.metrics?.trades ?? null,
                   pf: ib?.metrics?.pf ?? null,

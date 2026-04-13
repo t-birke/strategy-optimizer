@@ -1,0 +1,185 @@
+// JM Simple — Streamlined structural strategy
+// 3 entry conditions, 2 exit conditions. Designed for robustness.
+
+//@version=5
+strategy("JM Simple", "JMs", true,
+     default_qty_type    = strategy.percent_of_equity,
+     default_qty_value   = 100,
+     initial_capital     = 1000,
+     commission_type     = strategy.commission.percent,
+     commission_value    = 0.06,
+     slippage            = 2)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+GRP_DATE    = "Date Filter"
+i_startDate = input.time(timestamp("2021-04-11"), "Start Date", group=GRP_DATE)
+inDateRange = time >= i_startDate
+
+GRP_CORE    = "Core"
+i_minEntry  = input.int(2,       "Min Entry (of 3)", minval=1, maxval=3, group=GRP_CORE)
+i_stochLen  = input.int(14,      "Stoch Length", minval=5, maxval=50, group=GRP_CORE)
+i_stochSmth = input.int(3,       "Stoch Smooth", minval=1, maxval=10, group=GRP_CORE)
+i_rsiLen    = input.int(14,      "RSI Length", minval=5, maxval=30, group=GRP_CORE)
+i_emaFast   = input.int(21,      "EMA Fast", minval=5, maxval=50, group=GRP_CORE)
+i_emaSlow   = input.int(55,      "EMA Slow", minval=20, maxval=200, group=GRP_CORE)
+i_bbLen     = input.int(20,      "BB Length", minval=5, maxval=50, group=GRP_CORE)
+i_bbMult    = input.float(2.0,   "BB Mult", minval=1.0, maxval=4.0, step=0.5, group=GRP_CORE)
+i_atrLen    = input.int(14,      "ATR Length", minval=5, maxval=50, group=GRP_CORE)
+i_atrMult   = input.float(2.0,   "ATR SL Mult", minval=0.5, maxval=5.0, step=0.5, group=GRP_CORE)
+i_atrTP     = input.float(3.0,   "ATR TP Mult", minval=1.0, maxval=10.0, step=0.5, group=GRP_CORE)
+
+// ============================================================================
+// INDICATORS
+// ============================================================================
+
+// Stochastic (Jewel approx)
+stochRaw    = ta.stoch(close, high, low, i_stochLen)
+stochK      = ta.sma(stochRaw, i_stochSmth)
+stochD      = ta.sma(stochK, i_stochSmth)
+
+// RSI (Matrix approx)
+rsi         = ta.rsi(close, i_rsiLen)
+
+// EMA trend
+emaF        = ta.ema(close, i_emaFast)
+emaS        = ta.ema(close, i_emaSlow)
+
+// Bollinger Bands
+bbBasis     = ta.sma(close, i_bbLen)
+bbDev       = i_bbMult * ta.stdev(close, i_bbLen)
+bbUpper     = bbBasis + bbDev
+bbLower     = bbBasis - bbDev
+bbWidth     = (bbUpper - bbLower) / bbBasis * 100
+bbSqueeze   = ta.percentrank(bbWidth, 100) < 25
+
+// ATR for stops
+atr         = ta.atr(i_atrLen)
+
+// ============================================================================
+// ENTRY CONDITIONS (3 total, need i_minEntry)
+// ============================================================================
+
+// 1. Momentum ignition: Stochastic crosses up from below 30 (long) or down from above 70 (short)
+stochBullX  = ta.crossover(stochK, stochD) and stochK < 40
+stochBearX  = ta.crossunder(stochK, stochD) and stochK > 60
+
+// 2. Trend alignment: EMA fast > slow (long) or fast < slow (short)
+emaBull     = emaF > emaS
+emaBear     = emaF < emaS
+
+// 3. Volatility setup: BB squeeze active recently OR price breaking out of BB
+bbBullSetup = (bbSqueeze or bbSqueeze[1] or bbSqueeze[2]) and close > bbBasis
+bbBearSetup = (bbSqueeze or bbSqueeze[1] or bbSqueeze[2]) and close < bbBasis
+
+// Score
+int bullScore = 0
+bullScore += stochBullX  ? 1 : 0
+bullScore += emaBull     ? 1 : 0
+bullScore += bbBullSetup ? 1 : 0
+
+int bearScore = 0
+bearScore += stochBearX  ? 1 : 0
+bearScore += emaBear     ? 1 : 0
+bearScore += bbBearSetup ? 1 : 0
+
+bool goLong  = bullScore >= i_minEntry and inDateRange
+bool goShort = bearScore >= i_minEntry and inDateRange
+
+// ============================================================================
+// EXITS: structural + ATR-based stops
+// ============================================================================
+
+// Structural exit: stochastic crosses back OR RSI regime flip
+stochBullExit = ta.crossunder(stochK, stochD) and stochK > 60
+stochBearExit = ta.crossover(stochK, stochD) and stochK < 40
+
+rsiBullExit   = rsi < 40 and rsi[3] > 55  // was bullish, dropped
+rsiBearExit   = rsi > 60 and rsi[3] < 45  // was bearish, rose
+
+longExit  = stochBullExit or rsiBullExit or goShort
+shortExit = stochBearExit or rsiBearExit or goLong
+
+// ============================================================================
+// ORDERS
+// ============================================================================
+
+if goLong and strategy.position_size <= 0
+    strategy.entry("L", strategy.long)
+    strategy.exit("L-X", "L", stop=close - atr * i_atrMult, limit=close + atr * i_atrTP)
+
+if goShort and strategy.position_size >= 0
+    strategy.entry("S", strategy.short)
+    strategy.exit("S-X", "S", stop=close + atr * i_atrMult, limit=close - atr * i_atrTP)
+
+if strategy.position_size > 0 and longExit
+    strategy.close("L")
+if strategy.position_size < 0 and shortExit
+    strategy.close("S")
+
+// ============================================================================
+// VISUALIZATION
+// ============================================================================
+
+plotshape(goLong and strategy.position_size[1] <= 0, "Long",
+     shape.triangleup, location.belowbar, color.lime, size=size.tiny)
+plotshape(goShort and strategy.position_size[1] >= 0, "Short",
+     shape.triangledown, location.abovebar, color.red, size=size.tiny)
+
+p1 = plot(bbUpper, "BB+", color.new(color.blue, 80))
+p2 = plot(bbLower, "BB-", color.new(color.blue, 80))
+fill(p1, p2, color=bbSqueeze ? color.new(color.yellow, 92) : color.new(color.blue, 96))
+
+// ============================================================================
+// STATS TABLE
+// ============================================================================
+
+if barstate.islast
+    tbl = table.new(position.top_right, 2, 8,
+         bgcolor=color.new(#0f1729, 0), border_width=1,
+         border_color=color.new(color.gray, 60), frame_width=2,
+         frame_color=color.new(color.white, 40))
+
+    cW = color.white
+    cG = color.lime
+    cO = color.orange
+    cD = color.new(color.gray, 50)
+    sz = size.small
+    hBg = color.new(#1a3a6e, 0)
+
+    float wr = strategy.closedtrades > 0 ? strategy.wintrades * 100.0 / strategy.closedtrades : 0.0
+    float pf = strategy.grossloss != 0 ? math.abs(strategy.grossprofit / strategy.grossloss) : 0.0
+    float exp = strategy.closedtrades > 0 ? strategy.netprofit / strategy.closedtrades : 0.0
+
+    table.cell(tbl, 0, 0, "JM SIMPLE", text_color=color.yellow, text_size=size.normal, text_halign=text.align_center, bgcolor=hBg)
+    table.cell(tbl, 1, 0, "E" + str.tostring(i_minEntry) + "/3", text_color=color.yellow, text_size=sz, text_halign=text.align_center, bgcolor=hBg)
+
+    table.cell(tbl, 0, 1, "Trades", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 1, str.tostring(strategy.closedtrades) + " (" + str.tostring(strategy.wintrades) + "W)",
+         text_color=cW, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 2, "Win Rate", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 2, str.tostring(wr, "#.#") + "%",
+         text_color=wr >= 45 ? cG : wr >= 35 ? cO : color.red, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 3, "Profit Factor", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 3, str.tostring(pf, "#.##"),
+         text_color=pf >= 1.3 ? cG : pf >= 1.0 ? cO : color.red, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 4, "Net P&L", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 4, str.tostring(strategy.netprofit, "#.#") + " (" + str.tostring(strategy.netprofit / strategy.initial_capital * 100, "#.#") + "%)",
+         text_color=strategy.netprofit >= 0 ? cG : color.red, text_size=size.normal, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 5, "Max DD", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 5, str.tostring(strategy.max_drawdown, "#.#") + " (" + str.tostring(strategy.max_drawdown / strategy.initial_capital * 100, "#.#") + "%)",
+         text_color=cO, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 6, "Expect/Trade", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 6, str.tostring(exp, "#.##"),
+         text_color=exp > 0 ? cG : color.red, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 7, "ATR SL/TP", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 7, str.tostring(i_atrMult, "#.#") + " / " + str.tostring(i_atrTP, "#.#"),
+         text_color=cW, text_size=sz, text_halign=text.align_right)

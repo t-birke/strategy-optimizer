@@ -203,7 +203,8 @@ export function stdev(src, period) {
 
 /**
  * Percent Rank — ta.percentrank(src, period)
- * Returns the percentage of past `period` values that are less than or equal to the current value.
+ * Returns the percentage of past `period` values that are strictly less than the current value.
+ * Pine v5 uses strict inequality (<), not (<=).
  */
 export function percentrank(src, period) {
   const len = src.length;
@@ -216,7 +217,7 @@ export function percentrank(src, period) {
     }
     let count = 0;
     for (let j = i - period; j < i; j++) {
-      if (src[j] <= src[i]) count++;
+      if (src[j] < src[i]) count++;
     }
     out[i] = count / period * 100;
   }

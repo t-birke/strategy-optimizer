@@ -1,0 +1,316 @@
+// JM Simple 3TP — Multi-target exit strategy
+// 3 entry conditions, 3 take-profit levels with breakeven SL on TP1 hit
+
+//@version=5
+strategy("JM Simple 3TP", "JM3", true,
+     default_qty_type    = strategy.fixed,
+     default_qty_value   = 0,
+     initial_capital     = 100000,
+     margin_long         = 5,
+     margin_short        = 5,
+     commission_type     = strategy.commission.percent,
+     commission_value    = 0.06,
+     slippage            = 2)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+GRP_DATE    = "Date Filter"
+i_startDate = input.time(timestamp("2021-04-11"), "Start Date", group=GRP_DATE)
+inDateRange = time >= i_startDate
+
+GRP_CORE    = "Core"
+i_minEntry  = input.int(2,       "Min Entry (of 3)", minval=1, maxval=3, group=GRP_CORE)
+i_stochLen  = input.int(7,       "Stoch Length", minval=5, maxval=50, group=GRP_CORE)
+i_stochSmth = input.int(1,       "Stoch Smooth", minval=1, maxval=10, group=GRP_CORE)
+i_rsiLen    = input.int(8,       "RSI Length", minval=5, maxval=30, group=GRP_CORE)
+i_emaFast   = input.int(40,      "EMA Fast", minval=5, maxval=50, group=GRP_CORE)
+i_emaSlow   = input.int(70,      "EMA Slow", minval=20, maxval=200, group=GRP_CORE)
+i_bbLen     = input.int(13,      "BB Length", minval=5, maxval=50, group=GRP_CORE)
+i_bbMult    = input.float(2.0,   "BB Mult", minval=1.0, maxval=4.0, step=0.5, group=GRP_CORE)
+i_atrLen    = input.int(10,      "ATR Length", minval=5, maxval=50, group=GRP_CORE)
+
+GRP_RISK    = "Risk Management"
+i_atrSL     = input.float(1.5,   "ATR SL Mult", minval=0.25, maxval=5.0, step=0.25, group=GRP_RISK)
+i_tp1Mult   = input.float(1.0,   "TP1 ATR Mult", minval=0.25, maxval=5.0, step=0.25, group=GRP_RISK)
+i_tp2Mult   = input.float(3.0,   "TP2 ATR Mult", minval=0.5, maxval=8.0, step=0.25, group=GRP_RISK)
+i_tp3Mult   = input.float(5.0,   "TP3 ATR Mult", minval=1.0, maxval=12.0, step=0.5, group=GRP_RISK)
+i_tp1Pct    = input.int(33,      "TP1 Exit %", minval=10, maxval=60, step=5, group=GRP_RISK)
+i_tp2Pct    = input.int(33,      "TP2 Exit %", minval=10, maxval=60, step=5, group=GRP_RISK)
+i_riskPct   = input.float(2.0,   "Risk Per Trade %", minval=0.5, maxval=15.0, step=0.5, group=GRP_RISK)
+i_maxBars   = input.int(20,      "Max Bars in Trade", minval=5, maxval=40, step=5, group=GRP_RISK)
+i_leverage  = input.int(1,       "Leverage", minval=1, maxval=20, step=1, group=GRP_RISK)
+i_emergSL   = input.int(15,      "Emergency SL %", minval=5, maxval=25, step=1, group=GRP_RISK,
+     tooltip="Hard intra-bar stop as % from entry. Circuit-breaker for flash crashes.")
+
+// ============================================================================
+// INDICATORS
+// ============================================================================
+
+stochRaw    = ta.stoch(close, high, low, i_stochLen)
+stochK      = ta.sma(stochRaw, i_stochSmth)
+stochD      = ta.sma(stochK, i_stochSmth)
+
+rsi         = ta.rsi(close, i_rsiLen)
+
+emaF        = ta.ema(close, i_emaFast)
+emaS        = ta.ema(close, i_emaSlow)
+
+bbBasis     = ta.sma(close, i_bbLen)
+bbDev       = i_bbMult * ta.stdev(close, i_bbLen)
+bbUpper     = bbBasis + bbDev
+bbLower     = bbBasis - bbDev
+bbWidth     = (bbUpper - bbLower) / bbBasis * 100
+bbSqueeze   = ta.percentrank(bbWidth, 100) < 25
+
+atr         = ta.atr(i_atrLen)
+
+// ============================================================================
+// ENTRY CONDITIONS (3 total, need i_minEntry)
+// ============================================================================
+
+stochBullX  = ta.crossover(stochK, stochD) and stochK < 40
+stochBearX  = ta.crossunder(stochK, stochD) and stochK > 60
+
+emaBull     = emaF > emaS
+emaBear     = emaF < emaS
+
+bbBullSetup = (bbSqueeze or bbSqueeze[1] or bbSqueeze[2]) and close > bbBasis
+bbBearSetup = (bbSqueeze or bbSqueeze[1] or bbSqueeze[2]) and close < bbBasis
+
+int bullScore = 0
+bullScore += stochBullX  ? 1 : 0
+bullScore += emaBull     ? 1 : 0
+bullScore += bbBullSetup ? 1 : 0
+
+int bearScore = 0
+bearScore += stochBearX  ? 1 : 0
+bearScore += emaBear     ? 1 : 0
+bearScore += bbBearSetup ? 1 : 0
+
+bool goLong  = bullScore >= i_minEntry and inDateRange
+bool goShort = bearScore >= i_minEntry and inDateRange
+
+// ============================================================================
+// STRUCTURAL EXIT CONDITIONS
+// ============================================================================
+
+stochBullExit = ta.crossunder(stochK, stochD) and stochK > 60
+stochBearExit = ta.crossover(stochK, stochD) and stochK < 40
+
+rsiBullExit   = rsi < 40 and rsi[3] > 55
+rsiBearExit   = rsi > 60 and rsi[3] < 45
+
+longExit  = stochBullExit or rsiBullExit or goShort
+shortExit = stochBearExit or rsiBearExit or goLong
+
+// ============================================================================
+// ORDERS — Multi-TP with close-based SL + emergency intra-bar SL
+// ============================================================================
+
+var float longAtr  = na
+var bool  longTp1  = false
+var int   longBar  = na
+var float shortAtr = na
+var bool  shortTp1 = false
+var int   shortBar = na
+var int   totalEntries = 0
+var int   tp1Count     = 0
+var int   tp2Count     = 0
+var int   tp3Count     = 0
+var int   lastChecked  = 0
+var float peakEquity   = strategy.initial_capital
+var float maxDDPct     = 0.0
+var bool  slTriggered  = false
+
+// Position sizing: risk i_riskPct% of equity per trade, with leverage cap
+float riskAmt  = strategy.equity * i_riskPct / 100
+float slDist   = atr * i_atrSL
+float units    = slDist > 0 ? riskAmt / slDist : 0
+float maxUnits = close > 0 ? strategy.equity * i_leverage / close : 0
+units := math.min(units, maxUnits)
+
+// Long entry
+if goLong and strategy.position_size <= 0 and units > 0 and not slTriggered
+    strategy.entry("L", strategy.long, qty=units)
+    longAtr := atr
+    longTp1 := false
+    longBar := bar_index
+    totalEntries += 1
+    slTriggered := false
+
+// Short entry
+if goShort and strategy.position_size >= 0 and units > 0 and not slTriggered
+    strategy.entry("S", strategy.short, qty=units)
+    shortAtr := atr
+    shortTp1 := false
+    shortBar := bar_index
+    totalEntries += 1
+    slTriggered := false
+
+// Detect TP1 hit (partial exit reduced position size)
+if strategy.position_size > 0 and strategy.position_size < strategy.position_size[1] and not longTp1
+    longTp1 := true
+if strategy.position_size < 0 and strategy.position_size > strategy.position_size[1] and not shortTp1
+    shortTp1 := true
+
+// Execute pending SL exit at this bar's open
+if slTriggered and strategy.position_size != 0
+    if strategy.position_size > 0
+        strategy.close("L", comment="SL_CLOSE")
+    else
+        strategy.close("S", comment="SL_CLOSE")
+    slTriggered := false
+
+// Safety reset: if position went flat (e.g. TP3 or structural exit filled)
+// while slTriggered was pending, clear it so future entries aren't blocked.
+if strategy.position_size == 0
+    slTriggered := false
+
+// Long exits — emergency SL (intra-bar) + 3 TPs (intra-bar, no regular SL)
+if strategy.position_size > 0
+    float ep = strategy.position_avg_price
+    float emergSL = ep * (1 - i_emergSL / 100.0)
+    strategy.exit("L-ESL", "L", stop=emergSL, comment="EMERGENCY")
+    if not longTp1
+        strategy.exit("L-TP1", "L", qty_percent=i_tp1Pct, limit=ep + longAtr * i_tp1Mult)
+    strategy.exit("L-TP2", "L", qty_percent=i_tp2Pct, limit=ep + longAtr * i_tp2Mult)
+    strategy.exit("L-TP3", "L", limit=ep + longAtr * i_tp3Mult)
+
+// Short exits — emergency SL (intra-bar) + 3 TPs (intra-bar, no regular SL)
+if strategy.position_size < 0
+    float ep = strategy.position_avg_price
+    float emergSL = ep * (1 + i_emergSL / 100.0)
+    strategy.exit("S-ESL", "S", stop=emergSL, comment="EMERGENCY")
+    if not shortTp1
+        strategy.exit("S-TP1", "S", qty_percent=i_tp1Pct, limit=ep - shortAtr * i_tp1Mult)
+    strategy.exit("S-TP2", "S", qty_percent=i_tp2Pct, limit=ep - shortAtr * i_tp2Mult)
+    strategy.exit("S-TP3", "S", limit=ep - shortAtr * i_tp3Mult)
+
+// Structural exits (override TPs if conditions met)
+if strategy.position_size > 0 and longExit
+    strategy.close("L")
+if strategy.position_size < 0 and shortExit
+    strategy.close("S")
+
+// Close-based SL: only triggers when candle CLOSES beyond SL level.
+// Wicks past SL that recover by close are ignored.
+if strategy.position_size > 0 and not slTriggered
+    float ep = strategy.position_avg_price
+    float sl = longTp1 ? ep * 1.003 : ep - longAtr * i_atrSL
+    if close <= sl
+        slTriggered := true
+
+if strategy.position_size < 0 and not slTriggered
+    float ep = strategy.position_avg_price
+    float sl = shortTp1 ? ep * 0.997 : ep + shortAtr * i_atrSL
+    if close >= sl
+        slTriggered := true
+
+// Time-based exit: close after i_maxBars bars
+if strategy.position_size > 0 and not na(longBar) and bar_index - longBar >= i_maxBars
+    strategy.close("L", comment="time")
+if strategy.position_size < 0 and not na(shortBar) and bar_index - shortBar >= i_maxBars
+    strategy.close("S", comment="time")
+
+// ============================================================================
+// VISUALIZATION
+// ============================================================================
+
+plotshape(goLong and strategy.position_size[1] <= 0, "Long",
+     shape.triangleup, location.belowbar, color.lime, size=size.tiny)
+plotshape(goShort and strategy.position_size[1] >= 0, "Short",
+     shape.triangledown, location.abovebar, color.red, size=size.tiny)
+
+p1 = plot(bbUpper, "BB+", color.new(color.blue, 80))
+p2 = plot(bbLower, "BB-", color.new(color.blue, 80))
+fill(p1, p2, color=bbSqueeze ? color.new(color.yellow, 92) : color.new(color.blue, 96))
+
+// ============================================================================
+// DRAWDOWN TRACKING (% of peak equity)
+// ============================================================================
+
+peakEquity := math.max(peakEquity, strategy.equity)
+float curDDPct = peakEquity > 0 ? (peakEquity - strategy.equity) / peakEquity * 100 : 0.0
+maxDDPct := math.max(maxDDPct, curDDPct)
+
+// ============================================================================
+// TP HIT TRACKING (incremental — avoids loop-per-bar limits)
+// ============================================================================
+
+if strategy.closedtrades > lastChecked
+    for i = lastChecked to strategy.closedtrades - 1
+        string eid = strategy.closedtrades.exit_id(i)
+        if eid == "L-TP1" or eid == "S-TP1"
+            tp1Count += 1
+        else if eid == "L-TP2" or eid == "S-TP2"
+            tp2Count += 1
+        else if eid == "L-TP3" or eid == "S-TP3"
+            tp3Count += 1
+    lastChecked := strategy.closedtrades
+
+// ============================================================================
+// STATS TABLE
+// ============================================================================
+
+var table tbl = table.new(position.top_right, 2, 10,
+     bgcolor=color.new(#0f1729, 0), border_width=1,
+     border_color=color.new(color.gray, 60), frame_width=2,
+     frame_color=color.new(color.white, 40))
+
+if barstate.islastconfirmedhistory or barstate.islast
+    cW = color.white
+    cG = color.lime
+    cO = color.orange
+    cD = color.new(color.gray, 50)
+    sz = size.small
+    hBg = color.new(#1a3a6e, 0)
+
+    float wr = strategy.closedtrades > 0 ? strategy.wintrades * 100.0 / strategy.closedtrades : 0.0
+    float pf = strategy.grossloss != 0 ? math.abs(strategy.grossprofit / strategy.grossloss) : 0.0
+    float exp = strategy.closedtrades > 0 ? strategy.netprofit / strategy.closedtrades : 0.0
+    int tp3Pct = 100 - i_tp1Pct - i_tp2Pct
+
+    table.cell(tbl, 0, 0, "JM 3TP", text_color=color.yellow, text_size=size.normal, text_halign=text.align_center, bgcolor=hBg)
+    table.cell(tbl, 1, 0, "E" + str.tostring(i_minEntry) + "/3", text_color=color.yellow, text_size=sz, text_halign=text.align_center, bgcolor=hBg)
+
+    table.cell(tbl, 0, 1, "Trades", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 1, str.tostring(strategy.closedtrades) + " (" + str.tostring(strategy.wintrades) + "W)",
+         text_color=cW, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 2, "Win Rate", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 2, str.tostring(wr, "#.#") + "%",
+         text_color=wr >= 45 ? cG : wr >= 35 ? cO : color.red, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 3, "Profit Factor", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 3, str.tostring(pf, "#.##"),
+         text_color=pf >= 1.3 ? cG : pf >= 1.0 ? cO : color.red, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 4, "Net P&L", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 4, str.tostring(strategy.netprofit, "#.#") + " (" + str.tostring(strategy.netprofit / strategy.initial_capital * 100, "#.#") + "%)",
+         text_color=strategy.netprofit >= 0 ? cG : color.red, text_size=size.normal, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 5, "Max DD", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 5, str.tostring(strategy.max_drawdown, "#.#") + " (" + str.tostring(maxDDPct, "#.#") + "%)",
+         text_color=cO, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 6, "Expect/Trade", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 6, str.tostring(exp, "#.##"),
+         text_color=exp > 0 ? cG : color.red, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 7, "SL / TPs", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 7, str.tostring(i_atrSL, "#.#") + " | " + str.tostring(i_tp1Mult, "#.#") + "/" + str.tostring(i_tp2Mult, "#.#") + "/" + str.tostring(i_tp3Mult, "#.#") + " @" + str.tostring(i_tp1Pct) + "/" + str.tostring(i_tp2Pct) + "/" + str.tostring(tp3Pct) + "%",
+         text_color=cW, text_size=sz, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 8, "Risk / Lev / Bars", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 8, str.tostring(i_riskPct, "#.#") + "% | " + str.tostring(i_leverage) + "x | " + str.tostring(i_maxBars) + "b | ESL" + str.tostring(i_emergSL) + "%",
+         text_color=cW, text_size=sz, text_halign=text.align_right)
+
+    float tp1Prob = totalEntries > 0 ? tp1Count * 100.0 / totalEntries : 0.0
+    float tp2Prob = totalEntries > 0 ? tp2Count * 100.0 / totalEntries : 0.0
+    float tp3Prob = totalEntries > 0 ? tp3Count * 100.0 / totalEntries : 0.0
+
+    table.cell(tbl, 0, 9, "TP Prob", text_color=cD, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 9, str.tostring(tp1Prob, "#.#") + " / " + str.tostring(tp2Prob, "#.#") + " / " + str.tostring(tp3Prob, "#.#") + "%",
+         text_color=cW, text_size=sz, text_halign=text.align_right)
