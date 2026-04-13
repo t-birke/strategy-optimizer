@@ -231,6 +231,106 @@ router.post('/api/runs', async (req, res) => {
   }
 });
 
+router.get('/api/runs/:id/trades', async (req, res) => {
+  try {
+    const runs = await query(`SELECT * FROM runs WHERE id = ${req.params.id}`);
+    if (runs.length === 0) return res.status(404).json({ error: 'Run not found' });
+    const run = runs[0];
+
+    for (const field of ['config', 'best_gene', 'best_metrics']) {
+      if (run[field] && typeof run[field] === 'string') {
+        try { run[field] = JSON.parse(run[field]); } catch {}
+      }
+    }
+
+    if (!run.best_gene) return res.status(400).json({ error: 'Run has no best gene yet' });
+
+    const config = run.config || {};
+    const startTs = new Date(run.start_date).getTime();
+    const endTs = config.endDate ? new Date(config.endDate).getTime() : Infinity;
+    const WARMUP_BARS = 200;
+    const preloadTs = startTs - WARMUP_BARS * run.timeframe * 60000;
+    let candles = await loadCandles(run.symbol, run.timeframe, preloadTs);
+
+    if (endTs < Infinity) {
+      let lastIdx = candles.close.length;
+      for (let i = 0; i < candles.close.length; i++) {
+        if (candles.ts[i] > endTs) { lastIdx = i; break; }
+      }
+      if (lastIdx < candles.close.length) {
+        candles = {
+          ts: candles.ts.slice(0, lastIdx),
+          open: candles.open.slice(0, lastIdx),
+          high: candles.high.slice(0, lastIdx),
+          low: candles.low.slice(0, lastIdx),
+          close: candles.close.slice(0, lastIdx),
+          volume: candles.volume.slice(0, lastIdx),
+        };
+      }
+    }
+
+    let tradingStartBar = 0;
+    for (let i = 0; i < candles.close.length; i++) {
+      if (candles.ts[i] >= startTs) { tradingStartBar = i; break; }
+    }
+
+    const metrics = runStrategy(candles, run.best_gene, {
+      tradingStartBar, collectTrades: true, collectEquity: true,
+    });
+
+    // Build candle OHLC array for price chart (only trading period, downsampled if huge)
+    const ohlc = [];
+    for (let i = tradingStartBar; i < candles.close.length; i++) {
+      ohlc.push({
+        time: Math.floor(Number(candles.ts[i]) / 1000),
+        open: candles.open[i],
+        high: candles.high[i],
+        low: candles.low[i],
+        close: candles.close[i],
+      });
+    }
+
+    // Convert equity timestamps to seconds for lightweight-charts
+    const equity = (metrics.equityHistory ?? []).map(e => ({
+      time: Math.floor(e.ts / 1000),
+      value: e.equity,
+    }));
+
+    res.json({
+      metrics,
+      tradeList: metrics.tradeList ?? [],
+      ohlc,
+      equity,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Debug endpoint: get raw candle data for a symbol/timeframe/date range
+router.get('/api/candles/:symbol', async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const tf = parseInt(req.query.tf || '240');
+    const from = req.query.from ? new Date(req.query.from).getTime() : 0;
+    const to = req.query.to ? new Date(req.query.to).getTime() : Infinity;
+    const candles = await loadCandles(symbol, tf, from);
+    const rows = [];
+    for (let i = 0; i < candles.close.length; i++) {
+      if (candles.ts[i] > to) break;
+      rows.push({
+        ts: candles.ts[i],
+        date: new Date(candles.ts[i]).toISOString(),
+        open: candles.open[i], high: candles.high[i],
+        low: candles.low[i], close: candles.close[i],
+      });
+    }
+    res.json({ count: rows.length, candles: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.post('/api/runs/:id/cancel', async (req, res) => {
   const id = parseInt(req.params.id);
 

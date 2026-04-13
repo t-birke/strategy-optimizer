@@ -1,8 +1,10 @@
 // JM Simple 3TP — Multi-target exit strategy
 // 3 entry conditions, 3 take-profit levels with breakeven SL on TP1 hit
+// Each TP tier is a separate entry (L1/L2/L3) for clean full-position exits.
 
 //@version=5
 strategy("JM Simple 3TP", "JM3", true,
+     pyramiding          = 3,
      default_qty_type    = strategy.fixed,
      default_qty_value   = 0,
      initial_capital     = 100000,
@@ -107,7 +109,7 @@ longExit  = stochBullExit or rsiBullExit or goShort
 shortExit = stochBearExit or rsiBearExit or goLong
 
 // ============================================================================
-// ORDERS — Multi-TP with close-based SL + emergency intra-bar SL
+// ORDERS — 3 sub-entries per position for clean TP exits
 // ============================================================================
 
 var float longAtr  = na
@@ -132,68 +134,84 @@ float units    = slDist > 0 ? riskAmt / slDist : 0
 float maxUnits = close > 0 ? strategy.equity * i_leverage / close : 0
 units := math.min(units, maxUnits)
 
-// Long entry
+// Split units into 3 tiers
+float u1 = units * i_tp1Pct / 100.0
+float u2 = units * i_tp2Pct / 100.0
+float u3 = units - u1 - u2   // Remainder avoids rounding gap
+
+// Long entry — 3 sub-entries (L1=TP1 portion, L2=TP2 portion, L3=TP3 portion)
 if goLong and strategy.position_size <= 0 and units > 0 and not slTriggered
-    strategy.entry("L", strategy.long, qty=units)
+    strategy.entry("L1", strategy.long, qty=u1)
+    strategy.entry("L2", strategy.long, qty=u2)
+    strategy.entry("L3", strategy.long, qty=u3)
     longAtr := atr
     longTp1 := false
     longBar := bar_index
     totalEntries += 1
     slTriggered := false
 
-// Short entry
+// Short entry — 3 sub-entries (S1=TP1 portion, S2=TP2 portion, S3=TP3 portion)
 if goShort and strategy.position_size >= 0 and units > 0 and not slTriggered
-    strategy.entry("S", strategy.short, qty=units)
+    strategy.entry("S1", strategy.short, qty=u1)
+    strategy.entry("S2", strategy.short, qty=u2)
+    strategy.entry("S3", strategy.short, qty=u3)
     shortAtr := atr
     shortTp1 := false
     shortBar := bar_index
     totalEntries += 1
     slTriggered := false
 
-// Detect TP1 hit (partial exit reduced position size)
+// Detect TP1 hit (position size decreased but still > 0 means partial close)
 if strategy.position_size > 0 and strategy.position_size < strategy.position_size[1] and not longTp1
     longTp1 := true
 if strategy.position_size < 0 and strategy.position_size > strategy.position_size[1] and not shortTp1
     shortTp1 := true
 
-// Execute pending SL exit at this bar's open
+// Execute pending SL exit at this bar's open — close all sub-entries
 if slTriggered and strategy.position_size != 0
     if strategy.position_size > 0
-        strategy.close("L", comment="SL_CLOSE")
+        strategy.close("L1", comment="SL_CLOSE")
+        strategy.close("L2", comment="SL_CLOSE")
+        strategy.close("L3", comment="SL_CLOSE")
     else
-        strategy.close("S", comment="SL_CLOSE")
+        strategy.close("S1", comment="SL_CLOSE")
+        strategy.close("S2", comment="SL_CLOSE")
+        strategy.close("S3", comment="SL_CLOSE")
     slTriggered := false
 
-// Safety reset: if position went flat (e.g. TP3 or structural exit filled)
+// Safety reset: if position went flat (all TPs or structural exit filled)
 // while slTriggered was pending, clear it so future entries aren't blocked.
 if strategy.position_size == 0
     slTriggered := false
 
-// Long exits — emergency SL (intra-bar) + 3 TPs (intra-bar, no regular SL)
+// Long exits — each sub-entry has its own TP limit + emergency stop.
+// No qty_percent needed: each exit closes 100% of its from_entry.
 if strategy.position_size > 0
     float ep = strategy.position_avg_price
     float emergSL = ep * (1 - i_emergSL / 100.0)
-    strategy.exit("L-ESL", "L", stop=emergSL, comment="EMERGENCY")
     if not longTp1
-        strategy.exit("L-TP1", "L", qty_percent=i_tp1Pct, limit=ep + longAtr * i_tp1Mult)
-    strategy.exit("L-TP2", "L", qty_percent=i_tp2Pct, limit=ep + longAtr * i_tp2Mult)
-    strategy.exit("L-TP3", "L", limit=ep + longAtr * i_tp3Mult)
+        strategy.exit("L1-X", "L1", limit=ep + longAtr * i_tp1Mult, stop=emergSL, comment_profit="TP1", comment_loss="EMERGENCY")
+    strategy.exit("L2-X", "L2", limit=ep + longAtr * i_tp2Mult, stop=emergSL, comment_profit="TP2", comment_loss="EMERGENCY")
+    strategy.exit("L3-X", "L3", limit=ep + longAtr * i_tp3Mult, stop=emergSL, comment_profit="TP3", comment_loss="EMERGENCY")
 
-// Short exits — emergency SL (intra-bar) + 3 TPs (intra-bar, no regular SL)
+// Short exits — same pattern.
 if strategy.position_size < 0
     float ep = strategy.position_avg_price
     float emergSL = ep * (1 + i_emergSL / 100.0)
-    strategy.exit("S-ESL", "S", stop=emergSL, comment="EMERGENCY")
     if not shortTp1
-        strategy.exit("S-TP1", "S", qty_percent=i_tp1Pct, limit=ep - shortAtr * i_tp1Mult)
-    strategy.exit("S-TP2", "S", qty_percent=i_tp2Pct, limit=ep - shortAtr * i_tp2Mult)
-    strategy.exit("S-TP3", "S", limit=ep - shortAtr * i_tp3Mult)
+        strategy.exit("S1-X", "S1", limit=ep - shortAtr * i_tp1Mult, stop=emergSL, comment_profit="TP1", comment_loss="EMERGENCY")
+    strategy.exit("S2-X", "S2", limit=ep - shortAtr * i_tp2Mult, stop=emergSL, comment_profit="TP2", comment_loss="EMERGENCY")
+    strategy.exit("S3-X", "S3", limit=ep - shortAtr * i_tp3Mult, stop=emergSL, comment_profit="TP3", comment_loss="EMERGENCY")
 
-// Structural exits (override TPs if conditions met)
+// Structural exits — close all sub-entries
 if strategy.position_size > 0 and longExit
-    strategy.close("L")
+    strategy.close("L1")
+    strategy.close("L2")
+    strategy.close("L3")
 if strategy.position_size < 0 and shortExit
-    strategy.close("S")
+    strategy.close("S1")
+    strategy.close("S2")
+    strategy.close("S3")
 
 // Close-based SL: only triggers when candle CLOSES beyond SL level.
 // Wicks past SL that recover by close are ignored.
@@ -209,11 +227,15 @@ if strategy.position_size < 0 and not slTriggered
     if close >= sl
         slTriggered := true
 
-// Time-based exit: close after i_maxBars bars
+// Time-based exit: close all sub-entries after i_maxBars bars
 if strategy.position_size > 0 and not na(longBar) and bar_index - longBar >= i_maxBars
-    strategy.close("L", comment="time")
+    strategy.close("L1", comment="time")
+    strategy.close("L2", comment="time")
+    strategy.close("L3", comment="time")
 if strategy.position_size < 0 and not na(shortBar) and bar_index - shortBar >= i_maxBars
-    strategy.close("S", comment="time")
+    strategy.close("S1", comment="time")
+    strategy.close("S2", comment="time")
+    strategy.close("S3", comment="time")
 
 // End-of-range exit: close any open position once past the end date
 if time > i_endDate and strategy.position_size != 0
@@ -246,12 +268,12 @@ maxDDPct := math.max(maxDDPct, curDDPct)
 
 if strategy.closedtrades > lastChecked
     for i = lastChecked to strategy.closedtrades - 1
-        string eid = strategy.closedtrades.exit_id(i)
-        if eid == "L-TP1" or eid == "S-TP1"
+        string ec = strategy.closedtrades.exit_comment(i)
+        if ec == "TP1"
             tp1Count += 1
-        else if eid == "L-TP2" or eid == "S-TP2"
+        else if ec == "TP2"
             tp2Count += 1
-        else if eid == "L-TP3" or eid == "S-TP3"
+        else if ec == "TP3"
             tp3Count += 1
     lastChecked := strategy.closedtrades
 

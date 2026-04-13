@@ -11,6 +11,13 @@ export function sma(src, period) {
   const len = src.length;
   const out = new Float64Array(len);
 
+  // Period 1 is the identity function — short-circuit to avoid
+  // floating-point drift from the running-sum accumulator.
+  if (period === 1) {
+    out.set(src);
+    return out;
+  }
+
   // Find first non-NaN index
   let firstValid = 0;
   while (firstValid < len && isNaN(src[firstValid])) firstValid++;

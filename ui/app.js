@@ -611,7 +611,7 @@ async function loadRuns() {
 
       return `
         <tr onclick="toggleRunDetails(${r.id})" style="cursor:pointer">
-          <td>${r.id}</td>
+          <td><span style="font-family:monospace;font-weight:700;color:#58a6ff">#${r.id}</span></td>
           <td><strong>${r.symbol}</strong></td>
           <td>${tfLabel(r.timeframe)}</td>
           <td>${testFrom}</td>
@@ -625,8 +625,9 @@ async function loadRuns() {
           <td class="num">${trades ?? '-'}</td>
           <td class="num">${r.generations_completed || '-'}</td>
           <td>${elapsed}</td>
+          <td><button onclick="event.stopPropagation();openRunDetail(${r.id})" style="font-size:11px;padding:2px 8px">Detail →</button></td>
         </tr>
-        <tr class="expand-row" id="expand-${r.id}"><td colspan="14" id="expand-content-${r.id}">Loading...</td></tr>
+        <tr class="expand-row" id="expand-${r.id}"><td colspan="15" id="expand-content-${r.id}">Loading...</td></tr>
       `;
     }).join('');
   } catch (err) {
@@ -1140,6 +1141,328 @@ function compareRow(label, gaVal, tvVal, fmt) {
     }
   } catch {}
 })();
+
+// ─── Run Detail Page ─────────────────────────────────────────
+
+const PARAM_LABELS = {
+  minEntry:      { label: 'Min Entry Signals', unit: '',   desc: 'How many conditions must align to open a trade (1–3)' },
+  stochLen:      { label: 'Stoch Length',      unit: '',   desc: 'Bars for stochastic %K calculation' },
+  stochSmth:     { label: 'Stoch Smooth',      unit: '',   desc: 'SMA smoothing applied to %K and %D' },
+  rsiLen:        { label: 'RSI Length',         unit: '',   desc: 'Bars for RSI calculation' },
+  emaFast:       { label: 'EMA Fast',           unit: '',   desc: 'Fast EMA period (trend filter)' },
+  emaSlow:       { label: 'EMA Slow',           unit: '',   desc: 'Slow EMA period (trend filter)' },
+  bbLen:         { label: 'BB Length',          unit: '',   desc: 'Bollinger Band SMA period' },
+  bbMult:        { label: 'BB Multiplier',      unit: 'σ',  desc: 'Standard deviation multiplier for BB width' },
+  atrLen:        { label: 'ATR Length',         unit: '',   desc: 'Bars for ATR calculation' },
+  atrSL:         { label: 'ATR Stop Loss',      unit: '×',  desc: 'SL distance = ATR × this value' },
+  tp1Mult:       { label: 'TP1 Multiplier',     unit: '×',  desc: 'TP1 price = entry ± ATR × this value' },
+  tp2Mult:       { label: 'TP2 Multiplier',     unit: '×',  desc: 'TP2 price = entry ± ATR × this value' },
+  tp3Mult:       { label: 'TP3 Multiplier',     unit: '×',  desc: 'TP3 price = entry ± ATR × this value' },
+  tp1Pct:        { label: 'TP1 Close %',        unit: '%',  desc: 'Position % closed at TP1' },
+  tp2Pct:        { label: 'TP2 Close %',        unit: '%',  desc: 'Position % closed at TP2' },
+  riskPct:       { label: 'Risk %',             unit: '%',  desc: 'Capital % risked per trade (sizes the position)' },
+  maxBars:       { label: 'Max Bars',           unit: '',   desc: 'Time-based exit: close if open longer than this many bars' },
+  emergencySlPct:{ label: 'Emergency SL',       unit: '%',  desc: 'Hard intra-bar circuit-breaker stop loss' },
+};
+
+let detailRunId = null;
+let detailTradeList = [];
+
+window.openRunDetail = async (id) => {
+  detailRunId = id;
+  detailTradeList = [];
+
+  // Show the page
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+  document.getElementById('page-run-detail').classList.add('active');
+  document.getElementById('nav-run-detail').style.display = '';
+  document.getElementById('nav-run-detail').classList.add('active');
+
+  // Reset state
+  document.getElementById('detail-title').textContent = 'Loading…';
+  document.getElementById('detail-run-id').textContent = '';
+  document.getElementById('detail-params').innerHTML = '';
+  document.getElementById('recalc-status').textContent = '';
+  document.getElementById('recalc-metrics').innerHTML = '';
+  document.getElementById('detail-trades-card').style.display = 'none';
+  document.getElementById('detail-charts-card').style.display = 'none';
+  document.getElementById('btn-recalc').disabled = false;
+
+  try {
+    const res = await fetch(`/api/runs/${id}`);
+    const run = await res.json();
+
+    let gene = run.best_gene;
+    if (typeof gene === 'string') try { gene = JSON.parse(gene); } catch { gene = null; }
+    let cfg = run.config;
+    if (typeof cfg === 'string') try { cfg = JSON.parse(cfg); } catch { cfg = {}; }
+
+    document.getElementById('detail-title').textContent = `${run.symbol} ${tfLabel(run.timeframe)}`;
+    document.getElementById('detail-run-id').textContent = `#${id}`;
+
+    // Render parameter cards
+    if (gene) {
+      const tp3Pct = 100 - (gene.tp1Pct ?? 0) - (gene.tp2Pct ?? 0);
+      const paramsHtml = Object.entries(PARAM_LABELS).map(([key, meta]) => {
+        const raw = gene[key];
+        if (raw == null) return '';
+        // Special display for tp3Pct
+        const displayVal = key === 'tp2Pct'
+          ? `${raw}${meta.unit} <span style="color:#6e7681;font-size:11px">(TP3 gets ${tp3Pct}%)</span>`
+          : `${typeof raw === 'number' && !Number.isInteger(raw) ? raw.toFixed(2) : raw}${meta.unit ? ' ' + meta.unit : ''}`;
+        return `<div style="background:#21262d;border:1px solid #30363d;border-radius:6px;padding:10px 12px">
+          <div style="font-size:11px;color:#8b949e;margin-bottom:4px">${meta.label}</div>
+          <div style="font-size:16px;font-weight:700;color:#e6edf3;font-family:monospace">${displayVal}</div>
+          <div style="font-size:10px;color:#6e7681;margin-top:4px">${meta.desc}</div>
+        </div>`;
+      }).join('');
+      document.getElementById('detail-params').innerHTML = paramsHtml;
+    } else {
+      document.getElementById('detail-params').innerHTML = '<span style="color:#8b949e">No gene data yet</span>';
+    }
+  } catch (err) {
+    document.getElementById('detail-title').textContent = 'Error loading run';
+    console.error(err);
+  }
+};
+
+window.closeRunDetail = () => {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+  document.getElementById('page-optimizer').classList.add('active');
+  document.querySelector('[data-page="optimizer"]').classList.add('active');
+  document.getElementById('nav-run-detail').style.display = 'none';
+};
+
+window.recalcRun = async () => {
+  if (!detailRunId) return;
+  const btn = document.getElementById('btn-recalc');
+  const status = document.getElementById('recalc-status');
+  const metricsDiv = document.getElementById('recalc-metrics');
+  btn.disabled = true;
+  status.textContent = 'Recalculating…';
+  metricsDiv.innerHTML = '';
+  document.getElementById('detail-trades-card').style.display = 'none';
+
+  try {
+    const res = await fetch(`/api/runs/${detailRunId}/trades`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error);
+
+    const m = data.metrics;
+    const profit = m.netProfit;
+    metricsDiv.innerHTML = [
+      ['Net Profit',  profit != null ? `<span class="${profit >= 0 ? 'positive' : 'negative'}">$${Math.round(profit).toLocaleString()}</span>` : '—'],
+      ['Win Rate',    m.winRate != null ? (m.winRate * 100).toFixed(1) + '%' : '—'],
+      ['PF',          m.pf != null ? m.pf.toFixed(2) : '—'],
+      ['Max DD',      m.maxDDPct != null ? (m.maxDDPct * 100).toFixed(1) + '%' : '—'],
+      ['Trades',      m.trades ?? '—'],
+      ['Sharpe',      m.sharpe != null ? m.sharpe.toFixed(2) : '—'],
+    ].map(([k, v]) => `<div style="text-align:center">
+      <div style="font-size:11px;color:#8b949e">${k}</div>
+      <div style="font-size:15px;font-weight:700">${v}</div>
+    </div>`).join('');
+
+    detailTradeList = data.tradeList ?? [];
+    status.textContent = `Done — ${detailTradeList.length} trade executions`;
+    renderCharts(data.ohlc ?? [], data.equity ?? [], detailTradeList);
+    renderTradeTable(detailTradeList);
+  } catch (err) {
+    status.textContent = 'Error: ' + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+// ─── Charts ─────────────────────────────────────────────────
+let priceChart = null;
+let equityChart = null;
+
+function renderCharts(ohlc, equity, trades) {
+  const chartsCard = document.getElementById('detail-charts-card');
+  if (!ohlc.length && !equity.length) {
+    chartsCard.style.display = 'none';
+    return;
+  }
+  chartsCard.style.display = '';
+
+  // Clean up previous charts
+  const priceEl = document.getElementById('price-chart');
+  const equityEl = document.getElementById('equity-chart');
+  priceEl.innerHTML = '';
+  equityEl.innerHTML = '';
+
+  const chartColors = {
+    background: '#0d1117',
+    text: '#8b949e',
+    grid: '#21262d',
+  };
+
+  // ── Price chart (candlestick + trade markers) ──
+  priceChart = LightweightCharts.createChart(priceEl, {
+    width: priceEl.clientWidth,
+    height: 350,
+    layout: { background: { type: 'solid', color: chartColors.background }, textColor: chartColors.text },
+    grid: { vertLines: { color: chartColors.grid }, horzLines: { color: chartColors.grid } },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: '#30363d' },
+    timeScale: { borderColor: '#30363d', timeVisible: true },
+  });
+
+  const candleSeries = priceChart.addCandlestickSeries({
+    upColor: '#3fb950', downColor: '#f85149',
+    borderUpColor: '#3fb950', borderDownColor: '#f85149',
+    wickUpColor: '#3fb95088', wickDownColor: '#f8514988',
+  });
+  candleSeries.setData(ohlc);
+
+  // Trade markers on price chart
+  if (trades.length) {
+    const markers = [];
+    for (const t of trades) {
+      // Entry marker
+      markers.push({
+        time: Math.floor(t.entryTs / 1000),
+        position: t.direction === 'Long' ? 'belowBar' : 'aboveBar',
+        color: t.direction === 'Long' ? '#3fb950' : '#f85149',
+        shape: t.direction === 'Long' ? 'arrowUp' : 'arrowDown',
+        text: t.direction === 'Long' ? 'L' : 'S',
+      });
+      // Exit marker
+      const exitColor = t.pnl >= 0 ? '#3fb950' : '#f85149';
+      const signalShort = (t.signal || '').slice(0, 3);
+      markers.push({
+        time: Math.floor(t.exitTs / 1000),
+        position: t.direction === 'Long' ? 'aboveBar' : 'belowBar',
+        color: exitColor,
+        shape: 'circle',
+        text: signalShort,
+      });
+    }
+    // Sort by time (required by lightweight-charts)
+    markers.sort((a, b) => a.time - b.time);
+    candleSeries.setMarkers(markers);
+  }
+
+  // ── Equity chart (area) ──
+  equityChart = LightweightCharts.createChart(equityEl, {
+    width: equityEl.clientWidth,
+    height: 220,
+    layout: { background: { type: 'solid', color: chartColors.background }, textColor: chartColors.text },
+    grid: { vertLines: { color: chartColors.grid }, horzLines: { color: chartColors.grid } },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: '#30363d' },
+    timeScale: { borderColor: '#30363d', timeVisible: true },
+  });
+
+  const equitySeries = equityChart.addAreaSeries({
+    topColor: '#58a6ff40',
+    bottomColor: '#58a6ff08',
+    lineColor: '#58a6ff',
+    lineWidth: 2,
+    priceFormat: { type: 'custom', formatter: v => '$' + Math.round(v).toLocaleString() },
+  });
+  equitySeries.setData(equity);
+
+  // Sync visible range between the two charts
+  priceChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+    if (range) equityChart.timeScale().setVisibleLogicalRange(range);
+  });
+  equityChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+    if (range) priceChart.timeScale().setVisibleLogicalRange(range);
+  });
+
+  // Sync crosshair (wrapped in try/catch — setCrosshairPosition may not be available in all versions)
+  try {
+    priceChart.subscribeCrosshairMove(param => {
+      if (param.time) {
+        try { equityChart.setCrosshairPosition(undefined, param.time, equitySeries); } catch {}
+      } else {
+        try { equityChart.clearCrosshairPosition(); } catch {}
+      }
+    });
+    equityChart.subscribeCrosshairMove(param => {
+      if (param.time) {
+        try { priceChart.setCrosshairPosition(undefined, param.time, candleSeries); } catch {}
+      } else {
+        try { priceChart.clearCrosshairPosition(); } catch {}
+      }
+    });
+  } catch {}
+
+  // Resize handler
+  const resizeObserver = new ResizeObserver(() => {
+    if (priceChart) priceChart.applyOptions({ width: priceEl.clientWidth });
+    if (equityChart) equityChart.applyOptions({ width: equityEl.clientWidth });
+  });
+  resizeObserver.observe(priceEl);
+  resizeObserver.observe(equityEl);
+
+  priceChart.timeScale().fitContent();
+  equityChart.timeScale().fitContent();
+}
+
+function renderTradeTable(trades) {
+  if (!trades.length) return;
+  document.getElementById('detail-trades-card').style.display = '';
+  document.getElementById('detail-trade-count').textContent = `(${trades.length})`;
+
+  const SIGNAL_COLORS = {
+    TP1: '#3fb950', TP2: '#3fb950', TP3: '#3fb950',
+    SL: '#f85149', ESL: '#f85149',
+    Time: '#8b949e', Structural: '#8b949e', Reversal: '#d2a8ff', End: '#6e7681',
+  };
+
+  const fmtDate = ts => {
+    if (!ts) return '—';
+    const d = new Date(ts);
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  const fmtNum = (n, dec=2) => n != null ? n.toFixed(dec) : '—';
+
+  document.getElementById('detail-trades-tbody').innerHTML = trades.map((t, i) => {
+    const pnlColor = t.pnl > 0 ? '#3fb950' : t.pnl < 0 ? '#f85149' : '#8b949e';
+    const sigColor = SIGNAL_COLORS[t.signal] ?? '#8b949e';
+    const dirColor = t.direction === 'Long' ? '#3fb950' : '#f85149';
+    return `<tr style="border-bottom:1px solid #21262d">
+      <td style="padding:5px 8px;color:#6e7681">${i + 1}</td>
+      <td style="padding:5px 8px;font-weight:700;color:${dirColor}">${t.direction}</td>
+      <td style="padding:5px 8px;font-family:monospace;font-size:11px">${fmtDate(t.entryTs)}</td>
+      <td style="padding:5px 8px;font-family:monospace;font-size:11px">${fmtDate(t.exitTs)}</td>
+      <td style="padding:5px 8px"><span style="color:${sigColor};font-weight:600">${t.signal}</span></td>
+      <td style="padding:5px 8px;text-align:right;font-family:monospace">${fmtNum(t.entryPrice, 2)}</td>
+      <td style="padding:5px 8px;text-align:right;font-family:monospace">${fmtNum(t.exitPrice, 2)}</td>
+      <td style="padding:5px 8px;text-align:right;font-family:monospace">${fmtNum(t.sizeAsset, 4)}</td>
+      <td style="padding:5px 8px;text-align:right;font-family:monospace">$${fmtNum(t.sizeUsdt, 0)}</td>
+      <td style="padding:5px 8px;text-align:right;font-weight:700;font-family:monospace;color:${pnlColor}">$${fmtNum(t.pnl, 2)}</td>
+      <td style="padding:5px 8px;text-align:right;font-family:monospace;color:${pnlColor}">${fmtNum(t.pnlPct * 100, 3)}%</td>
+    </tr>`;
+  }).join('');
+}
+
+window.exportTrades = () => {
+  if (!detailTradeList.length) return;
+  const fmtDate = ts => {
+    if (!ts) return '';
+    const d = new Date(ts);
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  const header = ['#','Direction','Entry Date','Exit Date','Signal','Entry Price','Exit Price','Size Asset','Size USDT','Net PnL','PnL %'];
+  const rows = detailTradeList.map((t, i) => [
+    i + 1, t.direction, fmtDate(t.entryTs), fmtDate(t.exitTs), t.signal,
+    t.entryPrice?.toFixed(2), t.exitPrice?.toFixed(2),
+    t.sizeAsset?.toFixed(4), t.sizeUsdt?.toFixed(2),
+    t.pnl?.toFixed(2), (t.pnlPct * 100)?.toFixed(3),
+  ]);
+  const csv = [header, ...rows].map(r => r.join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+  a.download = `run-${detailRunId}-trades.csv`;
+  a.click();
+};
 
 // ─── Init ───────────────────────────────────────────────────
 loadSymbols();

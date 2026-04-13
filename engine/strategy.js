@@ -2,6 +2,11 @@
  * JM Simple 3TP — bar-by-bar strategy simulation.
  * Mirrors the PineScript strategy logic from jm_simple_3tp.pine.
  *
+ * Each position is split into 3 sub-entries (TP1/TP2/TP3 tiers), matching
+ * Pine's 3-entry approach with pyramiding=2. Each sub-position has its own
+ * TP level and is independently closed by its limit exit. SL/Time/Structural
+ * exits close all remaining sub-positions.
+ *
  * Returns performance metrics matching TradingView's report format.
  */
 
@@ -34,6 +39,13 @@ export function runStrategy(candles, params, opts = {}) {
 
   const initialCapital = opts.initialCapital ?? 100000;
   const leverage = opts.leverage ?? 1;
+  const collectTrades = opts.collectTrades ?? false;
+  const collectEquity = opts.collectEquity ?? false;
+  // Slippage: matches TradingView standard (slippage=2 ticks, mintick=$0.01).
+  // Applied to market/stop fills (entries, close exits, ESL) but NOT to limit fills (TPs).
+  const SLIPPAGE_TICKS = 2;
+  const MINTICK        = 0.01;
+  const slippage       = SLIPPAGE_TICKS * MINTICK;
   const len = candles.close.length;
 
   // ─── Compute indicators ────────────────────────────────────
@@ -64,7 +76,6 @@ export function runStrategy(candles, params, opts = {}) {
   const stochCrossDown = crossunder(stochK, stochD);
 
   // ─── Pre-compute per-bar signals ───────────────────────────
-  // We need "squeeze in last 3 bars" so pre-compute squeeze flag
   const squeeze = new Uint8Array(len);
   for (let i = 0; i < len; i++) {
     squeeze[i] = bbPctRank[i] < 25 ? 1 : 0;
@@ -76,55 +87,64 @@ export function runStrategy(candles, params, opts = {}) {
   let maxDD = 0;
   let maxDDPct = 0;
 
-  // Position state
-  let posSize = 0;        // +units = long, -units = short, 0 = flat
+  // Position state — 3 sub-positions per trade
+  let posDir = 0;          // +1 long, -1 short, 0 flat
+  let subs = [];           // [{units, tpMult, closed}] — 3 sub-entries per position
   let entryPrice = 0;
   let entryBar = 0;
   let entryAtr = 0;
-  let tp1Hit = false;
-  let tp2Hit = false;
-  let remainingUnits = 0;
+  let tp1Hit = false;      // Used for breakeven SL calculation
+  let tp1HitBar = -1;      // Bar on which TP1 filled (1-bar delay matching Pine's detection)
 
   // Pending entry — signals on bar N, fill at bar N+1's open (matches TV)
   let pendingEntry = null;  // { isLong, atr }
 
   // Pending exits — all strategy.close() equivalents defer to next bar's open
-  // to match PineScript's execution model where strategy.close() fills at next open.
-  let pendingClose = null;  // { isLong } — structural, time, or SL exits
+  let pendingClose = null;  // { isLong, signal } — structural, time, or SL exits
 
-  // Close-based SL uses 2-step deferral matching Pine's slTriggered pattern:
-  // Bar N: close crosses SL → slTriggered = true
-  // Bar N+1: slTriggered → pendingClose set (strategy.close placed) → fills at bar N+2 open
+  // Close-based SL uses 2-step deferral matching Pine's slTriggered pattern
   let slTriggered = false;
 
   // Metrics accumulators
-  let totalTrades = 0;    // Each partial exit counts as a trade (matches TV)
+  let totalTrades = 0;
   let wins = 0;
   let grossProfit = 0;
   let grossLoss = 0;
 
-  // For Sharpe: track per-trade returns
   const tradeReturns = [];
+  const tradeList = collectTrades ? [] : null;
+  const equityHistory = collectEquity ? [] : null;
 
-  // ─── Helper: apply commission and update equity ────────────
-  function closeTrade(units, exitPrice, isLong) {
-    const entryCommission = Math.abs(units) * entryPrice * COMMISSION_PCT;
-    const exitCommission = Math.abs(units) * exitPrice * COMMISSION_PCT;
+  // ─── Helper: close one sub-position and update equity ──────
+  function closeSub(subUnits, exitPrice, isLong, signal, exitBar) {
+    const entryComm = subUnits * entryPrice * COMMISSION_PCT;
+    const exitComm = subUnits * exitPrice * COMMISSION_PCT;
     const pnl = isLong
-      ? units * (exitPrice - entryPrice) - entryCommission - exitCommission
-      : Math.abs(units) * (entryPrice - exitPrice) - entryCommission - exitCommission;
+      ? subUnits * (exitPrice - entryPrice) - entryComm - exitComm
+      : subUnits * (entryPrice - exitPrice) - entryComm - exitComm;
 
     equity += pnl;
     totalTrades++;
 
-    if (pnl > 0) {
-      wins++;
-      grossProfit += pnl;
-    } else {
-      grossLoss += Math.abs(pnl);
-    }
+    if (pnl > 0) { wins++; grossProfit += pnl; }
+    else { grossLoss += Math.abs(pnl); }
 
     tradeReturns.push(pnl / initialCapital);
+
+    if (collectTrades) {
+      tradeList.push({
+        direction: isLong ? 'Long' : 'Short',
+        entryTs:   candles.ts ? Number(candles.ts[entryBar]) : null,
+        exitTs:    candles.ts ? Number(candles.ts[exitBar ?? entryBar]) : null,
+        signal:    signal ?? 'Close',
+        entryPrice,
+        exitPrice,
+        sizeAsset: subUnits,
+        sizeUsdt:  subUnits * exitPrice,
+        pnl,
+        pnlPct:    pnl / initialCapital,
+      });
+    }
 
     // DD tracking
     peakEquity = Math.max(peakEquity, equity);
@@ -132,14 +152,26 @@ export function runStrategy(candles, params, opts = {}) {
     if (dd > maxDD) maxDD = dd;
     const ddPct = peakEquity > 0 ? dd / peakEquity : 0;
     if (ddPct > maxDDPct) maxDDPct = ddPct;
+  }
 
-    return units; // consumed units
+  // ─── Helper: close ALL remaining sub-positions ─────────────
+  function closeAllSubs(exitPrice, isLong, signal, exitBar) {
+    for (const sub of subs) {
+      if (!sub.closed) {
+        closeSub(sub.units, exitPrice, isLong, signal, exitBar);
+        sub.closed = true;
+      }
+    }
+    posDir = 0;
+    subs = [];
+  }
+
+  // ─── Helper: check if all subs are closed ──────────────────
+  function allSubsClosed() {
+    return subs.length === 0 || subs.every(s => s.closed);
   }
 
   // ─── Main loop — bar by bar ────────────────────────────────
-  // Start from whichever is later: indicator warmup or trading start bar.
-  // When pre-warmed data is loaded before the start date, tradingStartBar
-  // will be >= warmup, so indicators are fully ready by the time we trade.
   const warmup = Math.max(stochLen + stochSmth * 2, rsiLen + 1, emaSlow, bbLen + 100, atrLen) + 5;
   const tradingStartBar = opts.tradingStartBar ?? 0;
   const startBar = Math.max(warmup, tradingStartBar);
@@ -150,25 +182,26 @@ export function runStrategy(candles, params, opts = {}) {
     const l = candles.low[i];
     const o = candles.open[i];
 
-    // Skip if indicators are NaN
     if (isNaN(stochK[i]) || isNaN(emaF[i]) || isNaN(emaS[i]) || isNaN(atrArr[i])) continue;
 
     // ─── Execute pending close at this bar's open ──────
     // Matches Pine's strategy.close() which fills at next bar's open.
-    // Must execute BEFORE pending entry so reversals work:
-    // close fills → position flat → entry fills (both at same bar's open).
-    if (pendingClose && posSize !== 0) {
-      closeTrade(Math.abs(remainingUnits), o, pendingClose.isLong);
-      posSize = 0;
-      remainingUnits = 0;
+    // Must execute BEFORE pending entry so reversals work.
+    if (pendingClose && posDir !== 0) {
+      const isLong = posDir > 0;
+      const closeSlip = isLong ? o - slippage : o + slippage;
+      closeAllSubs(closeSlip, isLong, pendingClose.signal, i);
+      pendingClose = null;
+    } else if (pendingClose && posDir === 0) {
+      // Stale pending close — position was already closed by intra-bar exit
       pendingClose = null;
     }
 
     // ─── Execute pending entry at this bar's open ────────
-    if (pendingEntry && posSize === 0) {
+    if (pendingEntry && posDir === 0) {
       const pe = pendingEntry;
       pendingEntry = null;
-      const fillPrice = o;
+      const fillPrice = pe.isLong ? o + slippage : o - slippage;
       const slDist = pe.atr * atrSL;
       if (slDist > 0 && fillPrice > 0) {
         const riskAmt = equity * riskPct / 100;
@@ -176,101 +209,88 @@ export function runStrategy(candles, params, opts = {}) {
         const maxUnits = equity * leverage / fillPrice;
         units = Math.min(units, maxUnits);
         if (units > 0) {
-          posSize = pe.isLong ? units : -units;
-          remainingUnits = posSize;
+          const u1 = units * tp1Pct / 100;
+          const u2 = units * tp2Pct / 100;
+          const u3 = units - u1 - u2;  // Remainder avoids rounding gap
+          posDir = pe.isLong ? 1 : -1;
+          subs = [
+            { units: u1, tpMult: tp1Mult, closed: false },
+            { units: u2, tpMult: tp2Mult, closed: false },
+            { units: u3, tpMult: tp3Mult, closed: false },
+          ];
           entryPrice = fillPrice;
           entryBar = i;
           entryAtr = pe.atr;
           tp1Hit = false;
-          tp2Hit = false;
+          tp1HitBar = -1;
         }
       }
     }
 
     // ─── slTriggered → place close order (2nd step of close-based SL) ──
-    // Matches Pine: slTriggered set on bar N → strategy.close() on bar N+1 → fills bar N+2
-    if (slTriggered && posSize !== 0) {
-      pendingClose = { isLong: posSize > 0 };
+    if (slTriggered && posDir !== 0) {
+      pendingClose = { isLong: posDir > 0, signal: 'SL' };
       slTriggered = false;
     }
-    if (posSize === 0) slTriggered = false;
+    if (posDir === 0) slTriggered = false;
 
     // ─── Exit checks ────────────────────────────────────
-    if (posSize !== 0) {
-      const isLong = posSize > 0;
+    if (posDir !== 0) {
+      const isLong = posDir > 0;
       const ep = entryPrice;
       const barsHeld = i - entryBar;
 
       let fullExit = false;
 
       // --- 1. Emergency SL (intra-bar, fires on ANY bar including entry bar) ---
-      // Hard circuit-breaker against catastrophic liquidity events.
       const emergencyPrice = isLong
         ? ep * (1 - emergencySlPct / 100)
         : ep * (1 + emergencySlPct / 100);
 
       if (isLong ? l <= emergencyPrice : h >= emergencyPrice) {
-        closeTrade(Math.abs(remainingUnits), emergencyPrice, isLong);
-        posSize = 0;
-        remainingUnits = 0;
+        const eslFill = isLong ? emergencyPrice - slippage : emergencyPrice + slippage;
+        closeAllSubs(eslFill, isLong, 'ESL', i);
         fullExit = true;
       }
 
       // --- 2. TP checks (intra-bar, skip entry bar) ---
+      // Each sub-position checks its own TP level independently.
       if (!fullExit && barsHeld >= 1) {
-        const tp1Price = isLong ? ep + entryAtr * tp1Mult : ep - entryAtr * tp1Mult;
-        const tp2Price = isLong ? ep + entryAtr * tp2Mult : ep - entryAtr * tp2Mult;
-        const tp3Price = isLong ? ep + entryAtr * tp3Mult : ep - entryAtr * tp3Mult;
+        const tpSignals = ['TP1', 'TP2', 'TP3'];
 
-        if (!tp1Hit) {
-          const tp1Reached = isLong ? h >= tp1Price : l <= tp1Price;
-          if (tp1Reached) {
-            const tp1Units = Math.abs(remainingUnits) * tp1Pct / 100;
-            closeTrade(tp1Units, tp1Price, isLong);
-            remainingUnits = isLong
-              ? remainingUnits - tp1Units
-              : remainingUnits + tp1Units;
-            tp1Hit = true;
+        for (let s = 0; s < subs.length; s++) {
+          if (subs[s].closed) continue;
+          const tpPrice = isLong
+            ? ep + entryAtr * subs[s].tpMult
+            : ep - entryAtr * subs[s].tpMult;
+          const tpReached = isLong ? h >= tpPrice : l <= tpPrice;
+          if (tpReached) {
+            closeSub(subs[s].units, tpPrice, isLong, tpSignals[s], i);
+            subs[s].closed = true;
+            // Record TP1 fill bar for breakeven SL with 1-bar delay
+            if (s === 0) tp1HitBar = i;
           }
         }
 
-        if (!tp2Hit && remainingUnits !== 0) {
-          const tp2Reached = isLong ? h >= tp2Price : l <= tp2Price;
-          if (tp2Reached) {
-            const currentAbs = Math.abs(remainingUnits);
-            const tp2Units = currentAbs * tp2Pct / 100;
-            closeTrade(tp2Units, tp2Price, isLong);
-            remainingUnits = isLong
-              ? remainingUnits - tp2Units
-              : remainingUnits + tp2Units;
-            tp2Hit = true;
-          }
-        }
+        // Pine detects TP1 via position_size change on NEXT bar
+        if (tp1HitBar >= 0 && i > tp1HitBar) tp1Hit = true;
 
-        if (remainingUnits !== 0) {
-          const tp3Reached = isLong ? h >= tp3Price : l <= tp3Price;
-          if (tp3Reached) {
-            closeTrade(Math.abs(remainingUnits), tp3Price, isLong);
-            remainingUnits = 0;
-          }
-        }
-
-        posSize = remainingUnits;
-        if (Math.abs(posSize) < 0.0001) {
-          posSize = 0;
-          remainingUnits = 0;
+        // Check if all subs closed by TPs
+        if (allSubsClosed()) {
+          posDir = 0;
+          subs = [];
           fullExit = true;
         }
       }
 
-      // --- 3. Time-based exit (deferred to next bar's open, matches Pine strategy.close()) ---
-      if (!fullExit && posSize !== 0 && barsHeld >= maxBars) {
-        pendingClose = { isLong };
+      // --- 3. Time-based exit (deferred to next bar's open) ---
+      if (!fullExit && posDir !== 0 && !pendingClose && barsHeld >= maxBars - 1) {
+        pendingClose = { isLong, signal: 'Time' };
         fullExit = true;
       }
 
-      // --- 4. Structural exits (deferred to next bar's open, matches Pine strategy.close()) ---
-      if (!fullExit && posSize !== 0) {
+      // --- 4. Structural exits (deferred to next bar's open) ---
+      if (!fullExit && posDir !== 0 && !pendingClose) {
         let structuralExit = false;
         let oppSignalFired = false;
         if (isLong) {
@@ -286,11 +306,9 @@ export function runStrategy(candles, params, opts = {}) {
         }
 
         if (structuralExit) {
-          pendingClose = { isLong };
+          pendingClose = { isLong, signal: oppSignalFired ? 'Reversal' : 'Structural' };
           fullExit = true;
 
-          // Pine reversal: entry("S") fires on same bar as close("L") when
-          // goShort and position_size >= 0. Both fill at next bar's open.
           if (oppSignalFired) {
             pendingEntry = { isLong: !isLong, atr: atrArr[i] };
           }
@@ -298,9 +316,7 @@ export function runStrategy(candles, params, opts = {}) {
       }
 
       // --- 5. Close-based SL (2-step deferral matching Pine's slTriggered pattern) ---
-      // Bar N: close crosses SL → slTriggered = true
-      // Bar N+1: slTriggered → pendingClose (strategy.close) → fills bar N+2 open
-      if (!fullExit && posSize !== 0 && barsHeld >= 1 && !slTriggered) {
+      if (posDir !== 0 && !slTriggered) {
         let slPrice;
         if (isLong) {
           slPrice = tp1Hit ? ep * 1.003 : ep - entryAtr * atrSL;
@@ -315,7 +331,7 @@ export function runStrategy(candles, params, opts = {}) {
     }
 
     // ─── Entry checks (if flat and no pending close/entry/SL) ──
-    if (posSize === 0 && !pendingEntry && !pendingClose && !slTriggered) {
+    if (posDir === 0 && !pendingEntry && !pendingClose && !slTriggered) {
       const longScore = computeLongScore(i);
       const shortScore = computeShortScore(i);
 
@@ -332,13 +348,29 @@ export function runStrategy(candles, params, opts = {}) {
     if (dd > maxDD) maxDD = dd;
     const ddPct = peakEquity > 0 ? dd / peakEquity : 0;
     if (ddPct > maxDDPct) maxDDPct = ddPct;
+
+    // Record per-bar equity for charting
+    if (collectEquity) {
+      // Mark-to-market: equity + unrealized PnL of open subs
+      let mtm = equity;
+      if (posDir !== 0) {
+        for (const sub of subs) {
+          if (sub.closed) continue;
+          const unrealized = posDir > 0
+            ? sub.units * (c - entryPrice)
+            : sub.units * (entryPrice - c);
+          mtm += unrealized;
+        }
+      }
+      equityHistory.push({ ts: Number(candles.ts[i]), equity: mtm });
+    }
   }
 
   // ─── Close any open position at last bar ──────────────────
-  if (posSize !== 0) {
+  if (posDir !== 0) {
     const lastClose = candles.close[len - 1];
-    closeTrade(Math.abs(remainingUnits), lastClose, posSize > 0);
-    posSize = 0;
+    const isLong = posDir > 0;
+    closeAllSubs(lastClose, isLong, 'End', len - 1);
     pendingClose = null;
   }
 
@@ -348,7 +380,6 @@ export function runStrategy(candles, params, opts = {}) {
   const netProfit = equity - initialCapital;
   const netProfitPct = netProfit / initialCapital;
 
-  // Sharpe ratio (annualized, assuming ~365 trades/year as rough proxy)
   let sharpe = 0;
   if (tradeReturns.length > 1) {
     const mean = tradeReturns.reduce((s, r) => s + r, 0) / tradeReturns.length;
@@ -368,16 +399,15 @@ export function runStrategy(candles, params, opts = {}) {
     maxDDPct,
     sharpe,
     equity,
+    ...(collectTrades ? { tradeList } : {}),
+    ...(collectEquity ? { equityHistory } : {}),
   };
 
   // ─── Signal scoring functions (closures over indicator arrays) ──
   function computeLongScore(bar) {
     let score = 0;
-    // 1. Stoch bullish crossover: K crosses above D, K < 40
     if (stochCrossUp[bar] && stochK[bar] < 40) score++;
-    // 2. EMA bull
     if (emaF[bar] > emaS[bar]) score++;
-    // 3. BB squeeze in last 3 bars + close > basis
     const recentSqueeze = squeeze[bar] || (bar > 0 && squeeze[bar - 1]) || (bar > 1 && squeeze[bar - 2]);
     if (recentSqueeze && candles.close[bar] > bbBasis[bar]) score++;
     return score;
@@ -385,11 +415,8 @@ export function runStrategy(candles, params, opts = {}) {
 
   function computeShortScore(bar) {
     let score = 0;
-    // 1. Stoch bearish crossover: K crosses below D, K > 60
     if (stochCrossDown[bar] && stochK[bar] > 60) score++;
-    // 2. EMA bear
     if (emaF[bar] < emaS[bar]) score++;
-    // 3. BB squeeze in last 3 bars + close < basis
     const recentSqueeze = squeeze[bar] || (bar > 0 && squeeze[bar - 1]) || (bar > 1 && squeeze[bar - 2]);
     if (recentSqueeze && candles.close[bar] < bbBasis[bar]) score++;
     return score;
