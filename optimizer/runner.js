@@ -5,6 +5,11 @@
  * Candle data is shared across workers via SharedArrayBuffer (zero-copy).
  * Migration is coordinated by the main thread between evolution batches.
  *
+ * Hierarchy (when numPlanets > 1):
+ *   Planets → Islands → Population
+ *   - Island migration: ring/torus/random within each planet
+ *   - Space travel: rare cross-planet migration of top individuals
+ *
  * Island model informed by:
  *  - Frahnow & Kötzing (2018): ring topology preserves diversity via slow
  *    information propagation; complete topology kills diversity.
@@ -31,10 +36,13 @@ const WORKER_URL = new URL('./island-worker.js', import.meta.url);
  * @param {number} config.populationSize — per island (e.g., 80)
  * @param {number} config.generations — e.g., 80
  * @param {number} config.mutationRate — e.g., 0.4
- * @param {number} [config.numIslands=4] — number of islands (1 = single-pop in its own thread)
- * @param {number} [config.migrationInterval=0] — migrate every N gens (0 = auto: 25% of total)
- * @param {number} [config.migrationCount=3] — individuals to migrate per event
+ * @param {number} [config.numIslands=4] — islands per planet
+ * @param {number} [config.numPlanets=1] — number of planets (1 = no planet layer)
+ * @param {number} [config.migrationInterval=0] — island migrate every N gens (0 = auto: 25% of total)
+ * @param {number} [config.migrationCount=3] — individuals per island migration event
  * @param {string} [config.migrationTopology='ring'] — 'ring', 'torus', or 'random'
+ * @param {number} [config.spaceTravelInterval=2] — space travel every N island migrations (numPlanets>1 only)
+ * @param {number} [config.spaceTravelCount=1] — individuals per space travel event
  * @param {Function} [config.onProgress]
  * @param {Function} [config.shouldCancel]
  * @returns {Object} results
@@ -46,16 +54,21 @@ export async function runOptimization(config) {
     generations = 80,
     mutationRate = 0.4,
     numIslands = 4,
+    numPlanets = 1,
     migrationInterval: migrationIntervalRaw = 0,
     migrationCount = 3,
     migrationTopology = 'ring',
+    spaceTravelInterval = 2,
+    spaceTravelCount = 1,
     onProgress,
     shouldCancel,
   } = config;
 
+  const totalWorkers = numPlanets * numIslands;
+
   // Auto migration interval: 25% of generations (rare = better diversity)
   // Single island: one batch = all gens (no migration)
-  const migrationInterval = numIslands > 1
+  const migrationInterval = totalWorkers > 1
     ? (migrationIntervalRaw > 0 ? migrationIntervalRaw : Math.max(5, Math.round(generations * 0.25)))
     : generations;
 
@@ -106,17 +119,18 @@ export async function runOptimization(config) {
   new Float64Array(sab, len * 3 * 8, len).set(candles.close);
   new Float64Array(sab, len * 4 * 8, len).set(candles.volume);
 
-  console.log(`[runner] Loaded ${len} bars, tradingStartBar=${tradingStartBar} (pre-warmed ${tradingStartBar} bars before ${startDate})`);
+  console.log(`[runner] Loaded ${len} bars, tradingStartBar=${tradingStartBar}, planets=${numPlanets}, islands/planet=${numIslands}, total workers=${totalWorkers}`);
 
-  // 3. Spawn worker threads — one per island
+  // 3. Spawn worker threads — one per island across all planets
+  //    Mutation rate varies across all workers globally for maximum diversity
   const workers = [];
   const readyPromises = [];
 
-  for (let idx = 0; idx < numIslands; idx++) {
-    const t = numIslands > 1 ? idx / (numIslands - 1) : 0.5;
-    // Mutation spread: ±50% across islands for heterogeneity
-    const islandMutRate = numIslands > 1 ? mutationRate * (0.5 + t) : mutationRate;
-    // Per-gene mutation probability: varies 0.12..0.30 across islands
+  for (let idx = 0; idx < totalWorkers; idx++) {
+    const t = totalWorkers > 1 ? idx / (totalWorkers - 1) : 0.5;
+    // Mutation spread: ±50% across all workers for heterogeneity
+    const islandMutRate = totalWorkers > 1 ? mutationRate * (0.5 + t) : mutationRate;
+    // Per-gene mutation probability: varies 0.12..0.30 across workers
     const perGeneMut = 0.12 + t * 0.18;
 
     const worker = new Worker(WORKER_URL, {
@@ -152,36 +166,51 @@ export async function runOptimization(config) {
 
   await Promise.all(readyPromises);
 
-  // 4. Topology helper — determines migration targets for each island
-  function getTargets(src) {
+  // 4. Topology helpers
+
+  // Island migration: targets are within the same planet only
+  function getIslandTargets(globalIdx) {
+    const planet = Math.floor(globalIdx / numIslands);
+    const local = globalIdx % numIslands;
+    const base = planet * numIslands;
+
     if (migrationTopology === 'torus') {
       const cols = Math.max(2, Math.round(Math.sqrt(numIslands)));
       const rows = Math.ceil(numIslands / cols);
-      const r = Math.floor(src / cols);
-      const c = src % cols;
+      const r = Math.floor(local / cols);
+      const c = local % cols;
       const neighbours = new Set();
       neighbours.add(r * cols + (c + 1) % cols);
       neighbours.add(r * cols + (c - 1 + cols) % cols);
       neighbours.add(((r + 1) % rows) * cols + c);
       neighbours.add(((r - 1 + rows) % rows) * cols + c);
-      neighbours.delete(src);
-      return [...neighbours].filter(n => n < numIslands);
+      neighbours.delete(local);
+      return [...neighbours].filter(n => n < numIslands).map(n => base + n);
     }
     if (migrationTopology === 'random') {
       let target;
-      do { target = Math.floor(Math.random() * numIslands); } while (target === src);
-      return [target];
+      do { target = Math.floor(Math.random() * numIslands); } while (target === local);
+      return [base + target];
     }
-    // Default: ring
-    return [(src + 1) % numIslands];
+    // Default: ring within planet
+    return [base + (local + 1) % numIslands];
   }
 
-  // Pre-compute static edges for ring/torus (random is dynamic, shown as "?")
+  // Space travel: pick a random island on a different planet
+  function getSpaceTravelTargets(fromPlanet) {
+    if (numPlanets <= 1) return [];
+    let toPlanet;
+    do { toPlanet = Math.floor(Math.random() * numPlanets); } while (toPlanet === fromPlanet);
+    const toIsland = Math.floor(Math.random() * numIslands);
+    return [toPlanet * numIslands + toIsland];
+  }
+
+  // Pre-compute static island edges for progress display
   function buildEdges() {
-    if (migrationTopology === 'random') return []; // dynamic, can't pre-compute
+    if (migrationTopology === 'random') return [];
     const edges = [];
-    for (let i = 0; i < numIslands; i++) {
-      for (const t of getTargets(i)) {
+    for (let i = 0; i < totalWorkers; i++) {
+      for (const t of getIslandTargets(i)) {
         edges.push([i, t]);
       }
     }
@@ -193,12 +222,13 @@ export async function runOptimization(config) {
   const startTime = Date.now();
   let completedGens = 0;
   let totalMigrations = 0;
+  let totalSpaceTravels = 0;
 
-  // Track per-island state for global best computation
-  const islandBest = new Array(numIslands).fill(null);
-  const islandGen = new Array(numIslands).fill(0);
-  const workerEvals = new Array(numIslands).fill(0);
-  const workerCaches = new Array(numIslands).fill(0);
+  // Track per-worker state
+  const islandBest = new Array(totalWorkers).fill(null);
+  const islandGen = new Array(totalWorkers).fill(0);
+  const workerEvals = new Array(totalWorkers).fill(0);
+  const workerCaches = new Array(totalWorkers).fill(0);
 
   // Build batch boundaries
   const batches = [];
@@ -220,7 +250,7 @@ export async function runOptimization(config) {
     }
 
     // Send 'evolve' to all workers and collect results
-    const batchDone = new Array(numIslands);
+    const batchDone = new Array(totalWorkers);
     const batchPromises = [];
 
     // Poll for cancel mid-batch — send cancel to workers immediately
@@ -241,13 +271,14 @@ export async function runOptimization(config) {
               metrics: islandBest.reduce((best, ib) => (ib && ib.fitness > (best?.fitness ?? -Infinity)) ? ib : best, null)?.metrics,
               elapsedMs: Date.now() - startTime,
               numIslands,
+              numPlanets,
             });
           }
         }
       }, 200);
     }
 
-    for (let idx = 0; idx < numIslands; idx++) {
+    for (let idx = 0; idx < totalWorkers; idx++) {
       const w = workers[idx];
 
       batchPromises.push(new Promise(resolve => {
@@ -255,7 +286,6 @@ export async function runOptimization(config) {
           if (msg.islandIdx !== idx) return;
 
           if (msg.type === 'gen_progress') {
-            // Update this island's best
             islandBest[idx] = {
               fitness: msg.bestFitness,
               gene: msg.bestGene,
@@ -265,7 +295,7 @@ export async function runOptimization(config) {
             workerEvals[idx] = msg.evalCount;
             workerCaches[idx] = msg.cacheSize;
 
-            // Compute global best across all islands
+            // Compute global best across all workers
             let globalBest = { fitness: -Infinity };
             for (const ib of islandBest) {
               if (ib && ib.fitness > globalBest.fitness) globalBest = ib;
@@ -273,7 +303,6 @@ export async function runOptimization(config) {
 
             completedGens = Math.max(...islandGen);
 
-            // Log first report per generation
             if (!generationLog.find(e => e.gen === msg.gen)) {
               generationLog.push({
                 gen: msg.gen,
@@ -287,6 +316,21 @@ export async function runOptimization(config) {
             if (onProgress) {
               const minGen = Math.min(...islandGen.filter(g => g > 0));
               const maxGen = Math.max(...islandGen);
+
+              // Per-planet best for progress display
+              const planetStats = Array.from({ length: numPlanets }, (_, p) => {
+                let best = { fitness: -Infinity };
+                for (let i = p * numIslands; i < (p + 1) * numIslands; i++) {
+                  if (islandBest[i] && islandBest[i].fitness > best.fitness) best = islandBest[i];
+                }
+                return {
+                  idx: p,
+                  profit: best.metrics?.netProfit ?? null,
+                  trades: best.metrics?.trades ?? null,
+                  pf: best.metrics?.pf ?? null,
+                };
+              });
+
               const progressMsg = {
                 gen: maxGen,
                 minGen: isFinite(minGen) ? minGen : 0,
@@ -300,20 +344,23 @@ export async function runOptimization(config) {
                 elapsedMs: Date.now() - startTime,
                 genTimeMs: 0,
                 numIslands,
+                numPlanets,
                 totalMigrations,
+                totalSpaceTravels,
                 topology: migrationTopology,
                 islands: islandBest.map((ib, i) => ({
                   idx: i,
+                  planetIdx: Math.floor(i / numIslands),
                   gen: islandGen[i],
                   profit: ib?.metrics?.netProfit ?? null,
                   trades: ib?.metrics?.trades ?? null,
                   pf: ib?.metrics?.pf ?? null,
                   evals: workerEvals[i],
                 })),
-                edges: numIslands > 1 ? buildEdges() : [],
+                planets: numPlanets > 1 ? planetStats : undefined,
+                edges: totalWorkers > 1 ? buildEdges() : [],
               };
 
-              // If aborting, add abort status
               if (cancelSent) {
                 progressMsg.aborting = true;
                 progressMsg.abortStatus = 'Stopping workers — finishing current generation';
@@ -343,7 +390,6 @@ export async function runOptimization(config) {
     await Promise.all(batchPromises);
     if (cancelPoller) clearInterval(cancelPoller);
 
-    // Check cancel between batches
     if (shouldCancel?.()) {
       if (!cancelSent) {
         for (const w of workers) w.postMessage({ type: 'cancel' });
@@ -352,12 +398,11 @@ export async function runOptimization(config) {
       break;
     }
 
-    // Migration (multi-island only, not after last batch)
-    if (numIslands > 1 && batch.endGen < generations) {
-      // Collect all migrants per target island (handles torus multi-source)
+    // Island migration (within each planet, not after last batch)
+    if (totalWorkers > 1 && batch.endGen < generations) {
       const migrationsPerTarget = new Map();
-      for (let i = 0; i < numIslands; i++) {
-        const targets = getTargets(i);
+      for (let i = 0; i < totalWorkers; i++) {
+        const targets = getIslandTargets(i);
         const srcTop = batchDone[i].top;
         for (const target of targets) {
           if (!migrationsPerTarget.has(target)) migrationsPerTarget.set(target, []);
@@ -365,7 +410,6 @@ export async function runOptimization(config) {
         }
       }
 
-      // Send one migrate message per target, capped at migrationCount best
       const migratePromises = [];
       for (const [target, allMigrants] of migrationsPerTarget) {
         allMigrants.sort((a, b) => b.score - a.score);
@@ -386,6 +430,41 @@ export async function runOptimization(config) {
 
       await Promise.all(migratePromises);
       totalMigrations++;
+
+      // Space travel: cross-planet migration, every spaceTravelInterval island migrations
+      if (numPlanets > 1 && totalMigrations % spaceTravelInterval === 0) {
+        const travelPromises = [];
+
+        for (let p = 0; p < numPlanets; p++) {
+          // Find best individual(s) on this planet
+          const planetWorkers = Array.from({ length: numIslands }, (_, i) => p * numIslands + i);
+          const allTop = planetWorkers.flatMap(wi => batchDone[wi].top);
+          allTop.sort((a, b) => b.score - a.score);
+          const travelers = allTop.slice(0, spaceTravelCount);
+
+          if (travelers.length === 0) continue;
+
+          // Send to random island on a different planet
+          const targets = getSpaceTravelTargets(p);
+          for (const target of targets) {
+            travelPromises.push(new Promise(resolve => {
+              const handler = (msg) => {
+                if (msg.type === 'migrate_done' && msg.islandIdx === target) {
+                  workers[target].off('message', handler);
+                  resolve();
+                }
+              };
+              workers[target].on('message', handler);
+            }));
+
+            workers[target].postMessage({ type: 'migrate', migrants: travelers });
+          }
+        }
+
+        await Promise.all(travelPromises);
+        totalSpaceTravels++;
+        console.log(`[runner] Space travel #${totalSpaceTravels} after migration #${totalMigrations}`);
+      }
     }
   }
 
@@ -398,6 +477,7 @@ export async function runOptimization(config) {
       abortStatus: 'Collecting partial results from workers',
       elapsedMs: Date.now() - startTime,
       numIslands,
+      numPlanets,
     });
   }
 
@@ -422,21 +502,20 @@ export async function runOptimization(config) {
       abortStatus: 'Terminating worker threads',
       elapsedMs: Date.now() - startTime,
       numIslands,
+      numPlanets,
     });
   }
 
   // Terminate all workers
   await Promise.all(workers.map(w => w.terminate()));
 
-  // 7. Merge results across all islands
+  // 7. Merge results across all workers
 
-  // Global best
   let finalBest = { fitness: -Infinity };
   for (const r of finalResults) {
     if (r.best.fitness > finalBest.fitness) finalBest = r.best;
   }
 
-  // Merge + deduplicate top results from all worker caches
   const seen = new Set();
   const topResults = finalResults
     .flatMap(r => r.topResults)
@@ -470,8 +549,9 @@ export async function runOptimization(config) {
     totalEvaluations,
     cacheSize: totalCacheSize,
     totalMigrations,
+    totalSpaceTravels,
     totalTimeMs: Date.now() - startTime,
     candleBars: len,
-    config: { populationSize, generations, mutationRate, numIslands, migrationInterval, migrationCount, migrationTopology },
+    config: { populationSize, generations, mutationRate, numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology, spaceTravelInterval, spaceTravelCount },
   };
 }

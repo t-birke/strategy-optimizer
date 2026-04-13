@@ -216,12 +216,19 @@ function onGeneration(msg) {
     document.getElementById('live-trades').textContent = m.trades;
   }
 
-  // Island info
-  if (msg.numIslands > 1) {
+  // Island / planet info
+  const totalIslands = (msg.numPlanets || 1) * (msg.numIslands || 1);
+  if (totalIslands > 1) {
     document.getElementById('live-islands-stat').style.display = '';
     document.getElementById('live-migrations-stat').style.display = '';
-    document.getElementById('live-islands').textContent = msg.numIslands;
-    document.getElementById('live-migrations').textContent = msg.totalMigrations;
+    const islandLabel = msg.numPlanets > 1
+      ? `${msg.numPlanets}p × ${msg.numIslands}i`
+      : msg.numIslands;
+    document.getElementById('live-islands').textContent = islandLabel;
+    const migLabel = msg.numPlanets > 1
+      ? `${msg.totalMigrations}m / ${msg.totalSpaceTravels ?? 0}st`
+      : msg.totalMigrations;
+    document.getElementById('live-migrations').textContent = migLabel;
     if (msg.islands) renderIslandViz(msg);
   }
 
@@ -300,27 +307,46 @@ function renderIslandViz(msg) {
   const n = msg.islands.length;
   if (n < 2) { container.style.display = 'none'; return; }
 
+  const numPlanets = msg.numPlanets || 1;
+  const numIslandsPerPlanet = msg.numIslands || n;
+
   const W = svg.clientWidth || 500;
-  const H = 220;
+  // Taller when we have planets so planet rings have room
+  const H = numPlanets > 1 ? Math.max(260, 130 + numPlanets * 80) : 220;
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
 
-  const cx = W / 2;
-  const cy = H / 2;
-  const rx = Math.min(W * 0.38, 190);
-  const ry = Math.min(H * 0.38, 70);
-  const nodeR = 34;
+  const nodeR = 28;
 
-  // Compute node positions in an ellipse
-  const nodes = msg.islands.map((isl, i) => {
-    const angle = -Math.PI / 2 + (2 * Math.PI * i) / n;
-    return {
-      ...isl,
-      x: cx + rx * Math.cos(angle),
-      y: cy + ry * Math.sin(angle),
-    };
-  });
+  // Compute node positions:
+  //   - Single planet: ellipse (existing layout)
+  //   - Multi-planet: each planet gets its own row, islands arranged in a small ellipse per row
+  let nodes;
+  if (numPlanets > 1) {
+    nodes = msg.islands.map((isl) => {
+      const p = isl.planetIdx ?? Math.floor(isl.idx / numIslandsPerPlanet);
+      const localIdx = isl.idx % numIslandsPerPlanet;
+      // Each planet row is centred vertically, spaced evenly
+      const rowY = 50 + p * ((H - 60) / (numPlanets - 1 || 1));
+      const rowRx = Math.min(W * 0.30, 150);
+      const angle = -Math.PI / 2 + (2 * Math.PI * localIdx) / numIslandsPerPlanet;
+      return {
+        ...isl,
+        planetIdx: p,
+        x: W / 2 + rowRx * Math.cos(angle),
+        y: rowY + 22 * Math.sin(angle), // flat ellipse per row
+      };
+    });
+  } else {
+    const cx = W / 2, cy = H / 2;
+    const rx = Math.min(W * 0.38, 190);
+    const ry = Math.min(H * 0.38, 70);
+    nodes = msg.islands.map((isl, i) => {
+      const angle = -Math.PI / 2 + (2 * Math.PI * i) / n;
+      return { ...isl, planetIdx: 0, x: cx + rx * Math.cos(angle), y: cy + ry * Math.sin(angle) };
+    });
+  }
 
-  // Find best island
+  // Find global best island
   let bestIdx = 0;
   let bestProfit = -Infinity;
   for (const nd of nodes) {
@@ -330,9 +356,12 @@ function renderIslandViz(msg) {
     }
   }
 
+  // Planet colors for multi-planet mode
+  const PLANET_COLORS = ['#1f6feb', '#388bfd', '#58a6ff', '#79c0ff', '#a5d6ff', '#cae8ff', '#e1f0ff', '#f0f8ff'];
+
   let html = '';
 
-  // Arrowhead marker
+  // Arrowhead markers
   html += `<defs>
     <marker id="arrow" viewBox="0 0 10 6" refX="10" refY="3" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
       <path d="M0,0 L10,3 L0,6 z" fill="#30363d"/>
@@ -340,15 +369,29 @@ function renderIslandViz(msg) {
     <marker id="arrow-hl" viewBox="0 0 10 6" refX="10" refY="3" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
       <path d="M0,0 L10,3 L0,6 z" fill="#58a6ff"/>
     </marker>
+    <marker id="arrow-travel" viewBox="0 0 10 6" refX="10" refY="3" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,3 L0,6 z" fill="#d2a8ff"/>
+    </marker>
   </defs>`;
 
-  // Draw edges
+  // Draw planet background bands for multi-planet mode
+  if (numPlanets > 1) {
+    for (let p = 0; p < numPlanets; p++) {
+      const rowY = 50 + p * ((H - 60) / (numPlanets - 1 || 1));
+      const bandTop = rowY - 38;
+      const bandH = 76;
+      const col = PLANET_COLORS[p % PLANET_COLORS.length];
+      html += `<rect x="8" y="${bandTop}" width="${W - 16}" height="${bandH}" rx="8" fill="${col}" fill-opacity="0.06" stroke="${col}" stroke-opacity="0.15" stroke-width="1"/>`;
+      html += `<text x="16" y="${bandTop + 13}" fill="${col}" fill-opacity="0.7" font-size="9" font-weight="600">Planet ${p}</text>`;
+    }
+  }
+
+  // Draw island migration edges (within planet)
   const edges = msg.edges || [];
   if (edges.length > 0) {
     for (const [from, to] of edges) {
       const a = nodes[from], b = nodes[to];
       if (!a || !b) continue;
-      // Shorten line to not overlap nodes
       const dx = b.x - a.x, dy = b.y - a.y;
       const dist = Math.sqrt(dx * dx + dy * dy);
       if (dist < 1) continue;
@@ -359,7 +402,6 @@ function renderIslandViz(msg) {
       html += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${isBestEdge ? '#58a6ff' : '#30363d'}" stroke-width="${isBestEdge ? 1.5 : 1}" marker-end="url(#${isBestEdge ? 'arrow-hl' : 'arrow'})" opacity="${isBestEdge ? 0.8 : 0.5}"/>`;
     }
   } else if (msg.topology === 'random') {
-    // Random: draw dashed lines between all pairs to suggest dynamic connections
     for (let i = 0; i < n; i++) {
       const next = (i + 1) % n;
       const a = nodes[i], b = nodes[next];
@@ -371,25 +413,56 @@ function renderIslandViz(msg) {
     }
   }
 
-  // Draw nodes
+  // Draw space travel arrows between planets (cross-planet dashed purple lines)
+  if (numPlanets > 1 && (msg.totalSpaceTravels ?? 0) > 0) {
+    // Draw one representative arrow per planet pair to show space travel happened
+    const drawn = new Set();
+    for (let p = 0; p < numPlanets; p++) {
+      const target = (p + 1) % numPlanets;
+      const key = `${Math.min(p, target)}-${Math.max(p, target)}`;
+      if (drawn.has(key)) continue;
+      drawn.add(key);
+      // Use centroid of each planet's islands
+      const pNodes = nodes.filter(nd => nd.planetIdx === p);
+      const tNodes = nodes.filter(nd => nd.planetIdx === target);
+      if (!pNodes.length || !tNodes.length) continue;
+      const ax = pNodes.reduce((s, nd) => s + nd.x, 0) / pNodes.length;
+      const ay = pNodes.reduce((s, nd) => s + nd.y, 0) / pNodes.length;
+      const bx = tNodes.reduce((s, nd) => s + nd.x, 0) / tNodes.length;
+      const by = tNodes.reduce((s, nd) => s + nd.y, 0) / tNodes.length;
+      const dx = bx - ax, dy = by - ay;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < 1) continue;
+      const ux = dx / dist, uy = dy / dist;
+      // Offset slightly to avoid overlapping island edges
+      const ox = -uy * 10, oy = ux * 10;
+      html += `<line x1="${ax + ox}" y1="${ay + oy}" x2="${bx + ox}" y2="${by + oy}" stroke="#d2a8ff" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow-travel)" opacity="0.6"/>`;
+    }
+  }
+
+  // Draw island nodes
   for (const nd of nodes) {
     const isBest = nd.idx === bestIdx;
-    const fill = isBest ? '#1f6feb33' : '#21262d';
-    const stroke = isBest ? '#58a6ff' : '#30363d';
+    const planetColor = numPlanets > 1 ? PLANET_COLORS[nd.planetIdx % PLANET_COLORS.length] : null;
+    const fill = isBest ? (planetColor ? `${planetColor}33` : '#1f6feb33') : '#21262d';
+    const stroke = isBest ? (planetColor ?? '#58a6ff') : (planetColor ? `${planetColor}60` : '#30363d');
     const profitStr = nd.profit != null ? '$' + Math.round(nd.profit).toLocaleString() : '-';
     const genStr = nd.gen != null ? 'g' + nd.gen : '';
     const tradesStr = nd.trades != null ? nd.trades + 't' : '';
 
     html += `<circle cx="${nd.x}" cy="${nd.y}" r="${nodeR}" fill="${fill}" stroke="${stroke}" stroke-width="${isBest ? 2 : 1}"/>`;
-    html += `<text x="${nd.x}" y="${nd.y - 12}" text-anchor="middle" fill="${isBest ? '#58a6ff' : '#8b949e'}" font-size="10" font-weight="600">#${nd.idx}</text>`;
-    html += `<text x="${nd.x}" y="${nd.y + 2}" text-anchor="middle" fill="${nd.profit > 0 ? '#3fb950' : nd.profit != null && nd.profit < 0 ? '#f85149' : '#8b949e'}" font-size="10" font-weight="700">${profitStr}</text>`;
+    html += `<text x="${nd.x}" y="${nd.y - 10}" text-anchor="middle" fill="${isBest ? (planetColor ?? '#58a6ff') : '#8b949e'}" font-size="9" font-weight="600">#${nd.idx}</text>`;
+    html += `<text x="${nd.x}" y="${nd.y + 3}" text-anchor="middle" fill="${nd.profit > 0 ? '#3fb950' : nd.profit != null && nd.profit < 0 ? '#f85149' : '#8b949e'}" font-size="9" font-weight="700">${profitStr}</text>`;
     html += `<text x="${nd.x}" y="${nd.y + 14}" text-anchor="middle" fill="#8b949e" font-size="8">${tradesStr}</text>`;
-    html += `<text x="${nd.x}" y="${nd.y + 24}" text-anchor="middle" fill="#6e7681" font-size="8">${genStr}</text>`;
+    html += `<text x="${nd.x}" y="${nd.y + 23}" text-anchor="middle" fill="#6e7681" font-size="7">${genStr}</text>`;
   }
 
-  // Topology label
+  // Labels
   const topoLabel = msg.topology === 'ring' ? 'Ring' : msg.topology === 'torus' ? 'Torus' : 'Random';
-  html += `<text x="${W - 8}" y="14" text-anchor="end" fill="#8b949e" font-size="10">${topoLabel} topology</text>`;
+  const label = numPlanets > 1
+    ? `${topoLabel} · ${numPlanets} planets · ${msg.totalSpaceTravels ?? 0} space travels`
+    : `${topoLabel} topology`;
+  html += `<text x="${W - 8}" y="14" text-anchor="end" fill="#8b949e" font-size="10">${label}</text>`;
 
   svg.innerHTML = html;
 }
@@ -828,15 +901,23 @@ document.getElementById('modal-islands').addEventListener('input', (e) => {
     parseInt(e.target.value) > 1 ? '' : 'none';
 });
 
+document.getElementById('modal-planets').addEventListener('input', (e) => {
+  document.getElementById('planet-options').style.display =
+    parseInt(e.target.value) > 1 ? '' : 'none';
+});
+
 document.getElementById('modal-start').addEventListener('click', async () => {
   const symbols = [...document.querySelectorAll('#modal-symbols input:checked')].map(i => i.value);
   const intervals = [...document.querySelectorAll('#modal-intervals input:checked')].map(i => i.value);
   const populationSize = parseInt(document.getElementById('modal-pop').value) || 80;
   const generations = parseInt(document.getElementById('modal-gen').value) || 80;
   const numIslands = parseInt(document.getElementById('modal-islands').value) || 4;
+  const numPlanets = parseInt(document.getElementById('modal-planets').value) || 1;
   const migrationInterval = parseInt(document.getElementById('modal-mig-interval').value) || 0;
   const migrationCount = parseInt(document.getElementById('modal-mig-count').value) || 3;
   const migrationTopology = document.getElementById('modal-topology').value || 'ring';
+  const spaceTravelInterval = parseInt(document.getElementById('modal-space-interval').value) || 2;
+  const spaceTravelCount = parseInt(document.getElementById('modal-space-count').value) || 1;
 
   if (symbols.length === 0 || intervals.length === 0) {
     alert('Select at least one symbol and one interval.');
@@ -857,7 +938,7 @@ document.getElementById('modal-start').addEventListener('click', async () => {
     const res = await fetch('/api/runs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbols, intervals, startDate, endDate, populationSize, generations, numIslands, migrationInterval, migrationCount, migrationTopology }),
+      body: JSON.stringify({ symbols, intervals, startDate, endDate, populationSize, generations, numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology, spaceTravelInterval, spaceTravelCount }),
     });
     const data = await res.json();
     console.log('Queued', data.totalRuns, 'runs:', data.runIds);

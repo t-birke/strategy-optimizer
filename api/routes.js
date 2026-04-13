@@ -172,7 +172,8 @@ router.post('/api/runs', async (req, res) => {
     const {
       symbols, intervals, period, startDate: rawStart, endDate: rawEnd,
       populationSize = 80, generations = 80, mutationRate = 0.4,
-      numIslands = 4, migrationInterval = 0, migrationCount = 3, migrationTopology = 'ring',
+      numIslands = 4, numPlanets = 1, migrationInterval = 0, migrationCount = 3, migrationTopology = 'ring',
+      spaceTravelInterval = 2, spaceTravelCount = 1,
     } = req.body;
 
     if (!symbols?.length || !intervals?.length) {
@@ -205,14 +206,15 @@ router.post('/api/runs', async (req, res) => {
           symbol, timeframe: tf, startDate, endDate,
           label: ivLabel,
           populationSize, generations, mutationRate,
-          numIslands, migrationInterval, migrationCount, migrationTopology,
+          numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology,
+          spaceTravelInterval, spaceTravelCount,
         });
       }
     }
 
     const runIds = [];
     for (const rc of runConfigs) {
-      const configJson = JSON.stringify({ populationSize: rc.populationSize, generations: rc.generations, mutationRate: rc.mutationRate, numIslands: rc.numIslands, migrationInterval: rc.migrationInterval, migrationCount: rc.migrationCount, migrationTopology: rc.migrationTopology, endDate: rc.endDate });
+      const configJson = JSON.stringify({ populationSize: rc.populationSize, generations: rc.generations, mutationRate: rc.mutationRate, numIslands: rc.numIslands, numPlanets: rc.numPlanets, migrationInterval: rc.migrationInterval, migrationCount: rc.migrationCount, migrationTopology: rc.migrationTopology, spaceTravelInterval: rc.spaceTravelInterval, spaceTravelCount: rc.spaceTravelCount, endDate: rc.endDate });
       await exec(`INSERT INTO runs (symbol, timeframe, start_date, status, config) VALUES ('${rc.symbol}', ${rc.timeframe}, '${rc.startDate}', 'pending', '${configJson}')`);
       const rows = await query('SELECT MAX(id) AS id FROM runs');
       const runId = rows[0].id;
