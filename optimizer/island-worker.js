@@ -3,6 +3,9 @@
  * Receives candle data as SharedArrayBuffer (zero-copy).
  * Communicates with main thread via message passing for
  * evolution batches, migration, and result collection.
+ *
+ * When windowSize > 0, fitness is evaluated across overlapping windows
+ * to reward strategies that perform consistently across market phases.
  */
 
 import { parentPort, workerData } from 'worker_threads';
@@ -17,9 +20,13 @@ const {
   candleBuffer, candleLength, tradingStartBar,
   populationSize, mutationRate, perGeneMut,
   islandIdx,
+  windowSizeBars,    // window size in bars (0 = disabled, single full-period eval)
+  windowStepBars,    // step between windows in bars (overlap = windowSize - step)
+  consistencyWeight, // 0..1 — how aggressively to penalize variance across windows
 } = workerData;
 
 const MIN_TRADES = 10;
+const MIN_TRADES_PER_WINDOW = 2;
 
 // Reconstruct candle Float64Array views from SharedArrayBuffer (zero-copy)
 const candles = {
@@ -30,24 +37,97 @@ const candles = {
   volume: new Float64Array(candleBuffer, candleLength * 4 * 8, candleLength),
 };
 
+// ─── Precompute window boundaries ──────────────────────────
+// Each window: { startBar, endBar } — indicator warmup data before startBar
+// is still accessible since we pass the full candle array.
+const windows = [];
+if (windowSizeBars > 0 && windowStepBars > 0) {
+  for (let start = tradingStartBar; start + windowSizeBars <= candleLength; start += windowStepBars) {
+    windows.push({ startBar: start, endBar: start + windowSizeBars });
+  }
+  // If last window doesn't reach the end, add a final window anchored at the end
+  if (windows.length > 0 && windows[windows.length - 1].endBar < candleLength) {
+    const lastStart = candleLength - windowSizeBars;
+    if (lastStart >= tradingStartBar && lastStart > windows[windows.length - 1].startBar) {
+      windows.push({ startBar: lastStart, endBar: candleLength });
+    }
+  }
+}
+const useWindows = windows.length >= 2;
+
 // Local fitness cache
 const fitnessCache = new Map();
 let evalCount = 0;
+
+function median(arr) {
+  const sorted = arr.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
 
 function fitness(gene) {
   const key = geneKey(gene);
   if (fitnessCache.has(key)) return fitnessCache.get(key).fitness;
 
   evalCount++;
-  const metrics = runStrategy(candles, gene, { tradingStartBar });
+
+  // Always run full-period for reporting metrics
+  const fullMetrics = runStrategy(candles, gene, { tradingStartBar });
+
+  if (!fullMetrics || fullMetrics.error) {
+    fitnessCache.set(key, { fitness: -10000, metrics: fullMetrics || {} });
+    return -10000;
+  }
+  if (fullMetrics.trades < 3) {
+    const score = -5000;
+    fitnessCache.set(key, { fitness: score, metrics: fullMetrics });
+    return score;
+  }
+  if (fullMetrics.trades < MIN_TRADES) {
+    const score = -1000 + fullMetrics.trades * 10;
+    fitnessCache.set(key, { fitness: score, metrics: fullMetrics });
+    return score;
+  }
+
   let score;
 
-  if (!metrics || metrics.error) score = -10000;
-  else if (metrics.trades < 3) score = -5000;
-  else if (metrics.trades < MIN_TRADES) score = -1000 + metrics.trades * 10;
-  else score = metrics.netProfit;
+  if (!useWindows) {
+    // Classic single-period fitness
+    score = fullMetrics.netProfitPct * 100;
+  } else {
+    // ─── Window-based fitness ─────────────────────────────
+    const windowScores = [];
 
-  fitnessCache.set(key, { fitness: score, metrics });
+    for (const w of windows) {
+      const m = runStrategy(candles, gene, {
+        tradingStartBar: w.startBar,
+        tradingEndBar: w.endBar,
+      });
+
+      if (!m || m.error || m.trades < MIN_TRADES_PER_WINDOW) {
+        windowScores.push(-100); // penalize windows with too few trades
+      } else {
+        windowScores.push(m.netProfitPct * 100);
+      }
+    }
+
+    const med = median(windowScores);
+    const mean = windowScores.reduce((s, v) => s + v, 0) / windowScores.length;
+    const variance = windowScores.reduce((s, v) => s + (v - mean) ** 2, 0) / windowScores.length;
+    const std = Math.sqrt(variance);
+    const absMean = Math.abs(mean);
+
+    // Coefficient of variation (capped to avoid blow-up when mean ≈ 0)
+    const cv = absMean > 0.01 ? std / absMean : std * 10;
+
+    // consistency penalty: cv * weight. At weight=0 we just use median.
+    // At weight=1, a cv of 1.0 (std = mean) would halve the score.
+    const penalty = 1 - Math.min(consistencyWeight * cv, 0.95);
+
+    score = med * penalty;
+  }
+
+  fitnessCache.set(key, { fitness: score, metrics: fullMetrics });
   return score;
 }
 
@@ -168,4 +248,8 @@ parentPort.on('message', async (msg) => {
   }
 });
 
-parentPort.postMessage({ type: 'ready', islandIdx });
+parentPort.postMessage({
+  type: 'ready',
+  islandIdx,
+  windowCount: useWindows ? windows.length : 0,
+});

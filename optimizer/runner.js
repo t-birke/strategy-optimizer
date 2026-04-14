@@ -60,11 +60,18 @@ export async function runOptimization(config) {
     migrationTopology = 'ring',
     spaceTravelInterval = 2,
     spaceTravelCount = 1,
+    windowSizeDays = 0,
+    consistencyWeight = 0.5,
     onProgress,
     shouldCancel,
   } = config;
 
   const totalWorkers = numPlanets * numIslands;
+
+  // Status callback — sends UI updates during setup phases
+  const status = (phase, detail) => {
+    if (onProgress) onProgress({ phase, detail, setup: true });
+  };
 
   // Auto migration interval: 25% of generations (rare = better diversity)
   // Single island: one batch = all gens (no migration)
@@ -75,6 +82,7 @@ export async function runOptimization(config) {
   // 1. Load candles once on main thread
   //    Load extra bars BEFORE startDate so indicators warm up before trading begins
   //    (matches PineScript behavior where historical data pre-seeds indicators).
+  status('loading', `Loading ${symbol} ${timeframe}min candles...`);
   const startTs = new Date(startDate).getTime();
   const endTs = endDate ? new Date(endDate).getTime() : Infinity;
   const WARMUP_BARS = 200;
@@ -110,6 +118,20 @@ export async function runOptimization(config) {
     throw new Error(`Insufficient data: ${len} bars for ${symbol} ${timeframe}min from ${startDate}`);
   }
 
+  // Window-based fitness: convert days → bars, 50% overlap
+  const barsPerDay = (24 * 60) / timeframe;
+  const windowSizeBars = windowSizeDays > 0 ? Math.round(windowSizeDays * barsPerDay) : 0;
+  const windowStepBars = windowSizeBars > 0 ? Math.round(windowSizeBars / 2) : 0;
+  const tradingBars = len - tradingStartBar;
+  const windowCount = windowSizeBars > 0 && windowStepBars > 0
+    ? Math.floor((tradingBars - windowSizeBars) / windowStepBars) + 1
+    : 0;
+
+  if (windowSizeBars > 0) {
+    console.log(`[runner] Window fitness: ${windowSizeDays}d = ${windowSizeBars} bars, step=${windowStepBars}, ~${windowCount} windows, consistency=${consistencyWeight}`);
+    status('config', `Window fitness: ${windowCount} × ${windowSizeDays}d windows, consistency=${consistencyWeight}`);
+  }
+
   // 2. Create SharedArrayBuffer — zero-copy sharing with workers
   //    Layout: [open|high|low|close|volume] × len Float64s each
   const sab = new SharedArrayBuffer(len * 5 * 8);
@@ -119,6 +141,11 @@ export async function runOptimization(config) {
   new Float64Array(sab, len * 3 * 8, len).set(candles.close);
   new Float64Array(sab, len * 4 * 8, len).set(candles.volume);
 
+  const actualStartTs = candles.ts[tradingStartBar];
+  const actualEndTs = candles.ts[len - 1];
+  const periodYears = (actualEndTs - actualStartTs) / (365.25 * 24 * 60 * 60 * 1000);
+
+  status('loaded', `${len.toLocaleString()} bars loaded (${periodYears.toFixed(1)}y). Preparing ${totalWorkers} workers (${numPlanets}p × ${numIslands}i)...`);
   console.log(`[runner] Loaded ${len} bars, tradingStartBar=${tradingStartBar}, planets=${numPlanets}, islands/planet=${numIslands}, total workers=${totalWorkers}`);
 
   // 3. Spawn worker threads — one per island across all planets
@@ -142,6 +169,9 @@ export async function runOptimization(config) {
         mutationRate: Math.min(islandMutRate, 0.9),
         perGeneMut,
         islandIdx: idx,
+        windowSizeBars,
+        windowStepBars,
+        consistencyWeight,
       },
     });
 
@@ -165,6 +195,7 @@ export async function runOptimization(config) {
   }
 
   await Promise.all(readyPromises);
+  status('ready', `All ${totalWorkers} workers ready. Starting evolution (${generations} generations)...`);
 
   // 4. Topology helpers
 
@@ -343,6 +374,7 @@ export async function runOptimization(config) {
                 cacheSize: workerCaches.reduce((a, b) => a + b, 0),
                 elapsedMs: Date.now() - startTime,
                 genTimeMs: 0,
+                periodYears,
                 numIslands,
                 numPlanets,
                 totalMigrations,

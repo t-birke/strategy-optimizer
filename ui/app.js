@@ -20,6 +20,9 @@ function handleWsMessage(msg) {
     case 'run_started':
       onRunStarted(msg);
       break;
+    case 'run_status':
+      onRunStatus(msg);
+      break;
     case 'generation':
       onGeneration(msg);
       break;
@@ -197,6 +200,10 @@ function onRunStarted(msg) {
   loadQueue();
 }
 
+function onRunStatus(msg) {
+  document.getElementById('live-gen').textContent = msg.detail;
+}
+
 function onGeneration(msg) {
   const pct = Math.round(msg.gen / msg.totalGens * 100);
   document.getElementById('live-progress-fill').style.width = pct + '%';
@@ -204,7 +211,13 @@ function onGeneration(msg) {
     ? `${msg.minGen}-${msg.maxGen} / ${msg.totalGens}`
     : `${msg.gen} / ${msg.totalGens}`;
   document.getElementById('live-gen').textContent = genText;
-  document.getElementById('live-best').textContent = '$' + Math.round(msg.best).toLocaleString();
+  const m_ = msg.metrics;
+  const totalProfit = m_?.netProfit ?? 0;
+  const netProfitPct = m_?.netProfitPct ?? 0;
+  const years = msg.periodYears || 1;
+  const annualized = (Math.pow(1 + netProfitPct, 1 / years) - 1) * 100;
+  document.getElementById('live-best').innerHTML =
+    `${annualized.toFixed(2)}%<span style="font-size:12px;color:#8b949e;display:block">$${Math.round(totalProfit).toLocaleString()} total</span>`;
   document.getElementById('live-evals').textContent = msg.evalCount;
   document.getElementById('live-time').textContent = (msg.elapsedMs / 1000).toFixed(1) + 's';
   document.getElementById('live-config').textContent = msg.config;
@@ -982,6 +995,15 @@ document.getElementById('modal-cancel').addEventListener('click', () => {
   $modal.classList.remove('active');
 });
 
+document.getElementById('modal-window-size').addEventListener('change', (e) => {
+  document.getElementById('window-options').style.display =
+    parseInt(e.target.value) > 0 ? '' : 'none';
+});
+
+document.getElementById('modal-consistency').addEventListener('input', (e) => {
+  document.getElementById('consistency-val').textContent = e.target.value;
+});
+
 document.getElementById('modal-islands').addEventListener('input', (e) => {
   document.getElementById('island-options').style.display =
     parseInt(e.target.value) > 1 ? '' : 'none';
@@ -1004,6 +1026,8 @@ document.getElementById('modal-start').addEventListener('click', async () => {
   const migrationTopology = document.getElementById('modal-topology').value || 'ring';
   const spaceTravelInterval = parseInt(document.getElementById('modal-space-interval').value) || 2;
   const spaceTravelCount = parseInt(document.getElementById('modal-space-count').value) || 1;
+  const windowSizeDays = parseInt(document.getElementById('modal-window-size').value) || 0;
+  const consistencyWeight = parseFloat(document.getElementById('modal-consistency').value) || 0;
 
   if (symbols.length === 0 || intervals.length === 0) {
     alert('Select at least one symbol and one interval.');
@@ -1024,7 +1048,7 @@ document.getElementById('modal-start').addEventListener('click', async () => {
     const res = await fetch('/api/runs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbols, intervals, startDate, endDate, populationSize, generations, numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology, spaceTravelInterval, spaceTravelCount }),
+      body: JSON.stringify({ symbols, intervals, startDate, endDate, populationSize, generations, numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology, spaceTravelInterval, spaceTravelCount, windowSizeDays, consistencyWeight }),
     });
     const data = await res.json();
     console.log('Queued', data.totalRuns, 'runs:', data.runIds);

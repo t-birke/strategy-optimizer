@@ -174,6 +174,7 @@ router.post('/api/runs', async (req, res) => {
       populationSize = 80, generations = 80, mutationRate = 0.4,
       numIslands = 4, numPlanets = 1, migrationInterval = 0, migrationCount = 3, migrationTopology = 'ring',
       spaceTravelInterval = 2, spaceTravelCount = 1,
+      windowSizeDays = 0, consistencyWeight = 0.5,
     } = req.body;
 
     if (!symbols?.length || !intervals?.length) {
@@ -208,13 +209,14 @@ router.post('/api/runs', async (req, res) => {
           populationSize, generations, mutationRate,
           numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology,
           spaceTravelInterval, spaceTravelCount,
+          windowSizeDays, consistencyWeight,
         });
       }
     }
 
     const runIds = [];
     for (const rc of runConfigs) {
-      const configJson = JSON.stringify({ populationSize: rc.populationSize, generations: rc.generations, mutationRate: rc.mutationRate, numIslands: rc.numIslands, numPlanets: rc.numPlanets, migrationInterval: rc.migrationInterval, migrationCount: rc.migrationCount, migrationTopology: rc.migrationTopology, spaceTravelInterval: rc.spaceTravelInterval, spaceTravelCount: rc.spaceTravelCount, endDate: rc.endDate });
+      const configJson = JSON.stringify({ populationSize: rc.populationSize, generations: rc.generations, mutationRate: rc.mutationRate, numIslands: rc.numIslands, numPlanets: rc.numPlanets, migrationInterval: rc.migrationInterval, migrationCount: rc.migrationCount, migrationTopology: rc.migrationTopology, spaceTravelInterval: rc.spaceTravelInterval, spaceTravelCount: rc.spaceTravelCount, windowSizeDays: rc.windowSizeDays, consistencyWeight: rc.consistencyWeight, endDate: rc.endDate });
       await exec(`INSERT INTO runs (symbol, timeframe, start_date, status, config) VALUES ('${rc.symbol}', ${rc.timeframe}, '${rc.startDate}', 'pending', '${configJson}')`);
       const rows = await query('SELECT MAX(id) AS id FROM runs');
       const runId = rows[0].id;
@@ -487,6 +489,10 @@ async function processQueue() {
       const result = await runOptimization({
         ...config,
         onProgress: (progress) => {
+          if (progress.setup) {
+            broadcast({ type: 'run_status', runId, phase: progress.phase, detail: progress.detail });
+            return;
+          }
           broadcast({ type: 'generation', runId, ...progress });
           // Update DB periodically
           if (progress.gen % 10 === 0) {

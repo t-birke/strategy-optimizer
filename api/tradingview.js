@@ -120,11 +120,11 @@ export async function sendToTradingView(gene, symbol, timeframe, dateRange) {
       })()
     `);
 
-    const strategy = studies.find(s => /jm|simple.*3tp/i.test(s.name));
-    if (!strategy) throw new Error('JM Simple 3TP strategy not found on chart. Studies: ' + studies.map(s => s.name).join(', '));
+    const strategy = studies.find(s => /jm.*simple.*3tp|simple.*3tp.*strat/i.test(s.name));
+    if (!strategy) throw new Error('JM Simple 3TP strategy not found on chart. Add it from the Pine Editor first. Studies: ' + studies.map(s => s.name).join(', '));
 
     // 6. Build input overrides from gene
-    const inputs = { in_19: 1 }; // ALWAYS force leverage to 1x (in_19 after ID shift)
+    const inputs = { in_19: 1, in_21: 1 }; // ALWAYS force leverage=1x and LVG=1x when sending from optimizer
     for (const [geneName, inputId] of Object.entries(GENE_TO_INPUT)) {
       if (gene[geneName] !== undefined) inputs[inputId] = gene[geneName];
     }

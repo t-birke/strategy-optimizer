@@ -32,6 +32,14 @@ initWebSocket(server);
 // Initialize DB on startup
 await getConn();
 
+// Reset any runs left in 'running' state from a previous crash
+import { query, exec } from './db/connection.js';
+const staleRuns = await query("SELECT id FROM runs WHERE status = 'running'");
+if (staleRuns.length > 0) {
+  await exec("UPDATE runs SET status = 'failed', error = 'Server restarted during run' WHERE status = 'running'");
+  console.log(`Reset ${staleRuns.length} stale 'running' run(s) to 'failed'`);
+}
+
 server.listen(PORT, () => {
   console.log(`Strategy Optimizer running at http://localhost:${PORT}`);
 });

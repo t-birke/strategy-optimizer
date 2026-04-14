@@ -174,9 +174,11 @@ export function runStrategy(candles, params, opts = {}) {
   // ─── Main loop — bar by bar ────────────────────────────────
   const warmup = Math.max(stochLen + stochSmth * 2, rsiLen + 1, emaSlow, bbLen + 100, atrLen) + 5;
   const tradingStartBar = opts.tradingStartBar ?? 0;
+  const tradingEndBar = opts.tradingEndBar ?? len;
   const startBar = Math.max(warmup, tradingStartBar);
+  const endBar = Math.min(len, tradingEndBar);
 
-  for (let i = startBar; i < len; i++) {
+  for (let i = startBar; i < endBar; i++) {
     const c = candles.close[i];
     const h = candles.high[i];
     const l = candles.low[i];
@@ -368,9 +370,10 @@ export function runStrategy(candles, params, opts = {}) {
 
   // ─── Close any open position at last bar ──────────────────
   if (posDir !== 0) {
-    const lastClose = candles.close[len - 1];
+    const lastBar = endBar - 1;
+    const lastClose = candles.close[lastBar];
     const isLong = posDir > 0;
-    closeAllSubs(lastClose, isLong, 'End', len - 1);
+    closeAllSubs(lastClose, isLong, 'End', lastBar);
     pendingClose = null;
   }
 
