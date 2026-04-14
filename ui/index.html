@@ -65,14 +65,17 @@
     <div class="live-panel" id="live-panel">
       <div style="display:flex;align-items:center;justify-content:space-between">
         <div class="title" id="live-title">-</div>
-        <button id="btn-abort" class="danger" onclick="abortRun()" style="font-size:12px;padding:4px 12px">Abort</button>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button id="btn-super-mutator" onclick="triggerSuperMutator()" style="font-size:12px;padding:4px 12px;background:#b26cff;color:#fff;border:0;border-radius:4px;cursor:pointer" title="Inject diversity by replacing worst 25% with random individuals and boosting mutation for 5 generations">⚡ Super Mutator</button>
+          <button id="btn-abort" class="danger" onclick="abortRun()" style="font-size:12px;padding:4px 12px">Abort</button>
+        </div>
       </div>
       <div class="progress-bar">
         <div class="fill" id="live-progress-fill" style="width:0%"></div>
       </div>
       <div class="stats">
         <div class="stat"><div class="value" id="live-gen">-</div><div class="label">Generation</div></div>
-        <div class="stat"><div class="value positive" id="live-best">-</div><div class="label">Best Profit</div></div>
+        <div class="stat"><div class="value positive" id="live-best">-</div><div class="label">Annualized</div></div>
         <div class="stat"><div class="value" id="live-pf">-</div><div class="label">PF</div></div>
         <div class="stat"><div class="value" id="live-wr">-</div><div class="label">Win Rate</div></div>
         <div class="stat"><div class="value neutral" id="live-dd">-</div><div class="label">Max DD</div></div>
@@ -142,17 +145,39 @@
     <div class="card" style="margin-bottom:16px">
       <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
         <button id="btn-recalc" class="primary" onclick="recalcRun()">Recalculate from DB data</button>
+        <div id="sizing-toggle" style="display:flex;gap:0;border:1px solid #30363d;border-radius:6px;overflow:hidden;font-size:12px">
+          <label style="padding:5px 12px;cursor:pointer;background:#21262d;color:#e6edf3" data-sizing="compounding">
+            <input type="radio" name="sizing" value="compounding" checked style="display:none">Compounding
+          </label>
+          <label style="padding:5px 12px;cursor:pointer;color:#8b949e;border-left:1px solid #30363d" data-sizing="flat">
+            <input type="radio" name="sizing" value="flat" style="display:none">Flat
+          </label>
+        </div>
         <span id="recalc-status" style="font-size:13px;color:#8b949e"></span>
         <div id="recalc-metrics" style="display:flex;gap:24px;flex-wrap:wrap"></div>
       </div>
     </div>
 
-    <!-- Charts -->
+    <!-- Periodic Performance (year / month breakdown) -->
+    <div class="card" id="detail-periodic-card" style="display:none;margin-bottom:16px">
+      <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em">
+        Periodic Performance
+        <span id="detail-periodic-sizing" style="color:#6e7681;font-size:11px;font-weight:400;margin-left:8px"></span>
+      </h3>
+      <div id="detail-periodic-body" style="overflow-x:auto"></div>
+    </div>
+
+    <!-- Charts (collapsible, default collapsed) -->
     <div class="card" id="detail-charts-card" style="display:none;margin-bottom:16px">
-      <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em">Price & Equity</h3>
-      <div id="price-chart" style="width:100%;height:350px;border:1px solid #30363d;border-radius:6px;overflow:hidden"></div>
-      <div style="height:8px"></div>
-      <div id="equity-chart" style="width:100%;height:220px;border:1px solid #30363d;border-radius:6px;overflow:hidden"></div>
+      <h3 id="detail-charts-header" style="margin:0;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;cursor:pointer;user-select:none;display:flex;align-items:center;gap:8px" onclick="toggleChartsCollapsed()">
+        <span id="detail-charts-caret">▸</span>
+        <span>Price & Equity</span>
+      </h3>
+      <div id="detail-charts-body" style="display:none;margin-top:12px">
+        <div id="price-chart" style="width:100%;height:350px;border:1px solid #30363d;border-radius:6px;overflow:hidden"></div>
+        <div style="height:8px"></div>
+        <div id="equity-chart" style="width:100%;height:220px;border:1px solid #30363d;border-radius:6px;overflow:hidden"></div>
+      </div>
     </div>
 
     <!-- Trade table -->
@@ -246,6 +271,16 @@
         <input type="number" id="modal-gen" value="80" min="5" max="500" style="width:80px">
       </div>
       <div class="form-row">
+        <label>Min Trades</label>
+        <input type="number" id="modal-min-trades" value="30" min="5" max="200" step="5" style="width:80px">
+        <span style="font-size:12px;color:#8b949e">minimum trades for valid strategy</span>
+      </div>
+      <div class="form-row">
+        <label>Max DD% <span id="max-dd-val" style="color:#58a6ff">50</span></label>
+        <input type="range" id="modal-max-dd" min="5" max="80" step="5" value="50" style="width:160px">
+        <span style="font-size:12px;color:#8b949e">max drawdown % before heavy penalty</span>
+      </div>
+      <div class="form-row">
         <label>Islands</label>
         <input type="number" id="modal-islands" value="4" min="1" max="16" style="width:80px">
         <span style="font-size:12px;color:#8b949e">1 = classic, 4-8 recommended</span>
@@ -284,6 +319,18 @@
             <label>Space Travel Count</label>
             <input type="number" id="modal-space-count" value="1" min="1" max="5" style="width:80px">
             <span style="font-size:12px;color:#8b949e">individuals per space travel event</span>
+          </div>
+          <div class="form-row">
+            <label>Gene Knockouts</label>
+            <select id="modal-knockout-mode" style="width:120px">
+              <option value="none">None</option>
+              <option value="sweep">Sweep (1 gene per planet)</option>
+            </select>
+            <select id="modal-knockout-value" style="width:120px;margin-left:6px">
+              <option value="midpoint">Midpoint value</option>
+              <option value="random">Random value</option>
+            </select>
+            <span style="font-size:12px;color:#8b949e">planet 0 = control; planet N freezes gene N-1</span>
           </div>
         </div>
       </div>

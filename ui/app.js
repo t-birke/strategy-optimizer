@@ -20,6 +20,9 @@ function handleWsMessage(msg) {
     case 'run_started':
       onRunStarted(msg);
       break;
+    case 'run_status':
+      onRunStatus(msg);
+      break;
     case 'generation':
       onGeneration(msg);
       break;
@@ -197,6 +200,10 @@ function onRunStarted(msg) {
   loadQueue();
 }
 
+function onRunStatus(msg) {
+  document.getElementById('live-gen').textContent = msg.detail;
+}
+
 function onGeneration(msg) {
   const pct = Math.round(msg.gen / msg.totalGens * 100);
   document.getElementById('live-progress-fill').style.width = pct + '%';
@@ -204,7 +211,13 @@ function onGeneration(msg) {
     ? `${msg.minGen}-${msg.maxGen} / ${msg.totalGens}`
     : `${msg.gen} / ${msg.totalGens}`;
   document.getElementById('live-gen').textContent = genText;
-  document.getElementById('live-best').textContent = '$' + Math.round(msg.best).toLocaleString();
+  const m_ = msg.metrics;
+  const totalProfit = m_?.netProfit ?? 0;
+  const netProfitPct = m_?.netProfitPct ?? 0;
+  const years = msg.periodYears || 1;
+  const annualized = (Math.pow(1 + netProfitPct, 1 / years) - 1) * 100;
+  document.getElementById('live-best').innerHTML =
+    `${annualized.toFixed(2)}%<span style="font-size:12px;color:#8b949e;display:block">$${Math.round(totalProfit).toLocaleString()} total</span>`;
   document.getElementById('live-evals').textContent = msg.evalCount;
   document.getElementById('live-time').textContent = (msg.elapsedMs / 1000).toFixed(1) + 's';
   document.getElementById('live-config').textContent = msg.config;
@@ -284,6 +297,27 @@ window.abortRun = async () => {
     console.error('Abort failed:', err);
     btn.disabled = false;
     btn.textContent = 'Abort';
+  }
+};
+
+window.triggerSuperMutator = async () => {
+  if (!activeRunId) return;
+  const btn = document.getElementById('btn-super-mutator');
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = '⚡ Firing...';
+  try {
+    await fetch(`/api/runs/${activeRunId}/hypermutate`, { method: 'POST' });
+    // Re-enable after a short cooldown — the worker's per-island cooldown
+    // already prevents spam at the evolution layer.
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }, 1500);
+  } catch (err) {
+    console.error('Super Mutator failed:', err);
+    btn.disabled = false;
+    btn.textContent = originalText;
   }
 };
 
@@ -405,10 +439,14 @@ function renderPlanetGrid(msg, svg, numPlanets, numIslandsPerPlanet) {
   svg.setAttribute('height', H);
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
 
-  // Build per-planet data from islands
+  // Build per-planet data from islands. Mutation factors (if present on
+  // msg.planets[p]) are randomized per planet at optimizer start and
+  // surface here for UI display.
+  const planetMeta = msg.planets || [];
   const planetData = Array.from({ length: numPlanets }, (_, p) => {
     const planetIslands = msg.islands.filter(isl => (isl.planetIdx ?? Math.floor(isl.idx / numIslandsPerPlanet)) === p);
     let bestProfit = null, bestTrades = null, bestPf = null, maxGen = 0;
+    let maxHyperActive = 0, hyperSource = null;
     for (const isl of planetIslands) {
       if (isl.profit != null && (bestProfit == null || isl.profit > bestProfit)) {
         bestProfit = isl.profit;
@@ -416,8 +454,20 @@ function renderPlanetGrid(msg, svg, numPlanets, numIslandsPerPlanet) {
         bestPf = isl.pf;
       }
       if (isl.gen != null && isl.gen > maxGen) maxGen = isl.gen;
+      if ((isl.hyperActive ?? 0) > maxHyperActive) {
+        maxHyperActive = isl.hyperActive;
+        hyperSource = isl.hyperSource;
+      }
     }
-    return { p, islands: planetIslands, bestProfit, bestTrades, bestPf, maxGen };
+    const meta = planetMeta[p] || {};
+    return {
+      p, islands: planetIslands, bestProfit, bestTrades, bestPf, maxGen,
+      maxHyperActive, hyperSource,
+      mutationRate: meta.mutationRate ?? null,
+      perGeneMut: meta.perGeneMut ?? null,
+      mutationMul: meta.mutationMul ?? null,
+      frozenGenes: meta.frozenGenes ?? null,
+    };
   });
 
   // Find global best planet
@@ -458,6 +508,26 @@ function renderPlanetGrid(msg, svg, numPlanets, numIslandsPerPlanet) {
     // Planet label
     html += `<text x="${x+12}" y="${y+20}" fill="${color}" font-size="11" font-weight="700">Planet ${p}</text>`;
 
+    // Mutation factor badge — randomized per planet at optimizer start.
+    // Anchored top-right of the card, under the optional BEST badge row.
+    if (pd.mutationRate != null) {
+      const mutPct = Math.round(pd.mutationRate * 100);
+      const genePct = pd.perGeneMut != null ? Math.round(pd.perGeneMut * 100) : null;
+      const mulStr = pd.mutationMul != null ? `×${pd.mutationMul.toFixed(2)}` : '';
+      const mutText = genePct != null
+        ? `μ ${mutPct}% · g ${genePct}%  ${mulStr}`
+        : `μ ${mutPct}%  ${mulStr}`;
+      html += `<text x="${x+12}" y="${y+34}" fill="#8b949e" font-size="9" font-family="monospace">${mutText}</text>`;
+    }
+
+    // Knockout badge — frozen gene(s) for this planet's ablation run.
+    // Control planet shows no badge; knockout planets show e.g. "🚫 rsiLen=14".
+    if (pd.frozenGenes) {
+      const parts = Object.entries(pd.frozenGenes).map(([k, v]) => `${k}=${v}`);
+      const knockText = `🚫 ${parts.join(', ')}`;
+      html += `<text x="${x+12}" y="${y+46}" fill="#ff7b72" font-size="9" font-family="monospace">${knockText}</text>`;
+    }
+
     // Best profit — large
     const profitStr = pd.bestProfit != null ? '$' + Math.round(pd.bestProfit).toLocaleString() : '—';
     const profitColor = pd.bestProfit == null ? '#8b949e' : pd.bestProfit >= 0 ? '#3fb950' : '#f85149';
@@ -466,6 +536,21 @@ function renderPlanetGrid(msg, svg, numPlanets, numIslandsPerPlanet) {
     // Generation
     const genStr = `Gen ${pd.maxGen} / ${msg.totalGens}`;
     html += `<text x="${x + cellW/2}" y="${y+82}" text-anchor="middle" fill="#8b949e" font-size="11">${genStr}</text>`;
+
+    // Hypermutation countdown badge — pulses when an event is in flight.
+    // Shows source (manual via Super Mutator button vs auto via diversity collapse).
+    // Anchored top-right; shifts left by 48px if BEST badge also occupies that slot.
+    if (pd.maxHyperActive > 0) {
+      const label = pd.hyperSource === 'manual' ? 'SUPER' : 'AUTO';
+      const badgeW = 76;
+      const shiftLeft = isBest ? 48 : 0;
+      const badgeX = x + cellW - badgeW - 8 - shiftLeft;
+      const badgeY = y + 6;
+      html += `<rect x="${badgeX}" y="${badgeY}" width="${badgeW}" height="14" rx="3" fill="#b26cff22" stroke="#b26cff" stroke-width="1">
+        <animate attributeName="opacity" values="0.6;1;0.6" dur="1s" repeatCount="indefinite"/>
+      </rect>`;
+      html += `<text x="${badgeX + badgeW/2}" y="${badgeY + 10}" text-anchor="middle" fill="#d2a8ff" font-size="9" font-weight="700" font-family="monospace">⚡ ${label} ${pd.maxHyperActive}/5</text>`;
+    }
 
     // Trades + PF
     const statsStr = pd.bestTrades != null
@@ -982,6 +1067,10 @@ document.getElementById('modal-cancel').addEventListener('click', () => {
   $modal.classList.remove('active');
 });
 
+document.getElementById('modal-max-dd').addEventListener('input', (e) => {
+  document.getElementById('max-dd-val').textContent = e.target.value;
+});
+
 document.getElementById('modal-islands').addEventListener('input', (e) => {
   document.getElementById('island-options').style.display =
     parseInt(e.target.value) > 1 ? '' : 'none';
@@ -1004,6 +1093,10 @@ document.getElementById('modal-start').addEventListener('click', async () => {
   const migrationTopology = document.getElementById('modal-topology').value || 'ring';
   const spaceTravelInterval = parseInt(document.getElementById('modal-space-interval').value) || 2;
   const spaceTravelCount = parseInt(document.getElementById('modal-space-count').value) || 1;
+  const minTrades = parseInt(document.getElementById('modal-min-trades').value) || 30;
+  const maxDrawdownPct = parseInt(document.getElementById('modal-max-dd').value) || 50;
+  const knockoutMode = document.getElementById('modal-knockout-mode')?.value || 'none';
+  const knockoutValueMode = document.getElementById('modal-knockout-value')?.value || 'midpoint';
 
   if (symbols.length === 0 || intervals.length === 0) {
     alert('Select at least one symbol and one interval.');
@@ -1024,7 +1117,7 @@ document.getElementById('modal-start').addEventListener('click', async () => {
     const res = await fetch('/api/runs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbols, intervals, startDate, endDate, populationSize, generations, numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology, spaceTravelInterval, spaceTravelCount }),
+      body: JSON.stringify({ symbols, intervals, startDate, endDate, populationSize, generations, numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology, spaceTravelInterval, spaceTravelCount, minTrades, maxDrawdownPct, knockoutMode, knockoutValueMode }),
     });
     const data = await res.json();
     console.log('Queued', data.totalRuns, 'runs:', data.runIds);
@@ -1188,6 +1281,7 @@ window.openRunDetail = async (id) => {
   document.getElementById('recalc-metrics').innerHTML = '';
   document.getElementById('detail-trades-card').style.display = 'none';
   document.getElementById('detail-charts-card').style.display = 'none';
+  document.getElementById('detail-periodic-card').style.display = 'none';
   document.getElementById('btn-recalc').disabled = false;
 
   try {
@@ -1236,6 +1330,51 @@ window.closeRunDetail = () => {
   document.getElementById('nav-run-detail').style.display = 'none';
 };
 
+// ─── Sizing toggle (compounding vs flat) ───────────────────
+let detailSizing = 'compounding';
+
+function initSizingToggle() {
+  const toggle = document.getElementById('sizing-toggle');
+  if (!toggle || toggle.dataset.bound) return;
+  toggle.dataset.bound = '1';
+  toggle.querySelectorAll('label').forEach(lbl => {
+    lbl.addEventListener('click', (e) => {
+      e.preventDefault();
+      const choice = lbl.dataset.sizing;
+      if (choice === detailSizing) return;
+      detailSizing = choice;
+      // Visual active state
+      toggle.querySelectorAll('label').forEach(l => {
+        const active = l.dataset.sizing === detailSizing;
+        l.style.background = active ? '#21262d' : 'transparent';
+        l.style.color = active ? '#e6edf3' : '#8b949e';
+        l.querySelector('input').checked = active;
+      });
+      // Re-run with new sizing if we have a run open
+      if (detailRunId) window.recalcRun();
+    });
+  });
+}
+initSizingToggle();
+
+// ─── Collapsible charts card ───────────────────────────────
+window.toggleChartsCollapsed = () => {
+  const body = document.getElementById('detail-charts-body');
+  const caret = document.getElementById('detail-charts-caret');
+  const open = body.style.display !== 'none';
+  body.style.display = open ? 'none' : '';
+  caret.textContent = open ? '▸' : '▾';
+  // Trigger chart reflow on expand (charts render 0-width if hidden)
+  if (!open && priceChart && equityChart) {
+    const priceEl = document.getElementById('price-chart');
+    const equityEl = document.getElementById('equity-chart');
+    priceChart.applyOptions({ width: priceEl.clientWidth });
+    equityChart.applyOptions({ width: equityEl.clientWidth });
+    priceChart.timeScale().fitContent();
+    equityChart.timeScale().fitContent();
+  }
+};
+
 window.recalcRun = async () => {
   if (!detailRunId) return;
   const btn = document.getElementById('btn-recalc');
@@ -1245,9 +1384,10 @@ window.recalcRun = async () => {
   status.textContent = 'Recalculating…';
   metricsDiv.innerHTML = '';
   document.getElementById('detail-trades-card').style.display = 'none';
+  document.getElementById('detail-periodic-card').style.display = 'none';
 
   try {
-    const res = await fetch(`/api/runs/${detailRunId}/trades`);
+    const res = await fetch(`/api/runs/${detailRunId}/trades?sizing=${detailSizing}`);
     const data = await res.json();
     if (!res.ok) throw new Error(data.error);
 
@@ -1266,7 +1406,8 @@ window.recalcRun = async () => {
     </div>`).join('');
 
     detailTradeList = data.tradeList ?? [];
-    status.textContent = `Done — ${detailTradeList.length} trade executions`;
+    status.textContent = `Done — ${detailTradeList.length} trade executions (${data.sizing})`;
+    renderPeriodicPerformance(data.equity ?? [], data.ohlc ?? [], data.sizing);
     renderCharts(data.ohlc ?? [], data.equity ?? [], detailTradeList);
     renderTradeTable(detailTradeList);
   } catch (err) {
@@ -1282,11 +1423,16 @@ let equityChart = null;
 
 function renderCharts(ohlc, equity, trades) {
   const chartsCard = document.getElementById('detail-charts-card');
+  const body = document.getElementById('detail-charts-body');
+  const caret = document.getElementById('detail-charts-caret');
   if (!ohlc.length && !equity.length) {
     chartsCard.style.display = 'none';
     return;
   }
   chartsCard.style.display = '';
+  // Temporarily show body to measure widths for chart init, then collapse.
+  // (Lightweight Charts can't initialize inside a display:none container.)
+  body.style.display = '';
 
   // Clean up previous charts
   const priceEl = document.getElementById('price-chart');
@@ -1402,6 +1548,193 @@ function renderCharts(ohlc, equity, trades) {
 
   priceChart.timeScale().fitContent();
   equityChart.timeScale().fitContent();
+
+  // Now collapse — charts are initialized with proper widths and will reflow
+  // via toggleChartsCollapsed() when the user expands.
+  body.style.display = 'none';
+  caret.textContent = '▸';
+}
+
+// ─── Periodic performance (year / month breakdown) ─────────
+//
+// Computes monthly + yearly PnL (absolute $ and %) from the per-bar
+// equity history. % basis differs by sizing mode:
+//   - flat:        % = Δ$ / initialCapital   (constant base)
+//   - compounding: % = Δ$ / equityAtPeriodStart
+//
+// Equity curve already reflects the chosen sizing (engine/strategy.js
+// uses flatSizing to pick sizing base). We derive period boundaries by
+// bucketing per-bar equity points; start-of-period equity = prior
+// period's end equity (or initialCapital for the first).
+const INITIAL_CAPITAL = 100000;
+
+function computePeriodicPerformance(equityHistory) {
+  if (!equityHistory.length) return { months: [], years: [] };
+
+  // Bucket per-bar equity into { year, month } keys in chronological order.
+  const monthMap = new Map(); // 'YYYY-MM' -> { year, month, endEq }
+  const monthOrder = [];
+  for (const pt of equityHistory) {
+    const d = new Date(pt.time * 1000); // equity.time is seconds
+    const key = `${d.getUTCFullYear()}-${d.getUTCMonth()}`;
+    let rec = monthMap.get(key);
+    if (!rec) {
+      rec = { year: d.getUTCFullYear(), month: d.getUTCMonth(), endEq: pt.value };
+      monthMap.set(key, rec);
+      monthOrder.push(key);
+    }
+    rec.endEq = pt.value; // overwritten until last point of the month wins
+  }
+
+  // Compute per-month $ and %, chaining start = prev.end (initial for first)
+  let prev = INITIAL_CAPITAL;
+  const months = monthOrder.map(key => {
+    const r = monthMap.get(key);
+    const dollar = r.endEq - prev;
+    const pct = prev !== 0 ? dollar / prev : 0;
+    const out = { year: r.year, month: r.month, dollar, pct, startEq: prev, endEq: r.endEq };
+    prev = r.endEq;
+    return out;
+  });
+
+  // Roll months into years (same chaining approach)
+  const yearMap = new Map();
+  const yearOrder = [];
+  for (const m of months) {
+    let rec = yearMap.get(m.year);
+    if (!rec) { rec = { year: m.year, endEq: m.endEq }; yearMap.set(m.year, rec); yearOrder.push(m.year); }
+    rec.endEq = m.endEq;
+  }
+  let prevY = INITIAL_CAPITAL;
+  const years = yearOrder.map(y => {
+    const r = yearMap.get(y);
+    const dollar = r.endEq - prevY;
+    const pct = prevY !== 0 ? dollar / prevY : 0;
+    const out = { year: y, dollar, pct, startEq: prevY, endEq: r.endEq };
+    prevY = r.endEq;
+    return out;
+  });
+
+  return { months, years };
+}
+
+// Buy-and-hold instrument return per year. For partial years (edges of
+// the trading window), uses first bar's open and last bar's close that
+// actually fall inside that year.
+function computeInstrumentByYear(ohlc) {
+  const byYear = new Map();
+  if (!ohlc || !ohlc.length) return byYear;
+  for (const bar of ohlc) {
+    const y = new Date(bar.time * 1000).getUTCFullYear();
+    let rec = byYear.get(y);
+    if (!rec) {
+      rec = { firstOpen: bar.open, lastClose: bar.close };
+      byYear.set(y, rec);
+    } else {
+      rec.lastClose = bar.close;
+    }
+  }
+  return byYear;
+}
+
+function renderPeriodicPerformance(equity, ohlc, sizing) {
+  const card = document.getElementById('detail-periodic-card');
+  const body = document.getElementById('detail-periodic-body');
+  const sizingLabel = document.getElementById('detail-periodic-sizing');
+  if (!equity || !equity.length) {
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = '';
+  sizingLabel.textContent = sizing === 'flat' ? 'flat sizing' : 'compounding';
+
+  const { months, years } = computePeriodicPerformance(equity);
+  const instrumentByYear = computeInstrumentByYear(ohlc);
+
+  // Organize months by year → column (0–11)
+  const byYear = new Map();
+  for (const m of months) {
+    if (!byYear.has(m.year)) byYear.set(m.year, new Array(12).fill(null));
+    byYear.get(m.year)[m.month] = m;
+  }
+  const yearSummary = new Map(years.map(y => [y.year, y]));
+  const sortedYears = [...byYear.keys()].sort((a, b) => a - b);
+
+  const MONTH_LABELS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+  // Color scale: interpolate green/red by magnitude of pct (clamped at ±20%)
+  const cellStyle = (pct) => {
+    if (pct == null) return 'background:transparent;color:#6e7681';
+    const clamp = Math.max(-0.20, Math.min(0.20, pct));
+    const intensity = Math.min(1, Math.abs(clamp) / 0.20);
+    const alpha = 0.12 + intensity * 0.55;
+    const bg = pct >= 0
+      ? `rgba(63,185,80,${alpha.toFixed(2)})`
+      : `rgba(248,81,73,${alpha.toFixed(2)})`;
+    const text = pct >= 0 ? '#b6f0c2' : '#ffc4c0';
+    return `background:${bg};color:${text}`;
+  };
+
+  const fmtPct = (n) => (n >= 0 ? '+' : '') + (n * 100).toFixed(1) + '%';
+  const fmtDollar = (n) => {
+    const sign = n >= 0 ? '+' : '−';
+    const v = Math.abs(n);
+    if (v >= 1e6) return `${sign}$${(v / 1e6).toFixed(2)}M`;
+    if (v >= 1e3) return `${sign}$${(v / 1e3).toFixed(1)}k`;
+    return `${sign}$${v.toFixed(0)}`;
+  };
+
+  const headerCells = ['<th style="text-align:left;padding:6px 10px;color:#8b949e;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em">Year</th>',
+    ...MONTH_LABELS.map(m => `<th style="text-align:center;padding:6px 6px;color:#8b949e;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em">${m}</th>`),
+    '<th style="text-align:center;padding:6px 10px;color:#58a6ff;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em;border-left:1px solid #30363d">Strategy</th>',
+    '<th style="text-align:center;padding:6px 10px;color:#d2a8ff;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em">Buy &amp; Hold</th>'
+  ].join('');
+
+  // Compact price formatter — shared by instrument cells
+  const fmtPrice = (p) => {
+    if (p == null) return '—';
+    if (p >= 1000) return '$' + (p / 1000).toFixed(p >= 10000 ? 1 : 2) + 'k';
+    if (p >= 1) return '$' + p.toFixed(2);
+    return '$' + p.toFixed(4);
+  };
+
+  const rows = sortedYears.map(y => {
+    const monthCells = byYear.get(y).map(m => {
+      if (!m) return '<td style="padding:6px 4px"></td>';
+      return `<td style="${cellStyle(m.pct)};padding:6px 4px;text-align:center;font-family:monospace;font-size:11px;border-radius:4px">
+        <div style="font-weight:700">${fmtPct(m.pct)}</div>
+        <div style="font-size:10px;opacity:.8">${fmtDollar(m.dollar)}</div>
+      </td>`;
+    }).join('');
+
+    const ys = yearSummary.get(y);
+    const yearCell = ys ? `<td style="${cellStyle(ys.pct)};padding:6px 10px;text-align:center;font-family:monospace;font-size:12px;border-left:1px solid #30363d;border-radius:4px">
+      <div style="font-weight:800">${fmtPct(ys.pct)}</div>
+      <div style="font-size:10px;opacity:.85">${fmtDollar(ys.dollar)}</div>
+    </td>` : '<td style="border-left:1px solid #30363d"></td>';
+
+    // Instrument buy-and-hold for this calendar year, scoped to the bars
+    // that actually fall inside the trading window (so partial years are
+    // reported partially — first-bar open to last-bar close).
+    const ins = instrumentByYear.get(y);
+    const insPct = ins ? (ins.lastClose - ins.firstOpen) / ins.firstOpen : null;
+    const insCell = ins ? `<td style="${cellStyle(insPct)};padding:6px 10px;text-align:center;font-family:monospace;font-size:12px;border-radius:4px">
+      <div style="font-weight:800">${fmtPct(insPct)}</div>
+      <div style="font-size:10px;opacity:.85">${fmtPrice(ins.firstOpen)} → ${fmtPrice(ins.lastClose)}</div>
+    </td>` : '<td></td>';
+
+    return `<tr>
+      <td style="padding:6px 10px;font-family:monospace;font-weight:700;color:#e6edf3">${y}</td>
+      ${monthCells}
+      ${yearCell}
+      ${insCell}
+    </tr>`;
+  }).join('');
+
+  body.innerHTML = `<table style="width:100%;border-collapse:separate;border-spacing:3px;font-size:12px">
+    <thead><tr>${headerCells}</tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
 }
 
 function renderTradeTable(trades) {

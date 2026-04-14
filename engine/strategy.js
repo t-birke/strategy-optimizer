@@ -39,6 +39,7 @@ export function runStrategy(candles, params, opts = {}) {
 
   const initialCapital = opts.initialCapital ?? 100000;
   const leverage = opts.leverage ?? 1;
+  const flatSizing = opts.flatSizing ?? false;
   const collectTrades = opts.collectTrades ?? false;
   const collectEquity = opts.collectEquity ?? false;
   // Slippage: matches TradingView standard (slippage=2 ticks, mintick=$0.01).
@@ -124,6 +125,7 @@ export function runStrategy(candles, params, opts = {}) {
       : subUnits * (entryPrice - exitPrice) - entryComm - exitComm;
 
     equity += pnl;
+    if (equity < 0) equity = 0; // account blown — floor at zero
     totalTrades++;
 
     if (pnl > 0) { wins++; grossProfit += pnl; }
@@ -174,9 +176,11 @@ export function runStrategy(candles, params, opts = {}) {
   // ─── Main loop — bar by bar ────────────────────────────────
   const warmup = Math.max(stochLen + stochSmth * 2, rsiLen + 1, emaSlow, bbLen + 100, atrLen) + 5;
   const tradingStartBar = opts.tradingStartBar ?? 0;
+  const tradingEndBar = opts.tradingEndBar ?? len;
   const startBar = Math.max(warmup, tradingStartBar);
+  const endBar = Math.min(len, tradingEndBar);
 
-  for (let i = startBar; i < len; i++) {
+  for (let i = startBar; i < endBar; i++) {
     const c = candles.close[i];
     const h = candles.high[i];
     const l = candles.low[i];
@@ -198,15 +202,17 @@ export function runStrategy(candles, params, opts = {}) {
     }
 
     // ─── Execute pending entry at this bar's open ────────
+    if (pendingEntry && equity <= 0) pendingEntry = null; // bankrupt — no new trades
     if (pendingEntry && posDir === 0) {
       const pe = pendingEntry;
       pendingEntry = null;
       const fillPrice = pe.isLong ? o + slippage : o - slippage;
       const slDist = pe.atr * atrSL;
       if (slDist > 0 && fillPrice > 0) {
-        const riskAmt = equity * riskPct / 100;
+        const sizingBase = flatSizing ? initialCapital : equity;
+        const riskAmt = sizingBase * riskPct / 100;
         let units = riskAmt / slDist;
-        const maxUnits = equity * leverage / fillPrice;
+        const maxUnits = sizingBase * leverage / fillPrice;
         units = Math.min(units, maxUnits);
         if (units > 0) {
           const u1 = units * tp1Pct / 100;
@@ -368,9 +374,10 @@ export function runStrategy(candles, params, opts = {}) {
 
   // ─── Close any open position at last bar ──────────────────
   if (posDir !== 0) {
-    const lastClose = candles.close[len - 1];
+    const lastBar = endBar - 1;
+    const lastClose = candles.close[lastBar];
     const isLong = posDir > 0;
-    closeAllSubs(lastClose, isLong, 'End', len - 1);
+    closeAllSubs(lastClose, isLong, 'End', lastBar);
     pendingClose = null;
   }
 

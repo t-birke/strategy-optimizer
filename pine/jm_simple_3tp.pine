@@ -47,6 +47,10 @@ i_leverage  = input.int(1,       "Leverage", minval=1, maxval=20, step=1, group=
 i_emergSL   = input.int(15,      "Emergency SL %", minval=5, maxval=25, step=1, group=GRP_RISK,
      tooltip="Hard intra-bar stop as % from entry. Circuit-breaker for flash crashes.")
 
+GRP_LVG     = "LVG"
+i_lvg       = input.int(1,       "LVG Multiplier", minval=1, maxval=50, step=1, group=GRP_LVG,
+     tooltip="Post-optimization leverage multiplier. Scales position size by this factor. Keep at 1 during optimization.")
+
 // ============================================================================
 // INDICATORS
 // ============================================================================
@@ -127,10 +131,10 @@ var float peakEquity   = strategy.initial_capital
 var float maxDDPct     = 0.0
 var bool  slTriggered  = false
 
-// Position sizing: risk i_riskPct% of equity per trade, with leverage cap
+// Position sizing: risk i_riskPct% of equity per trade, scaled by LVG multiplier
 float riskAmt  = strategy.equity * i_riskPct / 100
 float slDist   = atr * i_atrSL
-float units    = slDist > 0 ? riskAmt / slDist : 0
+float units    = slDist > 0 ? riskAmt / slDist * i_lvg : 0
 float maxUnits = close > 0 ? strategy.equity * i_leverage / close : 0
 units := math.min(units, maxUnits)
 
@@ -331,7 +335,7 @@ if barstate.islastconfirmedhistory or barstate.islast
          text_color=cW, text_size=sz, text_halign=text.align_right)
 
     table.cell(tbl, 0, 8, "Risk / Lev / Bars", text_color=cD, text_size=sz, text_halign=text.align_left)
-    table.cell(tbl, 1, 8, str.tostring(i_riskPct, "#.#") + "% | " + str.tostring(i_leverage) + "x | " + str.tostring(i_maxBars) + "b | ESL" + str.tostring(i_emergSL) + "%",
+    table.cell(tbl, 1, 8, str.tostring(i_riskPct, "#.#") + "% | " + str.tostring(i_leverage) + "x | LVG" + str.tostring(i_lvg) + " | " + str.tostring(i_maxBars) + "b | ESL" + str.tostring(i_emergSL) + "%",
          text_color=cW, text_size=sz, text_halign=text.align_right)
 
     float tp1Prob = totalEntries > 0 ? tp1Count * 100.0 / totalEntries : 0.0

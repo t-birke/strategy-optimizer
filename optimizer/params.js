@@ -72,6 +72,34 @@ export function crossover(a, b, child) {
   enforceConstraints(child);
 }
 
+/**
+ * Gene knockout support — force a subset of genes to fixed values across
+ * an entire population. Used by planet-level ablation experiments: planet p
+ * freezes gene X so the GA explores the rest of the space around X's fixed
+ * value. Fitness delta vs. the unfrozen control planet reveals importance.
+ *
+ * `frozenGenes` is a plain object { geneId: value }. Missing = not frozen.
+ * Caller is responsible for enforceConstraints AFTER (frozen values win
+ * over mutation / crossover / random output; constraint repair then only
+ * adjusts non-frozen genes).
+ */
+export function applyFrozen(gene, frozenGenes) {
+  if (!frozenGenes) return gene;
+  for (const id in frozenGenes) gene[id] = frozenGenes[id];
+  return gene;
+}
+
+/**
+ * Name-friendly label for a frozen-gene set, used in UI badges and logs.
+ * Returns e.g. "rsiLen=14" or "rsiLen=14, emaFast=20" or "" for control.
+ */
+export function frozenLabel(frozenGenes) {
+  if (!frozenGenes) return '';
+  const keys = Object.keys(frozenGenes);
+  if (keys.length === 0) return '';
+  return keys.map(k => `${k}=${frozenGenes[k]}`).join(', ');
+}
+
 export function geneKey(gene) {
   return PARAMS.map(p => gene[p.id]).join(',');
 }

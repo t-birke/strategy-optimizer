@@ -18,6 +18,7 @@ const router = Router();
 // ─── Active state ────────────────────────────────────────────
 let activeRun = null;        // currently running optimization
 let cancelRequested = false;
+let hyperRequested = false;  // manual "Super Mutator" trigger — consumed once by runner
 const runQueue = [];          // pending optimization configs
 
 // ─── Data management ─────────────────────────────────────────
@@ -174,6 +175,8 @@ router.post('/api/runs', async (req, res) => {
       populationSize = 80, generations = 80, mutationRate = 0.4,
       numIslands = 4, numPlanets = 1, migrationInterval = 0, migrationCount = 3, migrationTopology = 'ring',
       spaceTravelInterval = 2, spaceTravelCount = 1,
+      minTrades = 30, maxDrawdownPct = 50,
+      knockoutMode = 'none', knockoutValueMode = 'midpoint',
     } = req.body;
 
     if (!symbols?.length || !intervals?.length) {
@@ -208,13 +211,15 @@ router.post('/api/runs', async (req, res) => {
           populationSize, generations, mutationRate,
           numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology,
           spaceTravelInterval, spaceTravelCount,
+          minTrades, maxDrawdownPct: maxDrawdownPct / 100,
+          knockoutMode, knockoutValueMode,
         });
       }
     }
 
     const runIds = [];
     for (const rc of runConfigs) {
-      const configJson = JSON.stringify({ populationSize: rc.populationSize, generations: rc.generations, mutationRate: rc.mutationRate, numIslands: rc.numIslands, numPlanets: rc.numPlanets, migrationInterval: rc.migrationInterval, migrationCount: rc.migrationCount, migrationTopology: rc.migrationTopology, spaceTravelInterval: rc.spaceTravelInterval, spaceTravelCount: rc.spaceTravelCount, endDate: rc.endDate });
+      const configJson = JSON.stringify({ populationSize: rc.populationSize, generations: rc.generations, mutationRate: rc.mutationRate, numIslands: rc.numIslands, numPlanets: rc.numPlanets, migrationInterval: rc.migrationInterval, migrationCount: rc.migrationCount, migrationTopology: rc.migrationTopology, spaceTravelInterval: rc.spaceTravelInterval, spaceTravelCount: rc.spaceTravelCount, minTrades: rc.minTrades, maxDrawdownPct: rc.maxDrawdownPct, endDate: rc.endDate, knockoutMode: rc.knockoutMode, knockoutValueMode: rc.knockoutValueMode });
       await exec(`INSERT INTO runs (symbol, timeframe, start_date, status, config) VALUES ('${rc.symbol}', ${rc.timeframe}, '${rc.startDate}', 'pending', '${configJson}')`);
       const rows = await query('SELECT MAX(id) AS id FROM runs');
       const runId = rows[0].id;
@@ -274,8 +279,9 @@ router.get('/api/runs/:id/trades', async (req, res) => {
       if (candles.ts[i] >= startTs) { tradingStartBar = i; break; }
     }
 
+    const flatSizing = req.query.sizing === 'flat';
     const metrics = runStrategy(candles, run.best_gene, {
-      tradingStartBar, collectTrades: true, collectEquity: true,
+      tradingStartBar, collectTrades: true, collectEquity: true, flatSizing,
     });
 
     // Build candle OHLC array for price chart (only trading period, downsampled if huge)
@@ -298,6 +304,7 @@ router.get('/api/runs/:id/trades', async (req, res) => {
 
     res.json({
       metrics,
+      sizing: flatSizing ? 'flat' : 'compounding',
       tradeList: metrics.tradeList ?? [],
       ohlc,
       equity,
@@ -329,6 +336,15 @@ router.get('/api/candles/:symbol', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+router.post('/api/runs/:id/hypermutate', async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (activeRun?.runId !== id) {
+    return res.status(404).json({ error: 'Run not active' });
+  }
+  hyperRequested = true;
+  res.json({ status: 'triggered' });
 });
 
 router.post('/api/runs/:id/cancel', async (req, res) => {
@@ -477,6 +493,7 @@ async function processQueue() {
     const config = runQueue.shift();
     activeRun = config;
     cancelRequested = false;
+    hyperRequested = false;
 
     const { runId } = config;
 
@@ -487,6 +504,10 @@ async function processQueue() {
       const result = await runOptimization({
         ...config,
         onProgress: (progress) => {
+          if (progress.setup) {
+            broadcast({ type: 'run_status', runId, phase: progress.phase, detail: progress.detail });
+            return;
+          }
           broadcast({ type: 'generation', runId, ...progress });
           // Update DB periodically
           if (progress.gen % 10 === 0) {
@@ -494,6 +515,11 @@ async function processQueue() {
           }
         },
         shouldCancel: () => cancelRequested,
+        shouldHypermutate: () => {
+          // Consume-once: flag flips false after the runner reads it true
+          if (hyperRequested) { hyperRequested = false; return true; }
+          return false;
+        },
       });
 
       // Store results (including partial results from aborted runs)
