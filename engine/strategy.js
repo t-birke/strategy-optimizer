@@ -39,6 +39,7 @@ export function runStrategy(candles, params, opts = {}) {
 
   const initialCapital = opts.initialCapital ?? 100000;
   const leverage = opts.leverage ?? 1;
+  const flatSizing = opts.flatSizing ?? false;
   const collectTrades = opts.collectTrades ?? false;
   const collectEquity = opts.collectEquity ?? false;
   // Slippage: matches TradingView standard (slippage=2 ticks, mintick=$0.01).
@@ -124,6 +125,7 @@ export function runStrategy(candles, params, opts = {}) {
       : subUnits * (entryPrice - exitPrice) - entryComm - exitComm;
 
     equity += pnl;
+    if (equity < 0) equity = 0; // account blown — floor at zero
     totalTrades++;
 
     if (pnl > 0) { wins++; grossProfit += pnl; }
@@ -200,15 +202,17 @@ export function runStrategy(candles, params, opts = {}) {
     }
 
     // ─── Execute pending entry at this bar's open ────────
+    if (pendingEntry && equity <= 0) pendingEntry = null; // bankrupt — no new trades
     if (pendingEntry && posDir === 0) {
       const pe = pendingEntry;
       pendingEntry = null;
       const fillPrice = pe.isLong ? o + slippage : o - slippage;
       const slDist = pe.atr * atrSL;
       if (slDist > 0 && fillPrice > 0) {
-        const riskAmt = equity * riskPct / 100;
+        const sizingBase = flatSizing ? initialCapital : equity;
+        const riskAmt = sizingBase * riskPct / 100;
         let units = riskAmt / slDist;
-        const maxUnits = equity * leverage / fillPrice;
+        const maxUnits = sizingBase * leverage / fillPrice;
         units = Math.min(units, maxUnits);
         if (units > 0) {
           const u1 = units * tp1Pct / 100;

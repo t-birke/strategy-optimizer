@@ -19,12 +19,24 @@
  *    island configurations for trading strategy optimization.
  */
 
+import os from 'os';
 import { Worker } from 'worker_threads';
 import { loadCandles } from '../db/candles.js';
-import { PARAMS, geneKey, geneShort } from './params.js';
+import { PARAMS, geneKey, geneShort, randomParam, frozenLabel } from './params.js';
 
 const MIN_TRADES = 10;
 const WORKER_URL = new URL('./island-worker.js', import.meta.url);
+
+// Reserve 2 logical threads for the OS, the main thread, and other apps
+// (e.g. browser) so heavy optimizer runs don't freeze the machine.
+const CORE_RESERVE = 2;
+
+function getWorkerCap() {
+  const logical = typeof os.availableParallelism === 'function'
+    ? os.availableParallelism()
+    : os.cpus().length;
+  return Math.max(1, logical - CORE_RESERVE);
+}
 
 /**
  * Create and run a GA optimization using worker threads.
@@ -60,13 +72,29 @@ export async function runOptimization(config) {
     migrationTopology = 'ring',
     spaceTravelInterval = 2,
     spaceTravelCount = 1,
-    windowSizeDays = 0,
-    consistencyWeight = 0.5,
+    minTrades = 30,
+    maxDrawdownPct = 0.5,
+    autoHyperEnabled = true,
+    // Gene knockout / ablation experiments:
+    //   'none'    — every planet optimizes all genes (control run)
+    //   'sweep'   — planet 0 is control; planet p ≥ 1 freezes a single gene
+    //               drawn from PARAMS in order, so you can compare best
+    //               fitness per planet and rank gene importance
+    knockoutMode = 'none',
+    // 'midpoint' — frozen value = midpoint of gene's min/max range
+    // 'random'   — frozen value = random valid sample (drawn once at start)
+    knockoutValueMode = 'midpoint',
     onProgress,
     shouldCancel,
+    shouldHypermutate,  // consume-callback: returns true once to trigger
   } = config;
 
+  // Logical island count — preserved for GA quality (migration topology,
+  // population diversity). Physical worker threads are capped separately
+  // to avoid CPU oversubscription.
   const totalWorkers = numPlanets * numIslands;
+  const workerCap = getWorkerCap();
+  const workerCount = Math.min(totalWorkers, workerCap);
 
   // Status callback — sends UI updates during setup phases
   const status = (phase, detail) => {
@@ -118,19 +146,8 @@ export async function runOptimization(config) {
     throw new Error(`Insufficient data: ${len} bars for ${symbol} ${timeframe}min from ${startDate}`);
   }
 
-  // Window-based fitness: convert days → bars, 50% overlap
-  const barsPerDay = (24 * 60) / timeframe;
-  const windowSizeBars = windowSizeDays > 0 ? Math.round(windowSizeDays * barsPerDay) : 0;
-  const windowStepBars = windowSizeBars > 0 ? Math.round(windowSizeBars / 2) : 0;
-  const tradingBars = len - tradingStartBar;
-  const windowCount = windowSizeBars > 0 && windowStepBars > 0
-    ? Math.floor((tradingBars - windowSizeBars) / windowStepBars) + 1
-    : 0;
-
-  if (windowSizeBars > 0) {
-    console.log(`[runner] Window fitness: ${windowSizeDays}d = ${windowSizeBars} bars, step=${windowStepBars}, ~${windowCount} windows, consistency=${consistencyWeight}`);
-    status('config', `Window fitness: ${windowCount} × ${windowSizeDays}d windows, consistency=${consistencyWeight}`);
-  }
+  console.log(`[runner] Flat sizing fitness: minTrades=${minTrades}, maxDD=${maxDrawdownPct * 100}%`);
+  status('config', `Flat sizing fitness: PF×√trades×(1-ddPenalty), min ${minTrades} trades, max DD ${maxDrawdownPct * 100}%`);
 
   // 2. Create SharedArrayBuffer — zero-copy sharing with workers
   //    Layout: [open|high|low|close|volume] × len Float64s each
@@ -145,41 +162,132 @@ export async function runOptimization(config) {
   const actualEndTs = candles.ts[len - 1];
   const periodYears = (actualEndTs - actualStartTs) / (365.25 * 24 * 60 * 60 * 1000);
 
-  status('loaded', `${len.toLocaleString()} bars loaded (${periodYears.toFixed(1)}y). Preparing ${totalWorkers} workers (${numPlanets}p × ${numIslands}i)...`);
-  console.log(`[runner] Loaded ${len} bars, tradingStartBar=${tradingStartBar}, planets=${numPlanets}, islands/planet=${numIslands}, total workers=${totalWorkers}`);
+  status('loaded', `${len.toLocaleString()} bars loaded (${periodYears.toFixed(1)}y). Preparing ${workerCount} workers for ${totalWorkers} islands (${numPlanets}p × ${numIslands}i)...`);
+  console.log(`[runner] Loaded ${len} bars, tradingStartBar=${tradingStartBar}, planets=${numPlanets}, islands/planet=${numIslands}, islands=${totalWorkers}, workers=${workerCount} (cap=${workerCap}, reserve=${CORE_RESERVE})`);
 
-  // 3. Spawn worker threads — one per island across all planets
-  //    Mutation rate varies across all workers globally for maximum diversity
+  // 3. Per-planet random mutation factors — each planet picks its own
+  //    mutation rate / per-gene probability within reasonable bounds for
+  //    coarse-grained exploration diversity. All islands on the same planet
+  //    share the planet's factors. With numPlanets = 1 we fall back to the
+  //    deterministic per-island gradient to preserve island-level diversity.
+  //
+  // Bounds:
+  //   mutationRate multiplier ∈ [0.5, 1.5]  — around user-supplied base
+  //   perGeneMut              ∈ [0.10, 0.32] — similar range to old gradient
+  const planetMutations = [];
+  for (let p = 0; p < numPlanets; p++) {
+    const mul = 0.5 + Math.random();                 // [0.5, 1.5)
+    const perGeneMut = 0.10 + Math.random() * 0.22;  // [0.10, 0.32)
+    planetMutations.push({
+      planetIdx: p,
+      mutationMul: mul,
+      mutationRate: Math.min(mutationRate * mul, 0.9),
+      perGeneMut,
+    });
+  }
+  console.log(`[runner] Planet mutation factors: ` +
+    planetMutations.map(pm => `p${pm.planetIdx}: ×${pm.mutationMul.toFixed(2)} (mut=${(pm.mutationRate * 100).toFixed(0)}%, gene=${(pm.perGeneMut * 100).toFixed(0)}%)`).join(', '));
+
+  // 3b. Per-planet gene knockouts (ablation experiments).
+  // Planet 0 is always the control (no knockouts). For each subsequent
+  // planet we freeze one gene from PARAMS in a deterministic sweep order,
+  // so with enough planets every gene is represented. All islands on a
+  // planet share the same frozen set — within-planet migration is trivially
+  // compatible. Cross-planet space travel uses graft repair (the recipient
+  // worker overwrites the migrant's frozen-on-recipient slots with its own
+  // frozen values) so mating on the recipient never sees conflicting genes.
+  function pickFrozenValue(p) {
+    if (knockoutValueMode === 'random') return randomParam(p);
+    // 'midpoint': snap to the nearest step from the gene's midpoint
+    const mid = (p.min + p.max) / 2;
+    const steps = Math.round((mid - p.min) / p.step);
+    const v = p.min + steps * p.step;
+    return p.type === 'int' ? Math.round(v) : Math.round(v * 100) / 100;
+  }
+
+  const planetFrozen = [];
+  if (knockoutMode === 'sweep' && numPlanets > 1) {
+    for (let p = 0; p < numPlanets; p++) {
+      if (p === 0) {
+        planetFrozen.push({});           // control
+      } else {
+        const gene = PARAMS[(p - 1) % PARAMS.length];
+        planetFrozen.push({ [gene.id]: pickFrozenValue(gene) });
+      }
+    }
+  } else {
+    for (let p = 0; p < numPlanets; p++) planetFrozen.push({});
+  }
+  if (knockoutMode !== 'none') {
+    console.log(`[runner] Knockout sweep (${knockoutValueMode}): ` +
+      planetFrozen.map((fg, p) => `p${p}: ${frozenLabel(fg) || 'control'}`).join(', '));
+  }
+
+  const islandConfigs = [];
+  for (let idx = 0; idx < totalWorkers; idx++) {
+    const planetIdx = Math.floor(idx / numIslands);
+
+    let islandMutRate, perGeneMut;
+    if (numPlanets > 1) {
+      // Multi-planet: all islands on a planet share the planet's factors
+      const pm = planetMutations[planetIdx];
+      islandMutRate = pm.mutationRate;
+      perGeneMut = pm.perGeneMut;
+    } else {
+      // Single planet: keep the deterministic island-level gradient
+      const t = totalWorkers > 1 ? idx / (totalWorkers - 1) : 0.5;
+      islandMutRate = totalWorkers > 1 ? mutationRate * (0.5 + t) : mutationRate;
+      perGeneMut = 0.12 + t * 0.18;
+    }
+
+    islandConfigs.push({
+      islandIdx: idx,
+      mutationRate: Math.min(islandMutRate, 0.9),
+      perGeneMut,
+      frozenGenes: planetFrozen[planetIdx] || {},
+    });
+  }
+
+  // 4. Distribute islands to workers round-robin. Each worker evolves its
+  //    islands serially within a batch — islands on the same worker wait
+  //    for their turn. Sync happens at migration boundaries (see batch loop).
+  const islandsPerWorker = Array.from({ length: workerCount }, () => []);
+  for (let idx = 0; idx < totalWorkers; idx++) {
+    islandsPerWorker[idx % workerCount].push(islandConfigs[idx]);
+  }
+
   const workers = [];
+  const islandToWorker = new Array(totalWorkers); // global islandIdx -> Worker
   const readyPromises = [];
 
-  for (let idx = 0; idx < totalWorkers; idx++) {
-    const t = totalWorkers > 1 ? idx / (totalWorkers - 1) : 0.5;
-    // Mutation spread: ±50% across all workers for heterogeneity
-    const islandMutRate = totalWorkers > 1 ? mutationRate * (0.5 + t) : mutationRate;
-    // Per-gene mutation probability: varies 0.12..0.30 across workers
-    const perGeneMut = 0.12 + t * 0.18;
-
+  for (let w = 0; w < workerCount; w++) {
+    const myIslands = islandsPerWorker[w];
     const worker = new Worker(WORKER_URL, {
       workerData: {
         candleBuffer: sab,
         candleLength: len,
         tradingStartBar,
         populationSize,
-        mutationRate: Math.min(islandMutRate, 0.9),
-        perGeneMut,
-        islandIdx: idx,
-        windowSizeBars,
-        windowStepBars,
-        consistencyWeight,
+        islands: myIslands,
+        minTrades,
+        maxDrawdownPct,
+        autoHyperEnabled,
       },
     });
 
+    // Each hosted island attaches its own transient 'message' listener per
+    // batch / migrate / get_results phase. With many islands per worker
+    // (small core counts + many logical islands) we exceed Node's default
+    // 10-listener soft cap. Disable the warning — listener count is
+    // bounded by our own logic, not a runaway leak.
+    worker.setMaxListeners(0);
+
     workers.push(worker);
+    for (const cfg of myIslands) islandToWorker[cfg.islandIdx] = worker;
 
     readyPromises.push(new Promise((resolve, reject) => {
       const onMsg = (msg) => {
-        if (msg.type === 'ready' && msg.islandIdx === idx) {
+        if (msg.type === 'ready') {
           worker.off('message', onMsg);
           worker.off('error', onErr);
           resolve();
@@ -195,7 +303,7 @@ export async function runOptimization(config) {
   }
 
   await Promise.all(readyPromises);
-  status('ready', `All ${totalWorkers} workers ready. Starting evolution (${generations} generations)...`);
+  status('ready', `${workerCount} workers hosting ${totalWorkers} islands ready. Starting evolution (${generations} generations)...`);
 
   // 4. Topology helpers
 
@@ -227,13 +335,43 @@ export async function runOptimization(config) {
     return [base + (local + 1) % numIslands];
   }
 
-  // Space travel: pick a random island on a different planet
+  // Space travel: migrate best-of-planet to island(s) on other planets.
+  // Topology applies at the planet level, mirroring getIslandTargets:
+  //   - ring:   planet p → planet (p+1) % numPlanets
+  //   - torus:  planet's 4 grid neighbours (with wrap)
+  //   - random: one random peer planet
+  // Within the destination planet, the recipient island is chosen at
+  // random — island-level migration will then propagate the traveler
+  // through that planet's topology.
   function getSpaceTravelTargets(fromPlanet) {
     if (numPlanets <= 1) return [];
-    let toPlanet;
-    do { toPlanet = Math.floor(Math.random() * numPlanets); } while (toPlanet === fromPlanet);
-    const toIsland = Math.floor(Math.random() * numIslands);
-    return [toPlanet * numIslands + toIsland];
+
+    let targetPlanets;
+    if (migrationTopology === 'torus') {
+      const cols = Math.max(2, Math.round(Math.sqrt(numPlanets)));
+      const rows = Math.ceil(numPlanets / cols);
+      const r = Math.floor(fromPlanet / cols);
+      const c = fromPlanet % cols;
+      const neighbours = new Set();
+      neighbours.add(r * cols + (c + 1) % cols);
+      neighbours.add(r * cols + (c - 1 + cols) % cols);
+      neighbours.add(((r + 1) % rows) * cols + c);
+      neighbours.add(((r - 1 + rows) % rows) * cols + c);
+      neighbours.delete(fromPlanet);
+      targetPlanets = [...neighbours].filter(p => p < numPlanets);
+    } else if (migrationTopology === 'random') {
+      let toPlanet;
+      do { toPlanet = Math.floor(Math.random() * numPlanets); } while (toPlanet === fromPlanet);
+      targetPlanets = [toPlanet];
+    } else {
+      // Default: ring between planets
+      targetPlanets = [(fromPlanet + 1) % numPlanets];
+    }
+
+    return targetPlanets.map(tp => {
+      const toIsland = Math.floor(Math.random() * numIslands);
+      return tp * numIslands + toIsland;
+    });
   }
 
   // Pre-compute static island edges for progress display
@@ -260,6 +398,9 @@ export async function runOptimization(config) {
   const islandGen = new Array(totalWorkers).fill(0);
   const workerEvals = new Array(totalWorkers).fill(0);
   const workerCaches = new Array(totalWorkers).fill(0);
+  const islandHyperActive = new Array(totalWorkers).fill(0);
+  const islandHyperSource = new Array(totalWorkers).fill(null);
+  const islandHyperCount  = new Array(totalWorkers).fill(0);
 
   // Build batch boundaries
   const batches = [];
@@ -283,6 +424,18 @@ export async function runOptimization(config) {
     // Send 'evolve' to all workers and collect results
     const batchDone = new Array(totalWorkers);
     const batchPromises = [];
+
+    // Poll for manual hypermutate trigger — forward to all workers when fired
+    let hyperPoller = null;
+    if (shouldHypermutate) {
+      hyperPoller = setInterval(() => {
+        if (shouldHypermutate()) {
+          const gen = Math.max(0, ...islandGen);
+          for (const w of workers) w.postMessage({ type: 'hypermutate', gen });
+          console.log(`[runner] Manual hypermutation triggered at gen ${gen}`);
+        }
+      }, 200);
+    }
 
     // Poll for cancel mid-batch — send cancel to workers immediately
     let cancelPoller = null;
@@ -310,7 +463,7 @@ export async function runOptimization(config) {
     }
 
     for (let idx = 0; idx < totalWorkers; idx++) {
-      const w = workers[idx];
+      const w = islandToWorker[idx];
 
       batchPromises.push(new Promise(resolve => {
         const handler = (msg) => {
@@ -325,6 +478,9 @@ export async function runOptimization(config) {
             islandGen[idx] = msg.gen;
             workerEvals[idx] = msg.evalCount;
             workerCaches[idx] = msg.cacheSize;
+            islandHyperActive[idx] = msg.hyperActive ?? 0;
+            islandHyperSource[idx] = msg.hyperSource ?? null;
+            islandHyperCount[idx]  = msg.hyperCount ?? 0;
 
             // Compute global best across all workers
             let globalBest = { fitness: -Infinity };
@@ -354,11 +510,17 @@ export async function runOptimization(config) {
                 for (let i = p * numIslands; i < (p + 1) * numIslands; i++) {
                   if (islandBest[i] && islandBest[i].fitness > best.fitness) best = islandBest[i];
                 }
+                const pm = planetMutations[p];
+                const pf = planetFrozen[p] || {};
                 return {
                   idx: p,
                   profit: best.metrics?.netProfit ?? null,
                   trades: best.metrics?.trades ?? null,
                   pf: best.metrics?.pf ?? null,
+                  mutationRate: pm?.mutationRate ?? null,
+                  perGeneMut: pm?.perGeneMut ?? null,
+                  mutationMul: pm?.mutationMul ?? null,
+                  frozenGenes: Object.keys(pf).length ? pf : null,
                 };
               });
 
@@ -388,6 +550,9 @@ export async function runOptimization(config) {
                   trades: ib?.metrics?.trades ?? null,
                   pf: ib?.metrics?.pf ?? null,
                   evals: workerEvals[i],
+                  hyperActive: islandHyperActive[i],
+                  hyperSource: islandHyperSource[i],
+                  hyperCount: islandHyperCount[i],
                 })),
                 planets: numPlanets > 1 ? planetStats : undefined,
                 edges: totalWorkers > 1 ? buildEdges() : [],
@@ -410,7 +575,10 @@ export async function runOptimization(config) {
 
         w.on('message', handler);
       }));
+    }
 
+    // One evolve per worker — worker iterates its owned islands serially
+    for (const w of workers) {
       w.postMessage({
         type: 'evolve',
         startGen: batch.startGen,
@@ -421,6 +589,7 @@ export async function runOptimization(config) {
 
     await Promise.all(batchPromises);
     if (cancelPoller) clearInterval(cancelPoller);
+    if (hyperPoller) clearInterval(hyperPoller);
 
     if (shouldCancel?.()) {
       if (!cancelSent) {
@@ -447,17 +616,18 @@ export async function runOptimization(config) {
         allMigrants.sort((a, b) => b.score - a.score);
         const migrants = allMigrants.slice(0, migrationCount);
 
+        const tgtWorker = islandToWorker[target];
         migratePromises.push(new Promise(resolve => {
           const handler = (msg) => {
             if (msg.type === 'migrate_done' && msg.islandIdx === target) {
-              workers[target].off('message', handler);
+              tgtWorker.off('message', handler);
               resolve();
             }
           };
-          workers[target].on('message', handler);
+          tgtWorker.on('message', handler);
         }));
 
-        workers[target].postMessage({ type: 'migrate', migrants });
+        tgtWorker.postMessage({ type: 'migrate', targetIslandIdx: target, migrants });
       }
 
       await Promise.all(migratePromises);
@@ -479,17 +649,18 @@ export async function runOptimization(config) {
           // Send to random island on a different planet
           const targets = getSpaceTravelTargets(p);
           for (const target of targets) {
+            const tgtWorker = islandToWorker[target];
             travelPromises.push(new Promise(resolve => {
               const handler = (msg) => {
                 if (msg.type === 'migrate_done' && msg.islandIdx === target) {
-                  workers[target].off('message', handler);
+                  tgtWorker.off('message', handler);
                   resolve();
                 }
               };
-              workers[target].on('message', handler);
+              tgtWorker.on('message', handler);
             }));
 
-            workers[target].postMessage({ type: 'migrate', migrants: travelers });
+            tgtWorker.postMessage({ type: 'migrate', targetIslandIdx: target, migrants: travelers });
           }
         }
 
@@ -513,16 +684,24 @@ export async function runOptimization(config) {
     });
   }
 
-  const resultPromises = workers.map((w, idx) => new Promise(resolve => {
-    const handler = (msg) => {
-      if (msg.type === 'results' && msg.islandIdx === idx) {
-        w.off('message', handler);
-        resolve(msg);
-      }
-    };
-    w.on('message', handler);
+  // One promise per ISLAND — each worker emits one `results` message per
+  // owned island. Send one `get_results` per worker to trigger.
+  const resultPromises = [];
+  for (let idx = 0; idx < totalWorkers; idx++) {
+    const w = islandToWorker[idx];
+    resultPromises.push(new Promise(resolve => {
+      const handler = (msg) => {
+        if (msg.type === 'results' && msg.islandIdx === idx) {
+          w.off('message', handler);
+          resolve(msg);
+        }
+      };
+      w.on('message', handler);
+    }));
+  }
+  for (const w of workers) {
     w.postMessage({ type: 'get_results' });
-  }));
+  }
 
   const finalResults = await Promise.all(resultPromises);
 
@@ -584,6 +763,7 @@ export async function runOptimization(config) {
     totalSpaceTravels,
     totalTimeMs: Date.now() - startTime,
     candleBars: len,
-    config: { populationSize, generations, mutationRate, numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology, spaceTravelInterval, spaceTravelCount },
+    config: { populationSize, generations, mutationRate, numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology, spaceTravelInterval, spaceTravelCount, knockoutMode, knockoutValueMode },
+    planetFrozen,
   };
 }
