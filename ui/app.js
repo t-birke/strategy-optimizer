@@ -2291,11 +2291,12 @@ function readParamOverrides(containerEl, block) {
 function makeBlockRow(kind, value = '') {
   // Outer wrapper holds the select-row AND the description line below it
   // so a row is visually one unit — description moves with the row when
-  // it's reordered or removed.
+  // it's reordered or removed. Spacing + the dashed separator between
+  // rows live in style.css (#page-specs .spec-block-row) so the list is
+  // easy to scan without inline noise.
   const wrap = document.createElement('div');
   wrap.className = 'spec-block-row';
   wrap.dataset.kind = kind;
-  wrap.style.cssText = 'margin-bottom:10px';
 
   const row = document.createElement('div');
   row.style.cssText = 'display:flex;align-items:center;gap:8px';

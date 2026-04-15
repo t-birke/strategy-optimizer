@@ -520,3 +520,55 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
 .spec-params .param-row.pinned .param-min { display: none; }
 .spec-params .param-row:not(.pinned) .param-value { display: none; }
 .spec-params .param-row input.invalid { border-color: #f85149; }
+
+/* ─── Specs editor readability tweaks ────────────────────────
+   Picked-block rows (entries/filters) get a dashed grey separator
+   and more vertical breathing room so a list of 4-5 picked blocks
+   doesn't read as one blob. The block's select itself drops its
+   full frame once the user has made a pick — it reads as a label
+   with just a chevron affordance. Hover or click-to-open restores
+   the frame so the dropdown is still obviously interactive. */
+
+#page-specs .spec-block-row {
+  padding: 6px 0 14px 0;
+  margin-bottom: 14px;
+  border-bottom: 1px dashed #30363d;
+}
+#page-specs .spec-block-row:last-child {
+  border-bottom: none;
+  padding-bottom: 4px;
+  margin-bottom: 0;
+}
+
+/* Applies to the fixed-slot selects (regime, 3 exit slots, sizing)
+   AND to the per-row selects inside multi-block lists. The
+   `.param-row` param-control inputs are <input type="number">, so
+   this rule leaves them untouched. */
+#page-specs select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-color: transparent;
+  color: #e6edf3;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 6px 28px 6px 10px;
+  font-size: 15px;
+  font-family: inherit;
+  cursor: pointer;
+  /* Chevron stays visible so the user knows the field is still a dropdown. */
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%238b949e' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  transition: border-color 0.12s, background-color 0.12s;
+}
+#page-specs select:hover,
+#page-specs select:focus {
+  border-color: #30363d;
+  background-color: #0d1117;
+  outline: none;
+}
+#page-specs select option {
+  background: #0d1117;
+  color: #e6edf3;
+  font-size: 14px;
+}
