@@ -149,6 +149,17 @@ async function main() {
             b.sizingRequirements, null);
         }
 
+        // description: optional, but if present must be a non-empty string.
+        // The UI editor surfaces this under each block picker so users can
+        // remember what each block does without reading source.
+        assertTrue(`block ${b.id}: description is string or null`,
+          b.description === null || typeof b.description === 'string',
+          `typeof=${typeof b.description}`);
+        if (typeof b.description === 'string') {
+          assertTrue(`block ${b.id}: description is non-empty`,
+            b.description.length > 0);
+        }
+
         // Every declared param has id/type/min/max/step.
         for (const p of b.params) {
           assertTrue(`${b.id}.${p.id}: has id`, typeof p.id === 'string' && p.id.length > 0);
@@ -172,7 +183,19 @@ async function main() {
         const paramIds = stoch.params.map(p => p.id).sort();
         assertEq('stochCross params',
           paramIds, ['longLevel', 'shortLevel', 'stochLen', 'stochSmth']);
+        assertTrue('stochCross has a non-empty description',
+          typeof stoch.description === 'string' && stoch.description.length > 0);
       }
+
+      // Anchor: every shipping block has a description. New blocks are
+      // welcome to omit it (the contract makes it optional), but if any
+      // block regresses to null we want the gate to flag it.
+      const undescribed = r.body.blocks
+        .filter(b => typeof b.description !== 'string' || b.description.length === 0)
+        .map(b => b.id);
+      assertTrue('all registered blocks have a description',
+        undescribed.length === 0,
+        undescribed.length ? `missing: ${undescribed.join(', ')}` : '');
 
       // Anchor for an exit block with a slot.
       const hardStop = r.body.blocks.find(b => b.id === 'atrHardStop');

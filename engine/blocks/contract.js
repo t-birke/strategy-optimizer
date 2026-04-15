@@ -128,6 +128,10 @@ export const ALL_DIRECTIONS = Object.freeze(Object.values(DIRECTIONS));
  * @property {keyof KINDS} kind
  * @property {keyof DIRECTIONS} [direction]  — required unless kind is regime/sizing
  * @property {keyof EXIT_SLOTS} [exitSlot]   — required iff kind === 'exit'
+ * @property {string}  [description]  — optional 1-2 sentence human-readable
+ *      summary of what the block does. Surfaced in the spec authoring UI's
+ *      block pickers so users don't have to remember what every block id
+ *      means. Keep it compact (≤280 chars is a reasonable guideline).
  *
  * @property {() => ParamSpec[]} declaredParams
  *      Returns this block's GA param space. Called once at spec-load time to
@@ -251,6 +255,13 @@ export function validateBlock(block) {
   require(typeof block?.id === 'string' && block.id.length > 0, 'block.id must be a non-empty string');
   require(Number.isInteger(block?.version) && block.version >= 1, 'block.version must be a positive integer');
   require(ALL_KINDS.includes(block?.kind), `block.kind must be one of: ${ALL_KINDS.join(', ')}`);
+
+  // Description is optional — legacy blocks may not have it — but if
+  // present it must be a string so the UI can render it safely.
+  if (block?.description !== undefined) {
+    require(typeof block.description === 'string',
+      'block.description must be a string when present');
+  }
 
   if (block?.kind === KINDS.EXIT) {
     require(ALL_EXIT_SLOTS.includes(block?.exitSlot),

@@ -19,6 +19,7 @@ import { sma, crossover, crossunder } from '../../../indicators.js';
 
 export default {
   id: 'stochCross', version: 1, kind: KINDS.ENTRY, direction: DIRECTIONS.BOTH,
+  description: 'Smoothed Stochastic %K/%D cross gated by oversold/overbought zones. Long on an upward cross while %K < longLevel; short on a downward cross while %K > shortLevel. Bread-and-butter entry of the legacy JM Simple 3TP.',
 
   declaredParams() {
     return [

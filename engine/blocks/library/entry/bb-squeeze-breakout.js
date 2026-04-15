@@ -17,6 +17,7 @@ import { KINDS, DIRECTIONS } from '../../contract.js';
 
 export default {
   id: 'bbSqueezeBreakout', version: 1, kind: KINDS.ENTRY, direction: DIRECTIONS.BOTH,
+  description: 'Bollinger squeeze followed by a directional break of basis. A squeeze is a BB-width percentile in the bottom `squeezePctile`%; breakout fires when a recent-squeeze bar closes on one side of the basis within `lookbackBars`.',
 
   declaredParams() {
     return [

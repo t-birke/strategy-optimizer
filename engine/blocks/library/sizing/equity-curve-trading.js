@@ -16,6 +16,7 @@ import { KINDS } from '../../contract.js';
 
 export default {
   id: 'equityCurveTrading', version: 1, kind: KINDS.SIZING,
+  description: 'Meta-sizing: bigger when the equity curve is above its moving average ("on" regime), smaller — or zero — when below ("off"). Set offPct=0 to literally skip trades during strategy drawdowns.',
 
   declaredParams() {
     return [

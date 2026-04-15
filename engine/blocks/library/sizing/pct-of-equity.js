@@ -9,6 +9,7 @@ import { KINDS } from '../../contract.js';
 
 export default {
   id: 'pctOfEquity', version: 1, kind: KINDS.SIZING,
+  description: 'Deploy a fixed percentage of CURRENT equity on every entry. Compounds naturally — wins grow the next bet, losses shrink it. The canonical "fully invested" sizing for long-only swing strategies.',
 
   declaredParams() {
     return [

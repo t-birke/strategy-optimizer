@@ -41,6 +41,7 @@ const RSI_LOOKBACK          = 3;   // bars to look back for prior level
 export default {
   id: 'structuralExit', version: 1, kind: KINDS.EXIT, exitSlot: EXIT_SLOTS.TRAIL,
   direction: DIRECTIONS.BOTH,
+  description: 'Legacy "graceful" exit: time-out, stoch/RSI structural break, or opposite-side entry signal (reversal). All signals defer to the next-bar open — "the thesis is broken, get out gracefully" rather than a hard risk stop.',
 
   declaredParams() {
     return [

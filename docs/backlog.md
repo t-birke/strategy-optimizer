@@ -618,6 +618,21 @@ registry-declared range as-is, which is a valid runnable starting point.
   every block has id/kind/version/params; every exit block has a valid
   exitSlot; every param has a known type.
 
+**Follow-up (same phase): block descriptions** — optional `description`
+field on every block (≤280 chars), surfaced by `/api/blocks`, and
+rendered in the spec editor:
+- Fixed pickers (regime, 3 exit slots, sizing) each get a muted
+  description line below the `<select>` that updates on change.
+- Entry/filter rows render the description inline below each row so
+  multi-block slots don't lose the hint when the user scans the list.
+- All 14 shipping blocks have a 1–2 sentence description backfilled
+  from each block's header comment.
+- Gates: `spec-api-check` asserts description is string-or-null for
+  every block and non-empty for all currently-shipping blocks (regression
+  guard); `ui-spec-editor-check` asserts the `-desc` containers exist
+  and that `blockDescriptionFor`/`updateBlockDescription` are wired to
+  each fixed picker + the row builder.
+
 ### 4.3b Spec picker in the New Run modal — ✅ done
 Users can now pick an existing spec from a dropdown in the New Run modal
 instead of hand-editing JSON. Minimum-viable UI for spec-mode runs.

@@ -16,6 +16,7 @@ import { KINDS } from '../../contract.js';
 
 export default {
   id: 'atrRisk', version: 1, kind: KINDS.SIZING,
+  description: 'Van Tharp risk-per-trade sizing: size = (equity × riskPct) / stopDistance. Scales position so a full SL costs exactly riskPct of equity. Requires a hardStop block that implements planStop() — otherwise the entry is declined.',
 
   declaredParams() {
     return [

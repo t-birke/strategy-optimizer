@@ -13,6 +13,7 @@ import { KINDS } from '../../contract.js';
 
 export default {
   id: 'fixedFractional', version: 1, kind: KINDS.SIZING,
+  description: 'Ralph Vince sizing anchored to the worst historical loss: size = (equity × f) / max(biggestLoss, minWorstLoss). Intuition: "no single future loss should hurt me more than the worst historical loss has, scaled by f".',
 
   declaredParams() {
     return [

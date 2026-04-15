@@ -16,6 +16,7 @@ import { KINDS, DIRECTIONS } from '../../contract.js';
 
 export default {
   id: 'emaTrend', version: 1, kind: KINDS.ENTRY, direction: DIRECTIONS.BOTH,
+  description: 'Classic fast-EMA / slow-EMA trend vote. Fires long while emaFast > emaSlow, short while emaFast < emaSlow. Not a cross — a state vote that lets other score contributors pick the timing.',
 
   declaredParams() {
     return [

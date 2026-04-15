@@ -34,6 +34,7 @@ const BE_PLUS_SHORT = 0.997;
 export default {
   id: 'atrHardStop', version: 1, kind: KINDS.EXIT, exitSlot: EXIT_SLOTS.HARD_STOP,
   direction: DIRECTIONS.BOTH,
+  description: 'ATR-anchored stop-loss with Pine\'s 2-bar close-based deferral plus a fixed-% emergency intra-bar stop. Tightens to breakeven-plus once TP1 fills. Implements planStop() so risk-based sizing can size to its planned distance.',
 
   declaredParams() {
     return [

@@ -16,6 +16,7 @@ import { KINDS } from '../../contract.js';
 
 export default {
   id: 'kelly', version: 1, kind: KINDS.SIZING,
+  description: 'Kelly-fraction sizing driven by running win/loss stats. `fraction` lets you run half- or quarter-Kelly (full Kelly is notoriously aggressive); `maxFraction` is a hard cap. Falls back to a fixed `warmupPct` of equity until `minTrades` closed trades exist.',
 
   declaredParams() {
     return [

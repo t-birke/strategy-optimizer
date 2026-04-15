@@ -13,6 +13,7 @@ import { KINDS } from '../../contract.js';
 
 export default {
   id: 'flat', version: 1, kind: KINDS.SIZING,
+  description: 'Fixed dollar amount per trade regardless of current equity: size = amountUsd / fillPrice. Use for apples-to-apples strategy comparisons where you don\'t want compounding to flatter the results.',
 
   declaredParams() {
     return [

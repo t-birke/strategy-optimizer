@@ -709,6 +709,9 @@ router.get('/api/blocks', async (req, res) => {
         kind: b.kind,
         direction: b.direction ?? null,
         exitSlot:  b.exitSlot  ?? null,
+        // Optional human-readable description surfaced in the spec-editor UI
+        // so users don't have to remember what each block id means.
+        description: typeof b.description === 'string' ? b.description : null,
         sizingRequirements,
         params,
       };

@@ -33,6 +33,7 @@ const MAX_TRANCHES = 6;
 export default {
   id: 'atrScaleOutTarget', version: 1, kind: KINDS.EXIT, exitSlot: EXIT_SLOTS.TARGET,
   direction: DIRECTIONS.BOTH,
+  description: 'Generic N-tier scale-out target (up to 6 tranches). Unused tranches pin pct=0 and vanish from both the genome and the runtime. Tranches are TP-price-sorted and auto-normalized to sum to 100%.',
 
   declaredParams() {
     const params = [

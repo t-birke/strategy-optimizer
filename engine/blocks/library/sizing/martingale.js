@@ -17,6 +17,7 @@ import { KINDS } from '../../contract.js';
 
 export default {
   id: 'martingale', version: 1, kind: KINDS.SIZING,
+  description: 'Escalate size after losing streaks, reset on a win (mult = stepMult^lossStreak, capped by maxMult). Historically fatal if uncapped; the cap is mandatory. Use with caution — best for strategies with known mean-reverting W/L distributions.',
 
   declaredParams() {
     return [

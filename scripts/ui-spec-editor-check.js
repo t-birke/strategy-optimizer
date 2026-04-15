@@ -123,6 +123,18 @@ async function main() {
     assertTrue('spec-sizing select present', contains(slice, 'id="spec-sizing"'));
     assertTrue('spec-sizing-req hint container present', contains(slice, 'id="spec-sizing-req"'));
 
+    // Block description containers — one per fixed picker so the UI can
+    // show "what does this block do?" next to each slot.
+    for (const id of [
+      'spec-regime-desc',
+      'spec-exit-hardstop-desc',
+      'spec-exit-target-desc',
+      'spec-exit-trail-desc',
+      'spec-sizing-desc',
+    ]) {
+      assertTrue(`${id} container present`, contains(slice, `id="${id}"`));
+    }
+
     // Preview + copy.
     assertTrue('spec-json-preview pre present', contains(slice, 'id="spec-json-preview"'));
     assertTrue('spec-copy-json button present', contains(slice, 'id="spec-copy-json"'));
@@ -193,6 +205,24 @@ async function main() {
     assertTrue('threshold row hides when mode !== score',
       /spec-entries-threshold-row[\s\S]{0,200}mode\s*===\s*'score'/.test(js)
       || /mode\s*===\s*'score'[\s\S]{0,200}spec-entries-threshold-row/.test(js));
+
+    // 2g. Block description rendering — both the fixed-picker helper and
+    // the per-row inline description must be wired up so users can see
+    // what each block does without leaving the editor.
+    assertTrue('defines blockDescriptionFor helper',
+      /function\s+blockDescriptionFor\b/.test(js));
+    assertTrue('defines updateBlockDescription helper',
+      /function\s+updateBlockDescription\b/.test(js));
+    // There must be a for-of loop over the fixed-picker ids that passes
+    // each id to updateBlockDescription. Asserts each picker id appears
+    // within 400 chars before the updateBlockDescription() call.
+    for (const id of ['spec-regime', 'spec-exit-hardstop', 'spec-exit-target', 'spec-exit-trail', 'spec-sizing']) {
+      assertTrue(`${id} is fed to updateBlockDescription`,
+        new RegExp(`'${id}'[\\s\\S]{0,400}updateBlockDescription\\(`).test(js));
+    }
+    // Row-level description line in makeBlockRow.
+    assertTrue('makeBlockRow renders an inline block description',
+      /makeBlockRow[\s\S]{0,2500}blockDescriptionFor\(/.test(js));
   }
 
   // ── 3. Server contract: GET /api/blocks shape matches editor reads ──

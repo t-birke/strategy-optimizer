@@ -14,6 +14,7 @@ import { KINDS } from '../../contract.js';
 
 export default {
   id: 'antiMartingale', version: 1, kind: KINDS.SIZING,
+  description: 'Escalate size after WINNING streaks, reset on a loss. Presses winners and gives back less on eventual losers — philosophically the opposite of martingale and arguably more defensible for strategies that cluster wins.',
 
   declaredParams() {
     return [

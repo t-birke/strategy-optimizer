@@ -1948,6 +1948,25 @@ function blocksByExitSlot(slot) {
   return Object.values(blocksById).filter(b => b.kind === 'exit' && b.exitSlot === slot);
 }
 
+// Look up a block's description, tolerating "None" (empty string) and
+// unregistered ids. Returns '' when there's nothing to show so the caller
+// can set textContent unconditionally.
+function blockDescriptionFor(blockId) {
+  if (!blockId) return '';
+  const b = blocksById[blockId];
+  return (b && typeof b.description === 'string') ? b.description : '';
+}
+
+// Populate a `#<selectId>-desc` element with the currently selected block's
+// description. Reads the select's live value so it's safe to call from
+// "change" handlers AND from populate-then-render paths.
+function updateBlockDescription(selectId) {
+  const sel = document.getElementById(selectId);
+  const el  = document.getElementById(selectId + '-desc');
+  if (!sel || !el) return;
+  el.textContent = blockDescriptionFor(sel.value);
+}
+
 // Wipes and rebuilds a <select>'s options. Keeps the current value if
 // it's still a valid option; otherwise falls back to `defaultValue`.
 // An empty-value "None" option is included iff `includeNone` is true.
@@ -1995,6 +2014,13 @@ function populateSpecEditorPickers() {
   // just won't offer any options).
   const hasFilter = blocksByKind('filter').length > 0;
   document.getElementById('spec-filters-empty').style.display = hasFilter ? 'none' : '';
+
+  // Seed the description line under each fixed picker so they aren't
+  // blank on first render. The "change" listeners keep them in sync
+  // thereafter.
+  for (const id of ['spec-regime', 'spec-exit-hardstop', 'spec-exit-target', 'spec-exit-trail', 'spec-sizing']) {
+    updateBlockDescription(id);
+  }
 }
 
 function updateSizingReqHint() {
@@ -2020,10 +2046,16 @@ function updateSizingReqHint() {
 // keeping a parallel JS state array — simpler, and the DOM is the source
 // of truth for what the user sees.
 function makeBlockRow(kind, value = '') {
+  // Outer wrapper holds the select-row AND the description line below it
+  // so a row is visually one unit — description moves with the row when
+  // it's reordered or removed.
+  const wrap = document.createElement('div');
+  wrap.className = 'spec-block-row';
+  wrap.dataset.kind = kind;
+  wrap.style.cssText = 'margin-bottom:10px';
+
   const row = document.createElement('div');
-  row.className = 'spec-block-row';
-  row.dataset.kind = kind;
-  row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:6px';
+  row.style.cssText = 'display:flex;align-items:center;gap:8px';
 
   const select = document.createElement('select');
   select.style.cssText = 'flex:1;min-width:200px';
@@ -2045,7 +2077,18 @@ function makeBlockRow(kind, value = '') {
     select.appendChild(opt);
   }
   if (value) select.value = value;
-  select.addEventListener('change', renderSpecPreview);
+
+  // Per-row description line — updates when the selection changes so the
+  // user sees what a block does without leaving the editor.
+  const desc = document.createElement('div');
+  desc.dataset.role = 'block-desc';
+  desc.style.cssText = 'font-size:12px;color:#8b949e;line-height:1.5;margin:4px 0 0 0;min-height:14px';
+  desc.textContent = blockDescriptionFor(select.value);
+
+  select.addEventListener('change', () => {
+    desc.textContent = blockDescriptionFor(select.value);
+    renderSpecPreview();
+  });
   row.appendChild(select);
 
   const rm = document.createElement('button');
@@ -2054,12 +2097,14 @@ function makeBlockRow(kind, value = '') {
   rm.title = 'Remove this block';
   rm.style.cssText = 'padding:4px 10px;font-size:14px;line-height:1';
   rm.addEventListener('click', () => {
-    row.remove();
+    wrap.remove();
     renderSpecPreview();
   });
   row.appendChild(rm);
 
-  return row;
+  wrap.appendChild(row);
+  wrap.appendChild(desc);
+  return wrap;
 }
 
 function addEntryRow() {
@@ -2240,6 +2285,14 @@ function renderSpecPreview() {
 });
 // Sizing change also updates the requirements hint.
 document.getElementById('spec-sizing').addEventListener('change', updateSizingReqHint);
+
+// Fixed-picker change also refreshes its description line. The selects
+// already bubble a preview rebuild via the loop above; this extra handler
+// just keeps the human-readable description next to each slot in sync.
+for (const id of ['spec-regime', 'spec-exit-hardstop', 'spec-exit-target', 'spec-exit-trail', 'spec-sizing']) {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => updateBlockDescription(id));
+}
 
 document.getElementById('spec-entries-add').addEventListener('click', addEntryRow);
 document.getElementById('spec-filters-add').addEventListener('click', addFilterRow);
