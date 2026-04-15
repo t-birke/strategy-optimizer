@@ -756,18 +756,28 @@ window.toggleRunDetails = async (id) => {
     </div>`;
 
     if (gene) {
-      const tp3Pct = 100 - (gene.tp1Pct || 0) - (gene.tp2Pct || 0);
+      // Spec-mode runs carry a spec_hash and use qualified-ID gene keys
+      // (e.g. "emaTrend.main.emaFast"); legacy GA runs use flat keys
+      // (e.g. "emaFast"). The winner-config summary and "Send to TV"
+      // button only make sense for legacy runs — the TV bridge pushes
+      // into a hardcoded JM Simple 3TP Pine template whose input names
+      // don't match spec-mode block IDs. Branch here so spec-mode runs
+      // get a readable summary instead of "undefined undefined undefined"
+      // and don't offer a broken TV button.
+      const isSpecMode = !!run.spec_hash;
       html += `<div style="margin-bottom:12px;font-size:13px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
         <span>
           <strong>Winner config:</strong>
-          E${gene.minEntry} St${gene.stochLen}/${gene.stochSmth} R${gene.rsiLen}
-          EMA${gene.emaFast}/${gene.emaSlow} BB${gene.bbLen}x${gene.bbMult}
-          ATR${gene.atrLen} SL${gene.atrSL}
-          TP${gene.tp1Mult}/${gene.tp2Mult}/${gene.tp3Mult}
-          @${gene.tp1Pct}/${gene.tp2Pct}/${tp3Pct}%
-          R${gene.riskPct}% T${gene.maxBars}b
-        </span>
-        <button onclick="sendToTV(${id})" class="primary btn-tv" id="btn-tv-${id}" style="font-size:11px;padding:3px 10px;white-space:nowrap">Send to TV</button>
+          ${formatWinnerConfig(gene, isSpecMode)}
+        </span>`;
+      if (isSpecMode) {
+        html += `<button class="primary btn-tv" id="btn-tv-${id}" disabled
+          title="Send to TV is only available for legacy GA runs. Spec-mode genes use block-qualified IDs that don't map to the JM Simple 3TP Pine template."
+          style="font-size:11px;padding:3px 10px;white-space:nowrap;opacity:0.5;cursor:not-allowed">Send to TV (legacy only)</button>`;
+      } else {
+        html += `<button onclick="sendToTV(${id})" class="primary btn-tv" id="btn-tv-${id}" style="font-size:11px;padding:3px 10px;white-space:nowrap">Send to TV</button>`;
+      }
+      html += `
         <span id="tv-status-${id}" style="font-size:12px"></span>
       </div>
       <div id="tv-result-${id}" style="display:none;margin-bottom:12px"></div>`;
@@ -1462,6 +1472,74 @@ window.closeRunDetail = () => {
 // `NaN` (WFE when divisor is zero) since the underlying numeric
 // sources can emit both — openRunDetail shouldn't crash on a well-
 // formed but mathematically degenerate row.
+
+/**
+ * Format the one-line "Winner config" summary shown in the runs-list
+ * expand panel. Branches on gene shape:
+ *
+ *   - Legacy GA runs use a flat gene object like
+ *       { minEntry, stochLen, stochSmth, rsiLen, emaFast, emaSlow,
+ *         bbLen, bbMult, atrLen, atrSL, tp1Mult, tp2Mult, tp3Mult,
+ *         tp1Pct, tp2Pct, riskPct, maxBars }
+ *     and render the compact JM Simple 3TP summary that's shipped since
+ *     day one.
+ *
+ *   - Spec-mode runs (Phase 4.1+) use qualified-ID keys like
+ *       "emaTrend.main.emaFast": 38
+ *       "bbSqueezeBreakout.main.bbLen": 37
+ *       "_meta.entries.threshold": 3
+ *     because the gene is block-aware rather than hardcoded to one
+ *     strategy. We group by the block prefix and render
+ *     "E3 emaTrend(emaFast=38, emaSlow=40) · bbSqueezeBreakout(bbLen=37, …)".
+ *
+ * The branch is driven by `isSpecMode` (caller supplies it from
+ * run.spec_hash) rather than shape-sniffing — avoids false positives on
+ * odd legacy keys and matches how the TV-button branch is guarded.
+ */
+function formatWinnerConfig(gene, isSpecMode) {
+  if (!gene) return '';
+
+  if (!isSpecMode) {
+    const tp3Pct = 100 - (gene.tp1Pct || 0) - (gene.tp2Pct || 0);
+    return `E${gene.minEntry} St${gene.stochLen}/${gene.stochSmth} R${gene.rsiLen}
+      EMA${gene.emaFast}/${gene.emaSlow} BB${gene.bbLen}x${gene.bbMult}
+      ATR${gene.atrLen} SL${gene.atrSL}
+      TP${gene.tp1Mult}/${gene.tp2Mult}/${gene.tp3Mult}
+      @${gene.tp1Pct}/${gene.tp2Pct}/${tp3Pct}%
+      R${gene.riskPct}% T${gene.maxBars}b`;
+  }
+
+  // Spec-mode. Group keys by block-id prefix (before first `.`). Drop
+  // `_meta.*` — surface the entries threshold as a leading "E<n>" chip
+  // since that's the one gene bit that isn't block-owned.
+  const blocks = Object.create(null);
+  let entryThreshold = null;
+  for (const [k, v] of Object.entries(gene)) {
+    if (k === '_meta.entries.threshold') { entryThreshold = v; continue; }
+    if (k.startsWith('_meta.')) continue;
+    const dot = k.indexOf('.');
+    if (dot < 0) continue; // malformed — ignore rather than surface "undefined"
+    const block = k.slice(0, dot);
+    // Third segment is the param name; second is the instance id ("main").
+    const parts = k.split('.');
+    const param = parts.length >= 3 ? parts.slice(2).join('.') : parts[parts.length - 1];
+    (blocks[block] ??= []).push(`${param}=${formatGeneNum(v)}`);
+  }
+
+  const groups = Object.entries(blocks).map(
+    ([block, params]) => `${block}(${params.join(', ')})`
+  );
+  const prefix = entryThreshold != null ? `E${entryThreshold} ` : '';
+  return prefix + groups.join(' · ');
+}
+
+/** Compact number formatter for the winner-config line — strips
+ *  trailing zeros and caps at 4 decimal places, preserving ints. */
+function formatGeneNum(v) {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return String(v);
+  if (Number.isInteger(v)) return String(v);
+  return v.toFixed(4).replace(/\.?0+$/, '');
+}
 
 /**
  * Format a profit-factor value. PF comes in as a non-negative number

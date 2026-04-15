@@ -203,6 +203,117 @@ async function main() {
     // would mean the UI flags different rows than the gate evaluates.
     assertTrue('renderRegimeBreakdown flags trades < 5 as low-confidence',
       /function\s+renderRegimeBreakdown\b[\s\S]{0,3000}trades\s*<\s*5/.test(js));
+
+    // ── Winner-config helper (4.5a follow-up) ─────────────────
+    //
+    // Before this fix, the runs-list expand panel inlined
+    //   E${gene.minEntry} St${gene.stochLen}/${gene.stochSmth} ...
+    // which works for legacy GA genes (flat keys like `emaFast`) but
+    // produces "Eundefined Stundefined/undefined ..." for spec-mode
+    // runs whose gene uses qualified IDs ("emaTrend.main.emaFast").
+    // The fix is a formatWinnerConfig(gene, isSpecMode) helper that
+    // branches on the run's spec_hash. Guard the regression:
+    assertTrue('defines formatWinnerConfig helper',
+      /function\s+formatWinnerConfig\s*\(\s*gene\s*,\s*isSpecMode\s*\)/.test(js));
+    assertTrue('defines formatGeneNum helper',
+      /function\s+formatGeneNum\s*\(/.test(js));
+
+    // The expand panel must now route winner-config rendering through
+    // the helper — not inline the legacy template string. Specifically,
+    // the legacy shape `E${gene.minEntry} St${gene.stochLen}` should
+    // no longer appear anywhere OUTSIDE formatWinnerConfig itself.
+    const outsideHelper = js.replace(
+      /function\s+formatWinnerConfig\b[\s\S]*?\n\}/,
+      '/* formatWinnerConfig body elided for regression scan */',
+    );
+    assertTrue(
+      'expand panel no longer inlines legacy gene template',
+      !/E\$\{gene\.minEntry\}\s+St\$\{gene\.stochLen\}/.test(outsideHelper),
+      'found the pre-fix template outside formatWinnerConfig — ' +
+      'spec-mode runs would render "Eundefined Stundefined..."',
+    );
+
+    // formatWinnerConfig is called from the expand-panel render (the
+    // `if (gene)` block in the big renderResults/toggleExpand chain).
+    assertTrue('expand panel calls formatWinnerConfig',
+      /formatWinnerConfig\s*\(\s*gene\s*,/.test(js));
+
+    // Send to TV button is hidden/disabled for spec-mode runs. The
+    // current Pine template only speaks legacy gene keys, so a TV
+    // round-trip on a spec-mode run would push `undefined` for every
+    // input and mislead the user with a spurious "GA vs TV" delta.
+    // Detection hook: the `run.spec_hash` truthy-check used by the
+    // guard. If the branch disappears, this test screams.
+    assertTrue('expand panel guards Send-to-TV on spec-mode runs',
+      /isSpecMode\s*=\s*!!\s*run\.spec_hash/.test(js),
+      'expected `const isSpecMode = !!run.spec_hash`');
+    assertTrue('disabled TV button present for spec-mode',
+      /btn-tv[\s\S]{0,500}disabled\b[\s\S]{0,500}legacy only/i.test(js),
+      'expected a disabled "Send to TV (legacy only)" button branch');
+
+    // ── Behavioral: actually evaluate the helper ──────────────
+    //
+    // Static regex gets us partway — let's also run the function and
+    // confirm it produces usable text on a real spec-mode gene (shape
+    // copied from run #58 — BTCUSDT 4H, Phase 4.1 spec-mode) AND
+    // still emits the legacy JM Simple 3TP string for a flat gene.
+    //
+    // We extract the two helpers via regex and eval them in isolation
+    // so we don't need a DOM or the rest of app.js.
+    const formatWinnerConfigSrc = js.match(
+      /function\s+formatWinnerConfig\s*\([^)]*\)\s*\{[\s\S]*?\n\}/
+    )?.[0];
+    const formatGeneNumSrc = js.match(
+      /function\s+formatGeneNum\s*\([^)]*\)\s*\{[\s\S]*?\n\}/
+    )?.[0];
+    assertTrue('extracted formatWinnerConfig source', !!formatWinnerConfigSrc);
+    assertTrue('extracted formatGeneNum source', !!formatGeneNumSrc);
+
+    if (formatWinnerConfigSrc && formatGeneNumSrc) {
+      // eslint-disable-next-line no-new-func
+      const fn = new Function(
+        `${formatGeneNumSrc}\n${formatWinnerConfigSrc}\nreturn formatWinnerConfig;`,
+      )();
+
+      // Spec-mode gene (abbreviated from run #58).
+      const specGene = {
+        '_meta.entries.threshold': 3,
+        'stochCross.main.stochLen': 8,
+        'stochCross.main.stochSmth': 3,
+        'emaTrend.main.emaFast': 38,
+        'emaTrend.main.emaSlow': 40,
+        'bbSqueezeBreakout.main.bbLen': 37,
+        'bbSqueezeBreakout.main.bbMult': 2,
+        'atrScaleOutTarget.main.tp2Mult': 3.8,
+      };
+      const specOut = fn(specGene, true);
+      assertTrue('spec-mode output: no "undefined"',
+        !specOut.includes('undefined'),
+        `got: ${specOut}`);
+      assertTrue('spec-mode output: leads with entry threshold',
+        /^E3\b/.test(specOut), `got: ${specOut}`);
+      assertTrue('spec-mode output: groups by block id',
+        specOut.includes('emaTrend(') && specOut.includes('bbSqueezeBreakout('),
+        `got: ${specOut}`);
+      assertTrue('spec-mode output: preserves param=value pairs',
+        specOut.includes('emaFast=38') && specOut.includes('tp2Mult=3.8'),
+        `got: ${specOut}`);
+
+      // Legacy gene — same flat keys the template has always read.
+      const legacyGene = {
+        minEntry: 2, stochLen: 14, stochSmth: 3, rsiLen: 14,
+        emaFast: 50, emaSlow: 200, bbLen: 20, bbMult: 2,
+        atrLen: 14, atrSL: 2.5, tp1Mult: 1.5, tp2Mult: 2.5, tp3Mult: 4,
+        tp1Pct: 25, tp2Pct: 50, riskPct: 1.5, maxBars: 500,
+      };
+      const legacyOut = fn(legacyGene, false);
+      assertTrue('legacy output: no "undefined"',
+        !legacyOut.includes('undefined'), `got: ${legacyOut}`);
+      assertTrue('legacy output: contains EMA pair',
+        legacyOut.includes('EMA50/200'), `got: ${legacyOut}`);
+      assertTrue('legacy output: contains BB pair',
+        legacyOut.includes('BB20x2'), `got: ${legacyOut}`);
+    }
   }
 
   // ── 3. Server contract: /api/runs/:id parses the 3 JSON cols ─
