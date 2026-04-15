@@ -4,7 +4,12 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = resolve(__dirname, '../data/optimizer.duckdb');
+// OPTIMIZER_DB_PATH env var lets short-lived readers (e.g. parity scripts)
+// point at a copy of the DB while the long-running server holds the main
+// DB's write lock. Default stays the canonical on-disk location.
+const DB_PATH = process.env.OPTIMIZER_DB_PATH
+  ? resolve(process.env.OPTIMIZER_DB_PATH)
+  : resolve(__dirname, '../data/optimizer.duckdb');
 const SCHEMA_PATH = resolve(__dirname, 'schema.sql');
 
 let instance = null;
@@ -19,6 +24,16 @@ export async function getConn() {
   for (const stmt of schema.split(';').map(s => s.trim()).filter(Boolean)) {
     await conn.run(stmt);
   }
+
+  // Checkpoint after schema replay. DuckDB cannot reliably replay ALTER TABLE
+  // entries with DEFAULT clauses from the WAL (internal assertion failure
+  // "GetDefaultDatabase with no default database set" during bind). Forcing
+  // a checkpoint right after migration moves the ALTERs into the main file
+  // and truncates the WAL, so subsequent opens never try to replay them.
+  // The schema is idempotent (CREATE TABLE IF NOT EXISTS, ALTER TABLE ADD
+  // COLUMN IF NOT EXISTS), so when the DB is already migrated this loop is
+  // a no-op and the CHECKPOINT is cheap.
+  await conn.run('CHECKPOINT');
   return conn;
 }
 

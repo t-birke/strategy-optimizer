@@ -1,0 +1,126 @@
+{
+  "name": "20260414-001-jm-simple-3tp-legacy",
+  "description": "Legacy JM Simple 3TP ported into the composable framework. Parity gate for chunk 8 — the runtime + block composition must reproduce the old hardcoded engine's metrics (PF, net, maxDD, trade list) to within a tight tolerance before we deprecate engine/strategy.js. Notes: (a) atrLen and stochLen appear in two blocks each (hardStop+target; entry+trail); cross-block equality constraints aren't yet expressible, so the parity smoke test pins identical values by hand. (b) atrScaleOutTarget supports up to 6 tranches; this legacy port uses 3. Tranches 4-6 are disabled by pinning tpNPct=0, which drops them from the genome AND stops the runtime from creating subs for them. (c) tp3Pct is an explicit GA-optimized share under the generic block (legacy made it implicit as the remainder); runtime normalizes tp1Pct+tp2Pct+tp3Pct to 100% automatically, so the sum-constraint problem from before doesn't apply. Both alias support and sum constraints are tracked in backlog.",
+
+  "regime": null,
+
+  "entries": {
+    "mode": "score",
+    "threshold": { "min": 1, "max": 3, "step": 1 },
+    "blocks": [
+      {
+        "block": "stochCross",
+        "version": 1,
+        "instanceId": "main",
+        "params": {
+          "stochLen":   { "min": 5, "max": 40, "step": 1 },
+          "stochSmth":  { "min": 1, "max": 8,  "step": 1 },
+          "longLevel":  { "value": 40 },
+          "shortLevel": { "value": 60 }
+        }
+      },
+      {
+        "block": "emaTrend",
+        "version": 1,
+        "instanceId": "main",
+        "params": {
+          "emaFast": { "min": 8,  "max": 40,  "step": 1 },
+          "emaSlow": { "min": 30, "max": 150, "step": 5 }
+        }
+      },
+      {
+        "block": "bbSqueezeBreakout",
+        "version": 1,
+        "instanceId": "main",
+        "params": {
+          "bbLen":         { "min": 10,  "max": 40,  "step": 1 },
+          "bbMult":        { "min": 1.0, "max": 3.5, "step": 0.5 },
+          "squeezePctile": { "value": 25 },
+          "lookbackBars":  { "value": 3 }
+        }
+      }
+    ]
+  },
+
+  "filters": { "mode": "all", "blocks": [] },
+
+  "exits": {
+    "hardStop": {
+      "block": "atrHardStop",
+      "version": 1,
+      "instanceId": "main",
+      "params": {
+        "atrLen":         { "min": 5,   "max": 30,  "step": 1 },
+        "atrSL":          { "min": 0.5, "max": 4.0, "step": 0.25 },
+        "emergencySlPct": { "min": 5,   "max": 25,  "step": 1 }
+      }
+    },
+    "target": {
+      "block": "atrScaleOutTarget",
+      "version": 1,
+      "instanceId": "main",
+      "params": {
+        "atrLen":  { "min": 5,   "max": 30,   "step": 1 },
+        "tp1Mult": { "min": 1.5, "max": 3.0,  "step": 0.25 },
+        "tp2Mult": { "min": 1.5, "max": 6.0,  "step": 0.25 },
+        "tp3Mult": { "min": 3.0, "max": 12.0, "step": 0.5 },
+        "tp1Pct":  { "min": 10,  "max": 50,   "step": 5 },
+        "tp2Pct":  { "min": 10,  "max": 50,   "step": 5 },
+        "tp3Pct":  { "min": 10,  "max": 50,   "step": 5 },
+
+        "tp4Mult": { "value": 0.5 },
+        "tp4Pct":  { "value": 0 },
+        "tp5Mult": { "value": 0.5 },
+        "tp5Pct":  { "value": 0 },
+        "tp6Mult": { "value": 0.5 },
+        "tp6Pct":  { "value": 0 }
+      }
+    },
+    "trail": {
+      "block": "structuralExit",
+      "version": 1,
+      "instanceId": "main",
+      "params": {
+        "stochLen":  { "min": 5, "max": 40, "step": 1 },
+        "stochSmth": { "min": 1, "max": 8,  "step": 1 },
+        "rsiLen":    { "min": 5, "max": 25, "step": 1 },
+        "maxBars":   { "min": 5, "max": 40, "step": 5 }
+      }
+    }
+  },
+
+  "sizing": {
+    "block": "atrRisk",
+    "version": 1,
+    "instanceId": "main",
+    "params": {
+      "riskPct":           { "min": 0.5, "max": 5.0, "step": 0.5 },
+      "useInitialCapital": { "value": 0 }
+    }
+  },
+
+  "constraints": [
+    { "lhs": "emaTrend.main.emaFast",
+      "op":  "<",
+      "rhs": "emaTrend.main.emaSlow",
+      "repair": "clamp-rhs" },
+
+    { "lhs": "atrScaleOutTarget.main.tp1Mult",
+      "op":  "<=",
+      "rhs": "atrScaleOutTarget.main.tp2Mult",
+      "repair": "clamp-rhs" },
+
+    { "lhs": "atrScaleOutTarget.main.tp2Mult",
+      "op":  "<=",
+      "rhs": "atrScaleOutTarget.main.tp3Mult",
+      "repair": "clamp-rhs" }
+  ],
+
+  "fitness": {
+    "weights": { "pf": 0.5, "dd": 0.3, "ret": 0.2 },
+    "caps":    { "pf": 4.0, "ret": 2.0 },
+    "gates":   { "minTradesPerWindow": 30, "worstRegimePfFloor": 1.0, "wfeMin": 0.5 }
+  },
+
+  "walkForward": { "nWindows": 5, "scheme": "anchored" }
+}

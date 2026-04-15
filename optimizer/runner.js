@@ -22,7 +22,22 @@
 import os from 'os';
 import { Worker } from 'worker_threads';
 import { loadCandles } from '../db/candles.js';
-import { PARAMS, geneKey, geneShort, randomParam, frozenLabel } from './params.js';
+import {
+  PARAMS as LEGACY_PARAMS,
+  geneKey as legacyGeneKey,
+  geneShort as legacyGeneShort,
+  randomParam as legacyRandomParam,
+  frozenLabel as legacyFrozenLabel,
+} from './params.js';
+import { validateSpec } from '../engine/spec.js';
+import { buildParamSpace } from './param-space.js';
+import {
+  computeDatasetId,
+  loadCache,
+  saveCache,
+  mergeCaches,
+} from './fitness-cache.js';
+import { walkForward } from './walk-forward.js';
 
 const MIN_TRADES = 10;
 const WORKER_URL = new URL('./island-worker.js', import.meta.url);
@@ -57,6 +72,11 @@ function getWorkerCap() {
  * @param {number} [config.spaceTravelCount=1] — individuals per space travel event
  * @param {Function} [config.onProgress]
  * @param {Function} [config.shouldCancel]
+ * @param {Object}   [config.spec]    — when present, runs in **spec mode**:
+ *                                       worker uses runSpec + computeFitness
+ *                                       + dynamic param-space derived from
+ *                                       this spec. Legacy `runStrategy` +
+ *                                       static `params.js` path is bypassed.
  * @returns {Object} results
  */
 export async function runOptimization(config) {
@@ -87,7 +107,33 @@ export async function runOptimization(config) {
     onProgress,
     shouldCancel,
     shouldHypermutate,  // consume-callback: returns true once to trigger
+    spec: rawSpec,
   } = config;
+
+  // ─── Spec-mode wiring ──────────────────────────────────────
+  // When the caller passes a spec, we validate it once on the main thread
+  // (cheap, deterministic — buildParamSpace is called again inside each
+  // worker, which is fine because validateSpec produces the same hash).
+  // The functions in paramSpace are NOT serializable across worker_threads,
+  // so we ship the raw spec object and let the worker rebuild paramSpace.
+  const specMode  = Boolean(rawSpec);
+  const spec      = specMode ? validateSpec(rawSpec)   : null;
+  const paramSpace = specMode ? buildParamSpace(spec) : null;
+  if (specMode && spec.htfs && spec.htfs.length > 0) {
+    throw new Error('runOptimization: spec.htfs not yet supported in runner integration (Phase 2.6 follow-up)');
+  }
+
+  // PARAMS-and-helpers shim. In spec mode they come from paramSpace; in
+  // legacy mode from the static params.js. Everything below this line is
+  // mode-agnostic.
+  const PARAMS       = specMode ? paramSpace.PARAMS       : LEGACY_PARAMS;
+  const randomParam  = specMode ? paramSpace.randomParam  : legacyRandomParam;
+  const geneShort    = specMode
+    ? (g) => Object.entries(g).slice(0, 6).map(([k, v]) => `${k}=${v}`).join(' ')
+    : legacyGeneShort;
+  const frozenLabel  = specMode
+    ? (fg) => Object.keys(fg).map(k => `${k}=${fg[k]}`).join(',')
+    : legacyFrozenLabel;
 
   // Logical island count — preserved for GA quality (migration topology,
   // population diversity). Physical worker threads are capped separately
@@ -146,17 +192,58 @@ export async function runOptimization(config) {
     throw new Error(`Insufficient data: ${len} bars for ${symbol} ${timeframe}min from ${startDate}`);
   }
 
-  console.log(`[runner] Flat sizing fitness: minTrades=${minTrades}, maxDD=${maxDrawdownPct * 100}%`);
-  status('config', `Flat sizing fitness: PF×√trades×(1-ddPenalty), min ${minTrades} trades, max DD ${maxDrawdownPct * 100}%`);
+  // Spec-mode persistent fitness cache: keyed by spec.hash + dataset
+  // identity. Preload entries from disk so a re-run of the same spec on
+  // the same data starts warm. Workers hydrate their in-memory caches
+  // from this preload and report back at the end so we can persist the
+  // merged result. `bars` and `lastTs` go into the dataset id so adding
+  // candles to the DB invalidates the cache automatically.
+  let datasetId = null;
+  let cachePreload = null;
+  let cachePath = null;
+  if (specMode) {
+    datasetId = computeDatasetId({
+      symbol, timeframe, startDate, endDate: endDate || null,
+      bars: len, lastTs: Number(candles.ts[len - 1]),
+    });
+    const loaded = await loadCache({ specHash: spec.hash, datasetId });
+    cachePreload = loaded.entries;
+    cachePath = loaded.path;
+    console.log(`[runner] Fitness cache: ${loaded.count} entries preloaded from ${cachePath}`);
+  }
 
-  // 2. Create SharedArrayBuffer — zero-copy sharing with workers
-  //    Layout: [open|high|low|close|volume] × len Float64s each
-  const sab = new SharedArrayBuffer(len * 5 * 8);
-  new Float64Array(sab, len * 0 * 8, len).set(candles.open);
-  new Float64Array(sab, len * 1 * 8, len).set(candles.high);
-  new Float64Array(sab, len * 2 * 8, len).set(candles.low);
-  new Float64Array(sab, len * 3 * 8, len).set(candles.close);
-  new Float64Array(sab, len * 4 * 8, len).set(candles.volume);
+  if (specMode) {
+    console.log(`[runner] Spec mode: spec.hash=${spec.hash?.slice(0, 12)}, datasetId=${datasetId.slice(0, 12)}, ${PARAMS.length} genes from spec`);
+    status('config', `Spec mode (computeFitness gates: ${JSON.stringify(spec.fitness?.gates ?? {})})`);
+  } else {
+    console.log(`[runner] Flat sizing fitness: minTrades=${minTrades}, maxDD=${maxDrawdownPct * 100}%`);
+    status('config', `Flat sizing fitness: PF×√trades×(1-ddPenalty), min ${minTrades} trades, max DD ${maxDrawdownPct * 100}%`);
+  }
+
+  // 2. Create SharedArrayBuffer — zero-copy sharing with workers.
+  //
+  //    Legacy layout: [open|high|low|close|volume]            (5 cols × len Float64s)
+  //    Spec layout:   [ts|open|high|low|close|volume]         (6 cols × len Float64s)
+  //
+  //    The extra `ts` column in spec mode is needed because runSpec uses
+  //    bundle.base.ts for regime detection and period-year reporting; the
+  //    legacy runStrategy never reads ts, so we don't pay for it there.
+  const cols = specMode ? 6 : 5;
+  const sab = new SharedArrayBuffer(len * cols * 8);
+  if (specMode) {
+    new Float64Array(sab, len * 0 * 8, len).set(candles.ts);
+    new Float64Array(sab, len * 1 * 8, len).set(candles.open);
+    new Float64Array(sab, len * 2 * 8, len).set(candles.high);
+    new Float64Array(sab, len * 3 * 8, len).set(candles.low);
+    new Float64Array(sab, len * 4 * 8, len).set(candles.close);
+    new Float64Array(sab, len * 5 * 8, len).set(candles.volume);
+  } else {
+    new Float64Array(sab, len * 0 * 8, len).set(candles.open);
+    new Float64Array(sab, len * 1 * 8, len).set(candles.high);
+    new Float64Array(sab, len * 2 * 8, len).set(candles.low);
+    new Float64Array(sab, len * 3 * 8, len).set(candles.close);
+    new Float64Array(sab, len * 4 * 8, len).set(candles.volume);
+  }
 
   const actualStartTs = candles.ts[tradingStartBar];
   const actualEndTs = candles.ts[len - 1];
@@ -266,12 +353,24 @@ export async function runOptimization(config) {
       workerData: {
         candleBuffer: sab,
         candleLength: len,
+        candleCols: cols,
         tradingStartBar,
         populationSize,
         islands: myIslands,
         minTrades,
         maxDrawdownPct,
         autoHyperEnabled,
+        // Spec mode payload (null in legacy mode). The worker rebuilds
+        // paramSpace itself — functions don't survive structured-clone.
+        specMode,
+        spec: specMode ? rawSpec : null,
+        periodYears: specMode ? periodYears : null,
+        // Persistent-cache preload (spec mode only). Plain object of
+        // geneKey → { fitness, metrics }. Workers hydrate their in-mem
+        // cache from this on startup. Each worker gets the SAME preload —
+        // they may evaluate disjoint genes during the run, but on cache-hit
+        // the answer is identical regardless of which worker serves it.
+        fitnessCachePreload: specMode ? cachePreload : null,
       },
     });
 
@@ -705,6 +804,32 @@ export async function runOptimization(config) {
 
   const finalResults = await Promise.all(resultPromises);
 
+  // Persist the merged fitness cache (spec mode only). We do this BEFORE
+  // worker termination is awaited so a slow disk doesn't hold up release;
+  // the writes are atomic (write-tmp + rename) so a crash mid-write can't
+  // corrupt the file. Cancelled runs still persist what they computed —
+  // partial results are useful for the next run.
+  let cacheSaveInfo = null;
+  if (specMode) {
+    const snapshots = finalResults
+      .map(r => r.cacheSnapshot)
+      .filter(s => s && typeof s === 'object');
+    const merged = mergeCaches(snapshots);
+    try {
+      cacheSaveInfo = await saveCache({
+        specHash: spec.hash,
+        datasetId,
+        entries: merged,
+      });
+      console.log(`[runner] Fitness cache saved: ${cacheSaveInfo.count} entries → ${cacheSaveInfo.path}` +
+        (cacheSaveInfo.dropped > 0 ? ` (${cacheSaveInfo.dropped} eliminated/over-cap dropped)` : ''));
+    } catch (err) {
+      // Cache persistence is best-effort. A failed save degrades the next
+      // run's startup latency but doesn't invalidate this run's results.
+      console.warn(`[runner] Fitness cache save failed: ${err.message}`);
+    }
+  }
+
   if (cancelSent && onProgress) {
     onProgress({
       gen: Math.max(...islandGen),
@@ -747,6 +872,58 @@ export async function runOptimization(config) {
   const totalEvaluations = finalResults.reduce((sum, r) => sum + r.evalCount, 0);
   const totalCacheSize = finalResults.reduce((sum, r) => sum + r.cacheSize, 0);
 
+  // ─── Phase 4.1b: post-GA walk-forward on the winner ─────────
+  // Quantify how the shipped gene generalizes across time by freezing
+  // the full-data winner and re-evaluating it on nWindows IS/OOS slices
+  // (see optimizer/walk-forward.js for the design rationale). The
+  // `optimize` callback returns the winner for every window — the WF
+  // harness then runs `runSpec` on each IS + OOS slice to produce the
+  // per-window PFs and aggregate WFE.
+  //
+  // Spec mode only: legacy mode doesn't have a validated spec/paramSpace
+  // to hand to walkForward, and the UI surfaces for the WF report are
+  // going to be spec-native anyway (Phase 4.5 results view).
+  //
+  // Best-effort: a failed WF step (e.g. insufficient bars for nWindows)
+  // must not fail the whole run. We log a warning and return wfReport=null.
+  //
+  // Cancelled runs skip WF: the user asked us to stop, finishing with a
+  // ~5×single-backtest coda would be hostile.
+  let wfReport = null;
+  if (specMode && !cancelSent && finalBest.gene) {
+    try {
+      const wfStart = Date.now();
+      const bundle = {
+        symbol,
+        baseTfMin: timeframe,
+        baseTfMs:  timeframe * 60_000,
+        base:      candles,
+        htfs:      {},
+        tradingStartBar,
+        periodYears,
+        n:         len,
+        warmup:    tradingStartBar,
+      };
+      wfReport = await walkForward({
+        spec,
+        paramSpace,
+        bundle,
+        optimize: () => finalBest.gene,
+        scheme:   spec.walkForward?.scheme   ?? 'anchored',
+        nWindows: spec.walkForward?.nWindows ?? 5,
+      });
+      console.log(
+        `[runner] Walk-forward: ${wfReport.validWindows}/${wfReport.nWindows} valid windows, ` +
+        `meanIsPf=${wfReport.meanIsPf.toFixed(3)}, meanOosPf=${wfReport.meanOosPf.toFixed(3)}, ` +
+        `WFE=${Number.isFinite(wfReport.wfe) ? wfReport.wfe.toFixed(3) : 'NaN'} ` +
+        `(${((Date.now() - wfStart) / 1000).toFixed(1)}s)`
+      );
+    } catch (err) {
+      console.warn(`[runner] Walk-forward skipped: ${err.message}`);
+      wfReport = null;
+    }
+  }
+
   return {
     symbol,
     timeframe,
@@ -765,5 +942,18 @@ export async function runOptimization(config) {
     candleBars: len,
     config: { populationSize, generations, mutationRate, numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology, spaceTravelInterval, spaceTravelCount, knockoutMode, knockoutValueMode },
     planetFrozen,
+    // Spec-mode persistent-cache info (null in legacy mode):
+    //   { datasetId, preloadCount, savedCount, droppedCount, path }
+    fitnessCache: specMode ? {
+      datasetId,
+      preloadCount: cachePreload ? Object.keys(cachePreload).length : 0,
+      savedCount:   cacheSaveInfo?.count   ?? 0,
+      droppedCount: cacheSaveInfo?.dropped ?? 0,
+      path:         cacheSaveInfo?.path ?? cachePath,
+    } : null,
+    // Spec-mode walk-forward report on the winning gene (null in legacy
+    // mode, null if the WF step failed, null for cancelled runs).
+    // Shape: WalkForwardReport — see optimizer/walk-forward.js.
+    wfReport,
   };
 }
