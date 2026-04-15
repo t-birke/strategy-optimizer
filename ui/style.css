@@ -225,6 +225,9 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
   z-index: 100;
   align-items: center;
   justify-content: center;
+  /* 10% vertical breathing room so the modal never hugs the viewport edges.
+     When content is tall the modal itself scrolls internally (see .modal-body). */
+  padding: 10vh 20px;
 }
 
 .modal-overlay.active { display: flex; }
@@ -234,8 +237,15 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
   border: 1px solid #30363d;
   border-radius: 12px;
   padding: 24px;
-  min-width: 520px;
-  max-width: 580px;
+  min-width: 640px;
+  max-width: 780px;
+  width: 100%;
+  /* Fill the overlay's 80vh budget (100vh - 2*10vh padding), then defer
+     overflow to .modal-body so header/footer stay visible. */
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .modal h2 {
@@ -244,6 +254,19 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
   color: #e6edf3;
   text-transform: none;
   letter-spacing: 0;
+  flex-shrink: 0;
+}
+
+/* Everything between the h2 header and .actions footer lives here and
+   scrolls when the content exceeds the modal's height budget. Flex:1 lets
+   it take the remaining space after header/footer lay out. */
+.modal-body {
+  flex: 1;
+  overflow-y: auto;
+  /* Leave a little room so the scrollbar doesn't visually collide with
+     inputs on the right edge. */
+  padding-right: 8px;
+  margin-right: -8px;
 }
 
 .modal .actions {
@@ -251,7 +274,49 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
   justify-content: flex-end;
   gap: 8px;
   margin-top: 20px;
+  flex-shrink: 0;
+  /* Subtle top border so the sticky footer reads as distinct from the
+     scrollable body when content is cut off mid-field. */
+  padding-top: 16px;
+  border-top: 1px solid #21262d;
 }
+
+/* Tabs inside the modal — used by the New Run modal to pack setup params
+   into Simulation / Quality / Islands / Planets groups so the overall
+   modal height stays manageable. */
+.modal .tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid #30363d;
+  margin: 16px 0 16px;
+  flex-shrink: 0;
+}
+
+.modal .tab-btn {
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 8px 14px;
+  color: #8b949e;
+  font-size: 13px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.modal .tab-btn:hover {
+  background: transparent;
+  color: #e6edf3;
+  border-color: transparent;
+}
+
+.modal .tab-btn.active {
+  color: #58a6ff;
+  border-bottom-color: #58a6ff;
+}
+
+.modal .tab-panel { display: none; }
+.modal .tab-panel.active { display: block; }
 
 /* Checkbox group */
 .checkbox-group {

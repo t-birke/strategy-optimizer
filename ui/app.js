@@ -1092,6 +1092,24 @@ document.getElementById('modal-spec').addEventListener('change', (e) => {
   $desc.textContent = s?.description || '';
 });
 
+// Tab wiring for the New Run modal. Clicking a .tab-btn activates it and
+// the matching .tab-panel (data-tab on the button === data-panel on the
+// panel). All other panels are hidden via CSS (.tab-panel without .active).
+// No state persists between opens — the modal always lands on "Simulation
+// control" because that's the tab marked .active in index.html.
+document.querySelectorAll('#modal-new-run .tab-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const target = btn.dataset.tab;
+    const scope = document.getElementById('modal-new-run');
+    scope.querySelectorAll('.tab-btn').forEach((b) => {
+      b.classList.toggle('active', b.dataset.tab === target);
+    });
+    scope.querySelectorAll('.tab-panel').forEach((p) => {
+      p.classList.toggle('active', p.dataset.panel === target);
+    });
+  });
+});
+
 document.getElementById('btn-new-run').addEventListener('click', async () => {
   const res = await fetch('/api/symbols');
   const data = await res.json();
@@ -1110,6 +1128,23 @@ document.getElementById('btn-new-run').addEventListener('click', async () => {
   // Refresh the spec picker every time the modal opens so newly-saved
   // specs show up without a page reload.
   await loadSpecsIntoModal();
+
+  // Reset tab state to "Simulation control" on every open — otherwise the
+  // last-clicked tab from a prior open sticks around, which is confusing
+  // when the user expects a consistent starting view.
+  {
+    const scope = document.getElementById('modal-new-run');
+    scope.querySelectorAll('.tab-btn').forEach((b) => {
+      b.classList.toggle('active', b.dataset.tab === 'sim');
+    });
+    scope.querySelectorAll('.tab-panel').forEach((p) => {
+      p.classList.toggle('active', p.dataset.panel === 'sim');
+    });
+    // Also reset .modal-body scroll so a tall prior session doesn't leave
+    // us halfway down the form.
+    const body = scope.querySelector('.modal-body');
+    if (body) body.scrollTop = 0;
+  }
 
   $modal.classList.add('active');
   requestAnimationFrame(() => {

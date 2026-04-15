@@ -99,6 +99,61 @@ async function main() {
     const popIdx    = slice.indexOf('id="modal-pop"');
     assertTrue('picker appears before Population input',
       pickerIdx > -1 && popIdx > -1 && pickerIdx < popIdx);
+
+    // Modal-body wrapper must wrap the scrollable content so header +
+    // actions stay sticky. Without it the modal grows past the viewport
+    // and the Start button becomes unreachable.
+    assertTrue('.modal-body wrapper present inside modal',
+      contains(slice, 'class="modal-body"'));
+
+    // Tab scaffolding: four tab buttons with the expected data-tab keys
+    // and one matching tab-panel for each. Order matters — "sim" is the
+    // default-open tab and must be first.
+    const TABS = ['sim', 'quality', 'islands', 'planets'];
+    for (const t of TABS) {
+      assertTrue(`tab button data-tab="${t}" declared`,
+        new RegExp(`class="tab-btn[^"]*"[^>]*data-tab="${t}"`).test(slice)
+        || new RegExp(`data-tab="${t}"[^>]*class="tab-btn`).test(slice));
+      assertTrue(`tab panel data-panel="${t}" declared`,
+        new RegExp(`class="tab-panel[^"]*"[^>]*data-panel="${t}"`).test(slice)
+        || new RegExp(`data-panel="${t}"[^>]*class="tab-panel`).test(slice));
+    }
+    // "sim" is the default-active tab (no state persists between opens).
+    assertTrue('sim tab is active by default',
+      /class="tab-btn active"[^>]*data-tab="sim"/.test(slice));
+    assertTrue('sim panel is active by default',
+      /class="tab-panel active"[^>]*data-panel="sim"/.test(slice));
+
+    // Field-to-tab placement: each knob must live inside its assigned
+    // tab's panel. Verified by slicing the source from the panel marker
+    // to the next `data-panel=` marker and checking the field id is in
+    // that slice.
+    function sliceTabPanel(key) {
+      const start = slice.indexOf(`data-panel="${key}"`);
+      if (start < 0) return '';
+      const next = slice.indexOf('data-panel=', start + 1);
+      return next < 0 ? slice.slice(start) : slice.slice(start, next);
+    }
+    const simPanel    = sliceTabPanel('sim');
+    const qualPanel   = sliceTabPanel('quality');
+    const islPanel    = sliceTabPanel('islands');
+    const planetPanel = sliceTabPanel('planets');
+
+    assertTrue('Simulation tab contains Population', contains(simPanel, 'id="modal-pop"'));
+    assertTrue('Simulation tab contains Generations', contains(simPanel, 'id="modal-gen"'));
+    assertTrue('Simulation tab contains Gene Knockouts mode', contains(simPanel, 'id="modal-knockout-mode"'));
+
+    assertTrue('Quality tab contains Min Trades', contains(qualPanel, 'id="modal-min-trades"'));
+    assertTrue('Quality tab contains Max DD', contains(qualPanel, 'id="modal-max-dd"'));
+
+    assertTrue('Islands tab contains Islands count', contains(islPanel, 'id="modal-islands"'));
+    assertTrue('Islands tab contains Migration Interval', contains(islPanel, 'id="modal-mig-interval"'));
+    assertTrue('Islands tab contains Migration Count', contains(islPanel, 'id="modal-mig-count"'));
+    assertTrue('Islands tab contains Topology', contains(islPanel, 'id="modal-topology"'));
+
+    assertTrue('Planets tab contains Planets count', contains(planetPanel, 'id="modal-planets"'));
+    assertTrue('Planets tab contains Space Travel Every', contains(planetPanel, 'id="modal-space-interval"'));
+    assertTrue('Planets tab contains Space Travel Count', contains(planetPanel, 'id="modal-space-count"'));
   }
 
   // ── 2. JS wiring in app.js ───────────────────────────────────
