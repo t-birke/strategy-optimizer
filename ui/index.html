@@ -262,6 +262,19 @@
           <div class="tl-hint" id="tl-hint">Select a symbol to see available data range</div>
         </div>
       </div>
+      <!-- Phase 4.3b: spec picker. "None (legacy mode)" sends a run with no
+           `spec` field, matching pre-4.1 behavior. Any other option sends
+           `spec: <filename>` and the server resolves it under strategies/. -->
+      <div class="form-row" style="flex-direction:column;align-items:stretch">
+        <div style="display:flex;align-items:center;gap:12px">
+          <label style="margin:0">Strategy spec</label>
+          <select id="modal-spec" style="flex:1;min-width:200px">
+            <option value="">None (legacy mode)</option>
+          </select>
+        </div>
+        <div id="modal-spec-desc" style="font-size:12px;color:#8b949e;margin-top:4px;min-height:14px"></div>
+        <div id="modal-spec-warn" style="font-size:12px;color:#f85149;margin-top:4px;display:none"></div>
+      </div>
       <div class="form-row">
         <label>Population</label>
         <input type="number" id="modal-pop" value="80" min="10" max="200" style="width:80px">

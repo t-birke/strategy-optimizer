@@ -572,6 +572,34 @@ touches the queue or DuckDB; both are safe to call any time.
   `atrHardStop` has `exitSlot=hardStop`; `atrRisk` has `sizingRequirements=['stopDistance']`.
 - Sort order is non-regressing across the block list.
 
+### 4.3b Spec picker in the New Run modal — ✅ done
+Users can now pick an existing spec from a dropdown in the New Run modal
+instead of hand-editing JSON. Minimum-viable UI for spec-mode runs.
+
+- **UI** (`ui/index.html`): new `<select id="modal-spec">` between the
+  timeline widget and the GA-param fields. Default option: `"None (legacy
+  mode)"` with empty value. Below the select: a muted description line
+  (`#modal-spec-desc`) and a red warning line (`#modal-spec-warn`,
+  hidden until needed).
+- **Wiring** (`ui/app.js`):
+  - `loadSpecsIntoModal()` fetches `/api/specs` every time the modal opens
+    (so newly-saved specs appear without a page reload) and populates one
+    `<option>` per spec. `specsByFilename` caches the response so the
+    `change` handler can render the description without re-fetching.
+  - `malformed[]` surfaces as a red warning listing the filenames.
+  - On Start, `body.spec = filename` is only added when non-empty —
+    legacy-mode POSTs stay byte-identical to pre-4.3b.
+- **Graceful degradation**: fetch failure logs to console and leaves
+  the picker with only "None" — the modal still works.
+
+**Verification** — `scripts/ui-spec-picker-check.js` (22 checks ✓):
+- DOM: picker + description + warning elements present in the modal,
+  picker sits BEFORE the Population field (discoverable).
+- JS: `loadSpecsIntoModal` is defined, fetches `/api/specs`, is awaited
+  by the `btn-new-run` handler; Start handler conditionally adds
+  `body.spec`; change handler renders descriptions via `specsByFilename`.
+- Contract: `GET /api/specs` still returns the shape the picker reads.
+
 ### 4.4 UI — fitness config panel
 - Weight sliders for PF / DD / return.
 - Cap inputs.

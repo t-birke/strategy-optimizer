@@ -1039,6 +1039,59 @@ document.getElementById('modal-symbols').addEventListener('change', () => {
   initTimeline();
 });
 
+// Phase 4.3b: spec picker state. Keyed by filename so the POST body
+// can include the exact server-resolvable string. `specs[filename]`
+// holds { name, description, sizeBytes, mtime } for the description
+// line under the picker.
+let specsByFilename = {};
+
+/**
+ * Populate the `#modal-spec` <select> from GET /api/specs.
+ * Graceful degradation: on error, keep only the "None (legacy mode)"
+ * option and log to console — a spec-less run is always valid.
+ * `malformed[]` entries become a small red warning under the picker.
+ */
+async function loadSpecsIntoModal() {
+  const $select = document.getElementById('modal-spec');
+  const $warn = document.getElementById('modal-spec-warn');
+  const $desc = document.getElementById('modal-spec-desc');
+  specsByFilename = {};
+  // Preserve the None option; wipe any previously-loaded spec options.
+  $select.innerHTML = '<option value="">None (legacy mode)</option>';
+  $warn.style.display = 'none';
+  $warn.textContent = '';
+  $desc.textContent = '';
+  try {
+    const r = await fetch('/api/specs');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    for (const s of data.specs || []) {
+      specsByFilename[s.filename] = s;
+      const opt = document.createElement('option');
+      opt.value = s.filename;
+      opt.textContent = s.name;
+      $select.appendChild(opt);
+    }
+    if (Array.isArray(data.malformed) && data.malformed.length > 0) {
+      $warn.textContent =
+        `${data.malformed.length} spec file(s) failed to parse: ` +
+        data.malformed.map(m => m.filename).join(', ');
+      $warn.style.display = '';
+    }
+  } catch (err) {
+    console.warn('loadSpecsIntoModal failed:', err.message);
+    // Leave the picker with only "None" — the modal still works.
+  }
+}
+
+// Show the picked spec's description beneath the picker. Re-renders on
+// change. Empty string when "None" is selected.
+document.getElementById('modal-spec').addEventListener('change', (e) => {
+  const $desc = document.getElementById('modal-spec-desc');
+  const s = specsByFilename[e.target.value];
+  $desc.textContent = s?.description || '';
+});
+
 document.getElementById('btn-new-run').addEventListener('click', async () => {
   const res = await fetch('/api/symbols');
   const data = await res.json();
@@ -1053,6 +1106,10 @@ document.getElementById('btn-new-run').addEventListener('click', async () => {
   container.innerHTML = data.symbols.map(s =>
     `<label><input type="checkbox" value="${s.symbol}" checked>${s.symbol}</label>`
   ).join('');
+
+  // Refresh the spec picker every time the modal opens so newly-saved
+  // specs show up without a page reload.
+  await loadSpecsIntoModal();
 
   $modal.classList.add('active');
   requestAnimationFrame(() => {
@@ -1097,6 +1154,10 @@ document.getElementById('modal-start').addEventListener('click', async () => {
   const maxDrawdownPct = parseInt(document.getElementById('modal-max-dd').value) || 50;
   const knockoutMode = document.getElementById('modal-knockout-mode')?.value || 'none';
   const knockoutValueMode = document.getElementById('modal-knockout-value')?.value || 'midpoint';
+  // Phase 4.3b: spec filename (under strategies/) or empty string for legacy mode.
+  // Server-side POST /api/runs treats null/undefined/absent identically, but we
+  // omit the key entirely when empty to keep legacy-mode POSTs byte-identical.
+  const specFilename = document.getElementById('modal-spec')?.value || '';
 
   if (symbols.length === 0 || intervals.length === 0) {
     alert('Select at least one symbol and one interval.');
@@ -1114,10 +1175,20 @@ document.getElementById('modal-start').addEventListener('click', async () => {
   $modal.classList.remove('active');
 
   try {
+    const body = {
+      symbols, intervals, startDate, endDate,
+      populationSize, generations,
+      numIslands, numPlanets,
+      migrationInterval, migrationCount, migrationTopology,
+      spaceTravelInterval, spaceTravelCount,
+      minTrades, maxDrawdownPct,
+      knockoutMode, knockoutValueMode,
+    };
+    if (specFilename) body.spec = specFilename;
     const res = await fetch('/api/runs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbols, intervals, startDate, endDate, populationSize, generations, numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology, spaceTravelInterval, spaceTravelCount, minTrades, maxDrawdownPct, knockoutMode, knockoutValueMode }),
+      body: JSON.stringify(body),
     });
     const data = await res.json();
     console.log('Queued', data.totalRuns, 'runs:', data.runIds);
