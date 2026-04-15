@@ -23,6 +23,8 @@
 
 import express from 'express';
 import { createServer } from 'node:http';
+import { unlink, stat, readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import routes from '../api/routes.js';
 
 let failCount = 0;
@@ -66,6 +68,74 @@ async function get(port, path) {
   let body;
   try { body = JSON.parse(text); } catch { body = text; }
   return { status: r.status, body };
+}
+
+async function post(port, path, json) {
+  const r = await fetch(`http://127.0.0.1:${port}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(json),
+  });
+  const text = await r.text();
+  let body;
+  try { body = JSON.parse(text); } catch { body = text; }
+  return { status: r.status, body };
+}
+
+/**
+ * A minimal-but-valid spec that passes validateSpec against the shipping
+ * block registry. Used by the POST /api/specs suite to build happy-path
+ * and edge-case payloads without duplicating 30 lines of JSON in every test.
+ * Returns a fresh object each call so tests can mutate freely.
+ */
+function minimalValidSpec(name) {
+  return {
+    name,
+    description: 'spec-api-check POST smoke',
+    regime: null,
+    entries: {
+      mode: 'all',
+      blocks: [
+        {
+          block: 'stochCross',
+          version: 1,
+          instanceId: 'main',
+          params: {
+            stochLen:   { min: 5, max: 40, step: 1 },
+            stochSmth:  { min: 1, max: 8,  step: 1 },
+            longLevel:  { value: 40 },
+            shortLevel: { value: 60 },
+          },
+        },
+      ],
+    },
+    filters: { mode: 'all', blocks: [] },
+    exits: {
+      hardStop: {
+        block: 'atrHardStop',
+        version: 1,
+        instanceId: 'main',
+        params: {
+          atrLen:         { min: 5,   max: 30,  step: 1 },
+          atrSL:          { min: 0.5, max: 4.0, step: 0.25 },
+          emergencySlPct: { min: 5,   max: 25,  step: 1 },
+        },
+      },
+    },
+    sizing: {
+      block: 'pctOfEquity',
+      version: 1,
+      instanceId: 'main',
+      params: { pct: { min: 1, max: 100, step: 1 } },
+    },
+    constraints: [],
+    fitness: {
+      weights: { pf: 0.5, dd: 0.3, ret: 0.2 },
+      caps:    { pf: 4.0, ret: 2.0 },
+      gates:   { minTradesPerWindow: 30, worstRegimePfFloor: 1.0, wfeMin: 0.5 },
+    },
+    walkForward: { nWindows: 5, scheme: 'anchored' },
+  };
 }
 
 async function main() {
@@ -223,6 +293,145 @@ async function main() {
         const k = KIND_ORDER[b.kind];
         assertTrue(`sort: ${b.id} kind=${b.kind} non-regressing`, k >= lastKey);
         lastKey = k;
+      }
+    }
+
+    // ── 3. POST /api/specs ─────────────────────────────────────
+    // Covers Phase 4.3e: save-to-disk endpoint. Every test uses a unique
+    // "test-only" filename under strategies/ and cleans up at the end so
+    // we never leak fixtures into the shipped spec directory.
+    //
+    // Filename convention: `20991231-999-post-spec-test-<slug>.json`. The
+    // leading 20991231 places these in the far future, so if cleanup ever
+    // fails the orphans are easy to spot and rm manually.
+    console.log('\n[3] POST /api/specs');
+    const testNames = [];
+    try {
+      // 3a. Happy path — fresh name, returns 201, file is written.
+      {
+        const name = '20991231-999-post-spec-test-happy';
+        testNames.push(name);
+        const r = await post(app.port, '/api/specs', minimalValidSpec(name));
+        assertEq('happy: status 201', r.status, 201);
+        assertEq('happy: ok=true',     r.body?.ok, true);
+        assertEq('happy: filename',    r.body?.filename, `${name}.json`);
+        assertEq('happy: name',        r.body?.name, name);
+        assertEq('happy: overwritten=false', r.body?.overwritten, false);
+
+        const target = resolve(process.cwd(), 'strategies', `${name}.json`);
+        let fileStat = null;
+        try { fileStat = await stat(target); } catch { /* miss */ }
+        assertTrue('happy: file exists on disk', fileStat != null);
+        if (fileStat) {
+          assertTrue('happy: file is non-empty', fileStat.size > 0);
+          const text = await readFile(target, 'utf8');
+          let parsed = null;
+          try { parsed = JSON.parse(text); } catch { /* bad */ }
+          assertTrue('happy: file is valid JSON', parsed != null);
+          if (parsed) {
+            assertEq('happy: persisted name matches', parsed.name, name);
+            assertTrue('happy: persisted has entries.blocks',
+              Array.isArray(parsed.entries?.blocks));
+            assertTrue('happy: hash field is NOT persisted',
+              !('hash' in parsed), `found hash=${parsed.hash}`);
+          }
+        }
+      }
+
+      // 3b. Non-object body — 400.
+      {
+        const r = await post(app.port, '/api/specs', []);
+        assertEq('non-object: status 400', r.status, 400);
+        assertEq('non-object: ok=false',   r.body?.ok, false);
+        assertTrue('non-object: error mentions JSON object',
+          typeof r.body?.error === 'string' && /object/i.test(r.body.error));
+      }
+
+      // 3c. Invalid name — validateSpec rejects with 400.
+      {
+        const bad = minimalValidSpec('not a valid name!');
+        const r = await post(app.port, '/api/specs', bad);
+        assertEq('bad-name: status 400', r.status, 400);
+        assertEq('bad-name: ok=false',   r.body?.ok, false);
+        assertTrue('bad-name: error mentions name',
+          typeof r.body?.error === 'string' && /name/i.test(r.body.error),
+          `error=${r.body?.error}`);
+      }
+
+      // 3d. Out-of-range param — validateSpec rejects (min >= max).
+      {
+        const bad = minimalValidSpec('20991231-999-post-spec-test-badparam');
+        // Flip stochLen so min > max — validateSpec must catch this.
+        bad.entries.blocks[0].params.stochLen = { min: 40, max: 5, step: 1 };
+        const r = await post(app.port, '/api/specs', bad);
+        assertEq('bad-param: status 400', r.status, 400);
+        assertEq('bad-param: ok=false',   r.body?.ok, false);
+        assertTrue('bad-param: error surfaces the violation',
+          typeof r.body?.error === 'string' && r.body.error.length > 0);
+
+        // And no file should have been written.
+        const target = resolve(process.cwd(), 'strategies',
+          '20991231-999-post-spec-test-badparam.json');
+        let leaked = false;
+        try { await stat(target); leaked = true; } catch { /* good */ }
+        assertTrue('bad-param: no file leaked to disk', !leaked);
+      }
+
+      // 3e. Duplicate filename without ?overwrite — 409.
+      {
+        const name = '20991231-999-post-spec-test-happy'; // already written in 3a
+        const r = await post(app.port, '/api/specs', minimalValidSpec(name));
+        assertEq('dup: status 409', r.status, 409);
+        assertEq('dup: ok=false',   r.body?.ok, false);
+        assertEq('dup: filename echoed', r.body?.filename, `${name}.json`);
+        assertTrue('dup: error mentions overwrite',
+          typeof r.body?.error === 'string' && /overwrite/i.test(r.body.error));
+      }
+
+      // 3f. Duplicate filename WITH ?overwrite=1 — 200, file replaced.
+      {
+        const name = '20991231-999-post-spec-test-happy'; // still from 3a
+        const spec = minimalValidSpec(name);
+        // Tweak description so we can tell the file actually got rewritten.
+        spec.description = 'spec-api-check overwrite marker';
+        const r = await post(app.port, '/api/specs?overwrite=1', spec);
+        assertEq('overwrite: status 200', r.status, 200);
+        assertEq('overwrite: ok=true',    r.body?.ok, true);
+        assertEq('overwrite: overwritten=true', r.body?.overwritten, true);
+        assertEq('overwrite: filename',   r.body?.filename, `${name}.json`);
+
+        // Confirm the on-disk file picked up the new description.
+        const target = resolve(process.cwd(), 'strategies', `${name}.json`);
+        const text = await readFile(target, 'utf8');
+        let parsed = null;
+        try { parsed = JSON.parse(text); } catch { /* bad */ }
+        assertTrue('overwrite: file still parses', parsed != null);
+        if (parsed) {
+          assertEq('overwrite: description was replaced on disk',
+            parsed.description, 'spec-api-check overwrite marker');
+        }
+      }
+
+      // 3g. No .tmp files should be left behind in strategies/ after the run.
+      {
+        const dir = resolve(process.cwd(), 'strategies');
+        const { readdir } = await import('node:fs/promises');
+        const entries = await readdir(dir);
+        const tmpLeaks = entries.filter(f => f.endsWith('.tmp'));
+        assertTrue('no .tmp files left in strategies/',
+          tmpLeaks.length === 0,
+          tmpLeaks.length ? `found: ${tmpLeaks.join(', ')}` : '');
+      }
+    } finally {
+      // Cleanup — unlink every test file we created. Swallow ENOENT so
+      // a half-failed run doesn't crash cleanup.
+      for (const name of testNames) {
+        const target = resolve(process.cwd(), 'strategies', `${name}.json`);
+        try { await unlink(target); } catch (err) {
+          if (err.code !== 'ENOENT') {
+            console.log(`  (cleanup) failed to unlink ${target}: ${err.message}`);
+          }
+        }
       }
     }
   } finally {

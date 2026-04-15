@@ -2614,6 +2614,73 @@ document.getElementById('spec-copy-json').addEventListener('click', async () => 
   setTimeout(() => { status.textContent = ''; }, 2000);
 });
 
+// ── Save spec to strategies/ (Phase 4.3e) ─────────────────
+//
+// POSTs the currently-previewed spec to /api/specs. The server re-runs
+// the authoritative validator — the client-side clamps we do in the
+// param-narrowing controls are advisory; the backend is the gate.
+//
+// Three interesting branches:
+//   400 — validation failed. Server returns a newline-joined bullet
+//         list; we render it verbatim so the user sees every issue.
+//   409 — a file with that name already exists. Show a confirm()
+//         prompt; on yes, re-POST with ?overwrite=1.
+//   200/201 — happy path. Show "Saved ✓ as <filename>" and leave the
+//         form alone so the user can keep iterating.
+async function saveSpec({ overwrite = false } = {}) {
+  const status = document.getElementById('spec-save-status');
+  const setStatus = (text, color) => {
+    status.textContent = text;
+    status.style.color = color;
+  };
+  setStatus('Saving…', '#8b949e');
+
+  // Always rebuild from the UI — don't trust the preview pre text, which
+  // could be stale if the user somehow typed between build and save.
+  const spec = buildSpecFromUi();
+  const url = '/api/specs' + (overwrite ? '?overwrite=1' : '');
+  let res, body;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(spec),
+    });
+    body = await res.json().catch(() => ({ error: 'non-JSON response' }));
+  } catch (err) {
+    setStatus(`Network error: ${err.message}`, '#f85149');
+    return;
+  }
+
+  if (res.ok && body.ok) {
+    const verb = body.overwritten ? 'Overwrote' : 'Saved';
+    setStatus(`✓ ${verb} ${body.filename}`, '#3fb950');
+    return;
+  }
+
+  if (res.status === 409 && body.filename) {
+    // Duplicate — ask before clobbering the user's existing file.
+    const go = confirm(
+      `A spec named "${body.filename}" already exists.\n\nOverwrite it?`
+    );
+    if (!go) {
+      setStatus('Save cancelled — existing file kept.', '#8b949e');
+      return;
+    }
+    return saveSpec({ overwrite: true });
+  }
+
+  if (res.status === 400) {
+    // validateSpec's message is newline-joined; rendering in a
+    // white-space:pre-wrap block preserves the bullet layout.
+    setStatus(body.error || 'Validation failed', '#f85149');
+    return;
+  }
+
+  setStatus(body.error || `Save failed (HTTP ${res.status})`, '#f85149');
+}
+document.getElementById('spec-save').addEventListener('click', () => saveSpec());
+
 // ─── Init ───────────────────────────────────────────────────
 loadSymbols();
 loadRuns();

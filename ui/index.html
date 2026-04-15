@@ -267,16 +267,19 @@
           </h2>
           <div id="spec-preview-issues" style="font-size:12px;color:#d29922;margin-bottom:8px;min-height:14px"></div>
           <pre id="spec-json-preview" style="max-height:60vh;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6edf3;white-space:pre;margin:0"></pre>
-          <div style="display:flex;align-items:center;gap:8px;margin-top:12px">
-            <button type="button" id="spec-copy-json" class="primary">Copy JSON</button>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap">
+            <button type="button" id="spec-save" class="primary">Save to strategies/</button>
+            <button type="button" id="spec-copy-json">Copy JSON</button>
             <span id="spec-copy-status" style="font-size:12px;color:#8b949e"></span>
           </div>
+          <div id="spec-save-status" style="font-size:12px;color:#8b949e;margin-top:10px;min-height:14px;white-space:pre-wrap;line-height:1.5"></div>
           <p style="font-size:11px;color:#6e7681;margin-top:12px;line-height:1.5">
-            Save as <code style="background:#0d1117;padding:1px 5px;border-radius:3px">strategies/&lt;name&gt;.json</code>
-            to make it available in the New Run modal. Auto-save via
-            POST /api/specs is coming in Phase 4.3e. Per-param narrowing
-            (tighter min/max/step, pinning) is Phase 4.3d — for now each
-            block's params use the registry's declared range as-is.
+            <strong>Save</strong> writes to
+            <code style="background:#0d1117;padding:1px 5px;border-radius:3px">strategies/&lt;name&gt;.json</code>
+            after server-side validation (block refs, param ranges,
+            sizing requirements). Overwriting an existing spec requires
+            a confirmation prompt. Once saved, the spec appears in the
+            New Run modal's picker.
           </p>
         </div>
       </div>

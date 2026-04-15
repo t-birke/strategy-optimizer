@@ -541,7 +541,7 @@ Broken into sub-chunks (each its own commit):
 - **4.3b** — UI: spec picker in existing New Run modal.
 - **4.3c** — UI: new spec authoring page with block picker per slot.
 - **4.3d** — UI: per-block param narrowing form (min/max/step or pin).
-- **4.3e** — Save: `POST /api/specs` writes to `strategies/` after validation.
+- **4.3e** — Save: `POST /api/specs` writes to `strategies/` after validation. ✅ done
 
 ### 4.3a Backend endpoints for the authoring UI — ✅ done
 Two read-only endpoints that feed the upcoming authoring UI. Neither
@@ -684,6 +684,66 @@ Implementation entry points in `ui/app.js`:
 Still parked for 4.3e: server-side validation of narrowed ranges
 against registry bounds (client clamps are advisory — POST /api/specs
 will re-validate authoritatively).
+
+### 4.3e Save spec to strategies/ — ✅ done
+The spec editor's live JSON preview is now persistable to
+`strategies/<name>.json` via a new Save button that POSTs to
+`/api/specs`. The server re-runs the authoritative `validateSpec()` —
+client-side checks stay advisory, the backend is the gate.
+
+- **Endpoint** (`api/routes.js`): `POST /api/specs` accepts the spec as
+  JSON body. Pipeline:
+  1. Body must be a non-array object (400 otherwise).
+  2. `registry.ensureLoaded()` + `validateSpec()` — all violations
+     aggregate into one 400 response whose `error` is the multi-line
+     message (same string the user sees when `POST /api/runs` rejects
+     a hand-written spec, so failure modes match).
+  3. Filename derived from `normalized.name` via `basename()` (blocks
+     path traversal).
+  4. If the target exists and `?overwrite=1` is not set → 409 with the
+     filename echoed back so the UI can prompt.
+  5. Atomic write: `writeFile(tmp)` → `rename(tmp, target)`. On rename
+     failure the tmp is unlinked and the error bubbles up. The
+     transient `hash` field is stripped before persisting — specs on
+     disk stay deterministic.
+  6. 201 on create, 200 on overwrite; body includes
+     `{ ok, filename, name, overwritten }`.
+- **UI** (`ui/index.html` + `ui/app.js`): new `Save to strategies/`
+  button next to the existing `Copy JSON` button, with a
+  `#spec-save-status` line beneath the preview that shows inline
+  progress/success/error feedback (no modal dialog for the happy path).
+  `saveSpec()` POSTs `buildSpecFromUi()`; on 409 it opens a
+  `confirm()` asking to overwrite and retries with `?overwrite=1`.
+  400 responses surface the validator's multi-line error verbatim so
+  the user can see exactly which param/block is wrong.
+- **Safety invariants**: no writes on validation failure (the tmp file
+  is never created before validation passes); no `.tmp` files leaked
+  after a run (verified by the gate); no hand-rolled path joining
+  (every target goes through `resolve(cwd, 'strategies', basename(…))`).
+
+**Verification** — `scripts/spec-api-check.js` (449 checks ✓):
+- Happy path: 201 + response shape + file exists on disk with
+  `hash` stripped.
+- Non-object body → 400 with error mentioning "object".
+- Invalid name → 400 with validator message surfaced.
+- Out-of-range param (min > max) → 400 + no file leaked.
+- Duplicate filename without overwrite → 409 with filename echoed.
+- Duplicate filename with `?overwrite=1` → 200 + description on disk
+  reflects the new payload (proves it actually re-wrote, not
+  short-circuited).
+- Tmp-leak guard: strategies/ contains zero `*.tmp` files after run.
+- All test files live under `20991231-999-post-spec-test-*` (far-future
+  date) and are unlinked in a `finally` so a partial failure never
+  pollutes the real spec directory.
+
+**Verification** — `scripts/ui-spec-editor-check.js` (266 checks ✓):
+- DOM: `#spec-save` button + `#spec-save-status` line present inside
+  `#page-specs`.
+- JS: `saveSpec` function defined; references `/api/specs`, a `fetch()`
+  call, and `method: 'POST'`; uses `buildSpecFromUi()` as the body;
+  handles `?overwrite=1` fallback; 409 path invokes `confirm()`;
+  writes into `#spec-save-status`; `#spec-save` click wires to
+  `saveSpec`.
 
 ### 4.3b Spec picker in the New Run modal — ✅ done
 Users can now pick an existing spec from a dropdown in the New Run modal

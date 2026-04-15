@@ -25,9 +25,10 @@
  *      by spec-api-check; repeated as a smoke check so a 4.3c-only run
  *      catches an accidental contract break.
  *
- * Not covered here: POST /api/specs (that's 4.3e) and per-param narrowing
- * UI (that's 4.3d). This gate is deliberately forward-compatible — it
- * asserts the composition primitives, not the knobs inside them.
+ * Phase 4.3d (per-param narrowing) and 4.3e (save-to-disk) are layered
+ * on top: we assert the Save button + status line exist in the DOM and
+ * that saveSpec() posts to /api/specs with the overwrite fallback wired.
+ * End-to-end POST behavior lives in spec-api-check.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -150,6 +151,11 @@ async function main() {
     // Preview + copy.
     assertTrue('spec-json-preview pre present', contains(slice, 'id="spec-json-preview"'));
     assertTrue('spec-copy-json button present', contains(slice, 'id="spec-copy-json"'));
+
+    // Save to strategies/ (Phase 4.3e) — button + status line.
+    assertTrue('spec-save button present', contains(slice, 'id="spec-save"'));
+    assertTrue('spec-save-status container present',
+      contains(slice, 'id="spec-save-status"'));
   }
 
   // ── 2. JS wiring in app.js ───────────────────────────────────
@@ -274,6 +280,29 @@ async function main() {
       /readParamOverrides[\s\S]{0,2500}value\s*:/.test(js));
     assertTrue('readParamOverrides emits {min,max,step} for ranged params',
       /readParamOverrides[\s\S]{0,3500}min\s*:[\s\S]{0,200}max\s*:[\s\S]{0,200}step\s*:/.test(js));
+
+    // 2i. Save-to-disk wiring (Phase 4.3e). The Save button must POST the
+    // output of buildSpecFromUi to /api/specs, handle the 409-overwrite
+    // fallback via confirm(), and surface 400 validation errors in the
+    // status line so users know WHY their spec didn't save.
+    assertTrue('defines saveSpec function', /(async\s+function|function)\s+saveSpec\b/.test(js));
+    assertTrue('saveSpec fetches POST /api/specs',
+      // URL may be built into a variable before fetch() — just assert that
+      // both the endpoint path and a fetch() call appear inside saveSpec,
+      // and that the method is POST somewhere nearby.
+      /saveSpec[\s\S]{0,1500}\/api\/specs[\s\S]{0,1500}fetch\(/.test(js)
+      && /saveSpec[\s\S]{0,1500}method:\s*['"]POST['"]/.test(js));
+    assertTrue('saveSpec uses buildSpecFromUi as body',
+      /saveSpec[\s\S]{0,1200}buildSpecFromUi\(\)/.test(js));
+    assertTrue('saveSpec handles overwrite via ?overwrite=1',
+      /overwrite=1/.test(js));
+    assertTrue('saveSpec prompts confirm() on 409',
+      /409[\s\S]{0,600}confirm\(/.test(js)
+      || /confirm\([\s\S]{0,600}overwrite/i.test(js));
+    assertTrue('saveSpec writes to #spec-save-status',
+      /spec-save-status/.test(js));
+    assertTrue('spec-save button click triggers saveSpec',
+      /spec-save[\s\S]{0,200}saveSpec\b/.test(js));
   }
 
   // ── 3. Server contract: GET /api/blocks shape matches editor reads ──

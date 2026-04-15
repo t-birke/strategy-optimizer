@@ -3,8 +3,8 @@
  */
 
 import { Router } from 'express';
-import { readFile, readdir, stat } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { readFile, readdir, stat, writeFile, rename, mkdir, unlink } from 'node:fs/promises';
+import { resolve, basename } from 'node:path';
 import os from 'node:os';
 import { getSymbolStats, getLastTimestamp, deleteSymbol } from '../db/candles.js';
 import { query, exec } from '../db/connection.js';
@@ -726,6 +726,102 @@ router.get('/api/blocks', async (req, res) => {
     res.json({ blocks });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/specs — persist a user-authored spec to `strategies/<name>.json`.
+ *
+ * Phase 4.3e. Turns the spec-editor "Copy JSON" flow into a one-click save.
+ *
+ * Body: the full spec JSON object (same shape the spec editor builds into
+ * the live preview). Validated authoritatively via `validateSpec()` so
+ * every garbage shape, unknown block ref, out-of-bounds param override,
+ * etc. is rejected BEFORE a file hits disk. The client-side editor
+ * already clamps inputs, but that's advisory — this is the gate.
+ *
+ * Query: `?overwrite=1` opts into replacing an existing file. Without it,
+ * POSTing a duplicate name returns 409 so the UI can prompt the user.
+ *
+ * Filename: `${spec.name}.json`. The name regex already restricts to a
+ * kebab-safe alphabet, but `basename()` is a belt-and-braces guard so a
+ * crafted name like `../evil` can't traverse out of `strategies/`.
+ *
+ * Atomicity: write to `<target>.tmp` then rename — interrupted writes
+ * never leave a half-flushed JSON on disk that GET /api/specs would
+ * then classify as malformed.
+ *
+ * Response:
+ *   201 { ok: true, filename, name, overwritten: false }  — new file
+ *   200 { ok: true, filename, name, overwritten: true  }  — replaced
+ *   400 { ok: false, error }                              — validation failed
+ *   409 { ok: false, error, filename }                    — duplicate, no overwrite
+ *   500 { ok: false, error }                              — internal
+ */
+router.post('/api/specs', async (req, res) => {
+  try {
+    const spec = req.body;
+    if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+      return res.status(400).json({ ok: false, error: 'request body must be a JSON object' });
+    }
+
+    // Authoritative validation. Needs the registry so block refs resolve.
+    await registry.ensureLoaded();
+    let normalized;
+    try {
+      normalized = validateSpec(spec);
+    } catch (err) {
+      // validateSpec aggregates every violation into one newline-separated
+      // Error message. Surface it verbatim — the UI renders line-by-line.
+      return res.status(400).json({ ok: false, error: err.message });
+    }
+
+    // Normalized name is safe (regex-checked), but basename() belt-and-braces.
+    const filename = basename(`${normalized.name}.json`);
+    const dir = resolve(process.cwd(), 'strategies');
+    const target = resolve(dir, filename);
+
+    const overwrite = req.query.overwrite === '1' || req.query.overwrite === 'true';
+    let existed = false;
+    try {
+      await stat(target);
+      existed = true;
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+    if (existed && !overwrite) {
+      return res.status(409).json({
+        ok: false,
+        error: `A spec named "${filename}" already exists. Re-submit with ?overwrite=1 to replace it.`,
+        filename,
+      });
+    }
+
+    // Drop validator-attached derived fields before persisting; they're
+    // recomputed on every load, so baking them in would just cause diff
+    // noise in git.
+    const { hash: _hash, ...persisted } = normalized;
+
+    await mkdir(dir, { recursive: true });
+    const tmp = target + '.tmp';
+    await writeFile(tmp, JSON.stringify(persisted, null, 2) + '\n', 'utf8');
+    try {
+      await rename(tmp, target);
+    } catch (err) {
+      // Best-effort cleanup; if the rename fails we still surface the error.
+      try { await unlink(tmp); } catch { /* swallow */ }
+      throw err;
+    }
+
+    res.status(existed ? 200 : 201).json({
+      ok: true,
+      filename,
+      name: normalized.name,
+      overwritten: existed,
+    });
+  } catch (err) {
+    console.error('POST /api/specs failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
