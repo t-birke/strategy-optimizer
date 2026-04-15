@@ -1908,10 +1908,376 @@ window.exportTrades = () => {
   a.click();
 };
 
+// ─── Spec Editor (Phase 4.3c) ──────────────────────────────
+//
+// Composes a strategy spec JSON from user picks. Block catalog comes
+// from GET /api/blocks (same shape as the backlog 4.3a payload); each
+// block's declared `params` array is emitted into the spec with its
+// registry-declared range (min/max/step). Phase 4.3d will add per-param
+// narrowing (pin, tighten bounds).
+//
+// Save/load: out of scope for 4.3c. The right-hand preview has a Copy
+// JSON button; the user drops it into `strategies/<name>.json` by hand.
+// POST /api/specs lands in Phase 4.3e.
+
+// Flat catalog: block.id → full block object. Populated once by
+// loadBlocksForEditor and then read synchronously by the pickers + the
+// JSON emitter.
+const blocksById = {};
+
+async function loadBlocksForEditor() {
+  try {
+    const res = await fetch('/api/blocks');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    for (const b of data.blocks || []) blocksById[b.id] = b;
+    populateSpecEditorPickers();
+    renderSpecPreview();
+  } catch (err) {
+    console.warn('loadBlocksForEditor failed:', err.message);
+    // Leave pickers empty; user sees "No … blocks registered" hints.
+    populateSpecEditorPickers();
+    renderSpecPreview();
+  }
+}
+
+function blocksByKind(kind) {
+  return Object.values(blocksById).filter(b => b.kind === kind);
+}
+function blocksByExitSlot(slot) {
+  return Object.values(blocksById).filter(b => b.kind === 'exit' && b.exitSlot === slot);
+}
+
+// Wipes and rebuilds a <select>'s options. Keeps the current value if
+// it's still a valid option; otherwise falls back to `defaultValue`.
+// An empty-value "None" option is included iff `includeNone` is true.
+function populateSelect(id, items, { includeNone, defaultValue = '' } = {}) {
+  const sel = document.getElementById(id);
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = '';
+  if (includeNone) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'None';
+    sel.appendChild(opt);
+  }
+  for (const b of items) {
+    const opt = document.createElement('option');
+    opt.value = b.id;
+    opt.textContent = b.id;
+    sel.appendChild(opt);
+  }
+  const valid = new Set([...sel.options].map(o => o.value));
+  sel.value = valid.has(prev) ? prev : (valid.has(defaultValue) ? defaultValue : (sel.options[0]?.value ?? ''));
+}
+
+// Fills the fixed dropdowns (regime, three exit slots, sizing). Entry
+// and filter rows build their own selects via addEntryRow/addFilterRow.
+function populateSpecEditorPickers() {
+  populateSelect('spec-regime', blocksByKind('regime'), { includeNone: true });
+  const hasRegime = blocksByKind('regime').length > 0;
+  document.getElementById('spec-regime-empty').style.display = hasRegime ? 'none' : '';
+
+  populateSelect('spec-exit-hardstop', blocksByExitSlot('hardStop'), { includeNone: true });
+  populateSelect('spec-exit-target',   blocksByExitSlot('target'),   { includeNone: true });
+  populateSelect('spec-exit-trail',    blocksByExitSlot('trail'),    { includeNone: true });
+
+  // Sizing is required (spec.sizing is not nullable), so no "None" option.
+  // Default to `flat` if present — it's the safest no-op pick; otherwise
+  // the first registered sizing block.
+  const sizingBlocks = blocksByKind('sizing');
+  populateSelect('spec-sizing', sizingBlocks, { includeNone: false, defaultValue: 'flat' });
+  updateSizingReqHint();
+
+  // Filters: if no filter blocks registered, hint the user so the empty
+  // list doesn't look broken. The "+ Add" button is still clickable (it
+  // just won't offer any options).
+  const hasFilter = blocksByKind('filter').length > 0;
+  document.getElementById('spec-filters-empty').style.display = hasFilter ? 'none' : '';
+}
+
+function updateSizingReqHint() {
+  const id = document.getElementById('spec-sizing').value;
+  const b = blocksById[id];
+  const el = document.getElementById('spec-sizing-req');
+  if (!b) { el.textContent = ''; return; }
+  const reqs = b.sizingRequirements || [];
+  if (reqs.length === 0) { el.textContent = 'no extra requirements'; return; }
+  const human = reqs.map(r => {
+    if (r === 'stopDistance') return 'stopDistance (requires a Hard Stop block)';
+    if (r === 'tradeStats')   return 'tradeStats (uses recent trade history)';
+    if (r === 'equityCurve')  return 'equityCurve (uses recent equity PnL)';
+    return r;
+  }).join(', ');
+  el.textContent = `requires: ${human}`;
+}
+
+// Row management for entries + filters. Each row is a flex container
+// with a <select> + a remove button. The select is kind-filtered.
+//
+// We track rows by reading the DOM on each preview render rather than
+// keeping a parallel JS state array — simpler, and the DOM is the source
+// of truth for what the user sees.
+function makeBlockRow(kind, value = '') {
+  const row = document.createElement('div');
+  row.className = 'spec-block-row';
+  row.dataset.kind = kind;
+  row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:6px';
+
+  const select = document.createElement('select');
+  select.style.cssText = 'flex:1;min-width:200px';
+  select.dataset.role = 'block-select';
+
+  // Include a placeholder "(pick one)" only if we have options; otherwise
+  // show it as the only option so the row isn't useless.
+  const items = blocksByKind(kind);
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = items.length === 0
+    ? `(no ${kind} blocks registered)`
+    : '(pick a block)';
+  select.appendChild(placeholder);
+  for (const b of items) {
+    const opt = document.createElement('option');
+    opt.value = b.id;
+    opt.textContent = b.id;
+    select.appendChild(opt);
+  }
+  if (value) select.value = value;
+  select.addEventListener('change', renderSpecPreview);
+  row.appendChild(select);
+
+  const rm = document.createElement('button');
+  rm.type = 'button';
+  rm.textContent = '×';
+  rm.title = 'Remove this block';
+  rm.style.cssText = 'padding:4px 10px;font-size:14px;line-height:1';
+  rm.addEventListener('click', () => {
+    row.remove();
+    renderSpecPreview();
+  });
+  row.appendChild(rm);
+
+  return row;
+}
+
+function addEntryRow() {
+  document.getElementById('spec-entries-list').appendChild(makeBlockRow('entry'));
+  renderSpecPreview();
+}
+function addFilterRow() {
+  document.getElementById('spec-filters-list').appendChild(makeBlockRow('filter'));
+  renderSpecPreview();
+}
+
+// Reads all rows of a given container and returns [{blockId, ...}] for
+// rows with a non-empty selection. Empty picks are skipped from the
+// emitted spec so the preview is always a runnable-ish shape.
+function readRowBlockIds(containerId) {
+  const out = [];
+  document.querySelectorAll(`#${containerId} .spec-block-row`).forEach(row => {
+    const sel = row.querySelector('select[data-role="block-select"]');
+    if (sel && sel.value) out.push(sel.value);
+  });
+  return out;
+}
+
+// Build a {min,max,step} (or {value} when min===max) fragment for one
+// registry-declared param. 4.3d will replace this with per-param overrides.
+function paramToSpecEntry(p) {
+  if (p.min !== undefined && p.max !== undefined && p.min === p.max) {
+    return { value: p.min };
+  }
+  const out = {};
+  if (p.min  !== undefined) out.min  = p.min;
+  if (p.max  !== undefined) out.max  = p.max;
+  if (p.step !== undefined) out.step = p.step;
+  return out;
+}
+
+// Build a full spec-block dict {block, version, instanceId, params}
+// from a registry block id. Returns null if the id isn't in the registry.
+function blockRefToSpec(blockId) {
+  const b = blocksById[blockId];
+  if (!b) return null;
+  const params = {};
+  for (const p of b.params || []) params[p.id] = paramToSpecEntry(p);
+  return {
+    block: b.id,
+    version: b.version ?? 1,
+    instanceId: 'main', // 4.3c ships with a single instance per block; multi-instance is a later concern
+    params,
+  };
+}
+
+// Rebuild the full spec object from the current UI state and render it
+// into the preview pre. Non-destructive — no side effects outside the
+// preview pre and the validity indicator.
+function buildSpecFromUi() {
+  const name = (document.getElementById('spec-name').value || '').trim();
+  const description = (document.getElementById('spec-desc').value || '').trim();
+
+  // Regime: single block, optional.
+  const regimeId = document.getElementById('spec-regime').value;
+  const regime = regimeId ? blockRefToSpec(regimeId) : null;
+
+  // Entries.
+  const entriesMode = document.getElementById('spec-entries-mode').value;
+  const thrMin = parseInt(document.getElementById('spec-entries-threshold-min').value, 10) || 1;
+  const thrMax = parseInt(document.getElementById('spec-entries-threshold-max').value, 10) || thrMin;
+  const entryIds = readRowBlockIds('spec-entries-list');
+  const entries = {
+    mode: entriesMode,
+    blocks: entryIds.map(blockRefToSpec).filter(Boolean),
+  };
+  if (entriesMode === 'score') {
+    entries.threshold = thrMin === thrMax ? { value: thrMin } : { min: thrMin, max: thrMax, step: 1 };
+  }
+
+  // Filters.
+  const filters = {
+    mode: document.getElementById('spec-filters-mode').value,
+    blocks: readRowBlockIds('spec-filters-list').map(blockRefToSpec).filter(Boolean),
+  };
+
+  // Exits: three optional slots.
+  const exits = {};
+  const hardStopId = document.getElementById('spec-exit-hardstop').value;
+  const targetId   = document.getElementById('spec-exit-target').value;
+  const trailId    = document.getElementById('spec-exit-trail').value;
+  if (hardStopId) exits.hardStop = blockRefToSpec(hardStopId);
+  if (targetId)   exits.target   = blockRefToSpec(targetId);
+  if (trailId)    exits.trail    = blockRefToSpec(trailId);
+
+  // Sizing: required.
+  const sizingId = document.getElementById('spec-sizing').value;
+  const sizing = sizingId ? blockRefToSpec(sizingId) : null;
+
+  return {
+    name,
+    description,
+    regime,
+    entries,
+    filters,
+    exits,
+    sizing,
+    // 4.4 owns fitness weights/caps/gates. Emit the current runner
+    // defaults so the preview is a runnable spec.
+    constraints: [],
+    fitness: {
+      weights: { pf: 0.5, dd: 0.3, ret: 0.2 },
+      caps:    { pf: 4.0, ret: 2.0 },
+      gates:   { minTradesPerWindow: 30, worstRegimePfFloor: 1.0, wfeMin: 0.5 },
+    },
+    walkForward: { nWindows: 5, scheme: 'anchored' },
+  };
+}
+
+// Light validation — surfaces obvious problems (missing name, no entry
+// blocks, sizing needs stopDistance but no hard-stop picked) without
+// blocking the preview. The real gate is the server-side validator we
+// lean on for POST /api/specs in 4.3e.
+function validateSpec(spec) {
+  const issues = [];
+  if (!spec.name) issues.push('name is required');
+  if (!spec.entries.blocks.length) issues.push('at least one entry block is required');
+  if (!spec.sizing)  issues.push('sizing block is required');
+
+  if (spec.sizing) {
+    const sb = blocksById[spec.sizing.block];
+    const reqs = sb?.sizingRequirements || [];
+    if (reqs.includes('stopDistance') && !spec.exits.hardStop) {
+      issues.push(`sizing "${spec.sizing.block}" requires a Hard Stop block (stopDistance)`);
+    }
+  }
+  return issues;
+}
+
+function renderSpecPreview() {
+  const spec = buildSpecFromUi();
+  const issues = validateSpec(spec);
+
+  // Render JSON with a stable key order. JSON.stringify doesn't offer a
+  // built-in sort, but our spec has a fixed top-level key order we want
+  // to preserve (name, description, regime, entries, filters, exits,
+  // sizing, constraints, fitness, walkForward) — we build the object in
+  // that order in buildSpecFromUi, and JSON.stringify preserves it.
+  const json = JSON.stringify(spec, null, 2);
+  document.getElementById('spec-json-preview').textContent = json;
+
+  const validity = document.getElementById('spec-preview-validity');
+  const issuesEl = document.getElementById('spec-preview-issues');
+  if (issues.length === 0) {
+    validity.textContent = '✓ valid';
+    validity.style.color = '#3fb950';
+    issuesEl.textContent = '';
+  } else {
+    validity.textContent = `${issues.length} issue${issues.length === 1 ? '' : 's'}`;
+    validity.style.color = '#d29922';
+    issuesEl.textContent = issues.join(' · ');
+  }
+
+  // Toggle threshold row visibility based on entries mode.
+  const thrRow = document.getElementById('spec-entries-threshold-row');
+  thrRow.style.display = spec.entries.mode === 'score' ? '' : 'none';
+}
+
+// ── Wire inputs ───────────────────────────────────────
+// Every user-visible control that changes the spec shape triggers a
+// preview rebuild. We don't debounce — the build is a couple of DOM reads
+// + a JSON.stringify on a tiny object, well under 1ms.
+['spec-name', 'spec-desc',
+ 'spec-regime',
+ 'spec-entries-mode', 'spec-entries-threshold-min', 'spec-entries-threshold-max',
+ 'spec-filters-mode',
+ 'spec-exit-hardstop', 'spec-exit-target', 'spec-exit-trail',
+ 'spec-sizing'].forEach(id => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener('input',  renderSpecPreview);
+  el.addEventListener('change', renderSpecPreview);
+});
+// Sizing change also updates the requirements hint.
+document.getElementById('spec-sizing').addEventListener('change', updateSizingReqHint);
+
+document.getElementById('spec-entries-add').addEventListener('click', addEntryRow);
+document.getElementById('spec-filters-add').addEventListener('click', addFilterRow);
+
+document.getElementById('spec-copy-json').addEventListener('click', async () => {
+  const json = document.getElementById('spec-json-preview').textContent;
+  const status = document.getElementById('spec-copy-status');
+  try {
+    await navigator.clipboard.writeText(json);
+    status.textContent = 'Copied to clipboard';
+    status.style.color = '#3fb950';
+  } catch {
+    // Clipboard API requires a secure context; fall back to a visible
+    // textarea + execCommand('copy') which works on http://localhost.
+    const ta = document.createElement('textarea');
+    ta.value = json;
+    ta.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy');
+      status.textContent = 'Copied to clipboard';
+      status.style.color = '#3fb950';
+    } catch (err) {
+      status.textContent = `copy failed: ${err.message}`;
+      status.style.color = '#f85149';
+    } finally {
+      ta.remove();
+    }
+  }
+  setTimeout(() => { status.textContent = ''; }, 2000);
+});
+
 // ─── Init ───────────────────────────────────────────────────
 loadSymbols();
 loadRuns();
 loadQueue();
+loadBlocksForEditor();
 
 // Refresh periodically
 setInterval(loadSymbols, 30000);

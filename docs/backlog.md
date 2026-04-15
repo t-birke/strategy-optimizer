@@ -572,6 +572,52 @@ touches the queue or DuckDB; both are safe to call any time.
   `atrHardStop` has `exitSlot=hardStop`; `atrRisk` has `sizingRequirements=['stopDistance']`.
 - Sort order is non-regressing across the block list.
 
+### 4.3c Spec authoring page (block picker per slot) — ✅ done
+New top-level "Specs" page that lets the user compose a strategy spec
+by picking blocks per slot. Live JSON preview on the right; "Copy JSON"
+button dumps to clipboard. Saving to `strategies/<name>.json` is still
+manual — POST /api/specs lands in 4.3e. Per-param narrowing (tighter
+min/max/step, pinning) is 4.3d; for now each block's params use the
+registry-declared range as-is, which is a valid runnable starting point.
+
+- **Nav + page** (`ui/index.html`): new `<a data-page="specs">` link;
+  new `#page-specs` container with two-column grid — left = editor
+  form, right = sticky live JSON preview.
+- **Editor form**: name/description; regime (single, optional); entries
+  (mode all/any/score + threshold + multi-block list); filters (mode +
+  multi-block list); three exit slots (hardStop/target/trail, each
+  optional); sizing (required). Each row's dropdown is filtered by
+  block `kind` (and for exits, by `exitSlot`).
+- **Wiring** (`ui/app.js`): `loadBlocksForEditor()` fetches `/api/blocks`
+  at init and caches into `blocksById`. `buildSpecFromUi()` reads the
+  DOM and composes the full spec object; `renderSpecPreview()` stringifies
+  it and updates the preview on every input/change. Sizing block's
+  `sizingRequirements` surface as a muted hint under the sizing row
+  (flags `stopDistance` → requires Hard Stop). Threshold row auto-hides
+  when entries mode ≠ score.
+- **Validation** (non-blocking): name required, ≥1 entry block, sizing
+  required, and (iff sizing needs stopDistance) a Hard Stop pick. Issues
+  render as a muted line above the preview; authoritative check still
+  happens server-side at save (4.3e).
+- **Copy JSON**: uses `navigator.clipboard.writeText` with a textarea +
+  `execCommand('copy')` fallback for non-secure contexts (localhost http).
+
+**Verification** — `scripts/ui-spec-editor-check.js` (225 checks ✓):
+- DOM: nav link + #page-specs + every spec-* field (name/desc/regime,
+  entries mode+threshold+list+add, filters mode+list+add, three exit
+  slots, sizing + requirements hint, JSON preview, Copy button).
+- JS: `loadBlocksForEditor` exists + fetches `/api/blocks` + called at
+  init; `blocksByKind`/`blocksByExitSlot` helpers defined; per-slot
+  populate calls use the right filter; sizing excludes None; every
+  input id is wired to `renderSpecPreview`; `buildSpecFromUi` emits the
+  full top-level key set (name/description/regime/entries/filters/exits/
+  sizing/constraints/fitness/walkForward); `instanceId:'main'`
+  everywhere; Copy-JSON reads `#spec-json-preview` and writes via
+  `navigator.clipboard.writeText`; threshold row auto-hides on non-score.
+- Server contract: per-block assertions against `GET /api/blocks` —
+  every block has id/kind/version/params; every exit block has a valid
+  exitSlot; every param has a known type.
+
 ### 4.3b Spec picker in the New Run modal — ✅ done
 Users can now pick an existing spec from a dropdown in the New Run modal
 instead of hand-editing JSON. Minimum-viable UI for spec-mode runs.

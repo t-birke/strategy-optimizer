@@ -11,6 +11,7 @@
     <h1>Strategy Optimizer</h1>
     <a href="#data" class="nav-link active" data-page="data">Data</a>
     <a href="#optimizer" class="nav-link" data-page="optimizer">Optimizer</a>
+    <a href="#specs" class="nav-link" data-page="specs">Specs</a>
     <a href="#run-detail" class="nav-link" data-page="run-detail" id="nav-run-detail" style="display:none">Run Detail</a>
     <span id="tv-badge" class="badge" style="display:none;margin-left:auto;font-size:11px"></span>
   </nav>
@@ -123,6 +124,151 @@
       </table>
       <div id="no-runs" style="padding:20px;text-align:center;color:#8b949e;display:none">
         No optimization runs yet. Click "New Run" to start.
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ SPECS PAGE (Phase 4.3c) ═══════════ -->
+  <!--
+    Spec authoring. The user composes a strategy spec by picking blocks
+    per slot; the live JSON preview on the right-hand side shows exactly
+    what would be written to strategies/<name>.json once POST /api/specs
+    lands in 4.3e. For now the user Copy-JSONs the preview and saves the
+    file by hand.
+
+    Each picker is filtered at runtime (app.js) by the block's `kind`
+    (entry / filter / exit / sizing / regime) and — for the three exit
+    slots — by `exitSlot`. Block lists come from GET /api/blocks.
+
+    Param narrowing (per-param min/max/step/pin) is Phase 4.3d. Until
+    then, the generated JSON emits each block's registry-declared range
+    as-is, which is a valid starting point the user can tighten later.
+  -->
+  <div id="page-specs" class="page">
+    <div style="display:grid;grid-template-columns:minmax(0, 1fr) minmax(320px, 460px);gap:16px">
+      <!-- Left column: editor form -->
+      <div>
+        <div class="card">
+          <h2>New Strategy Spec</h2>
+          <div class="form-row">
+            <label>Name</label>
+            <input type="text" id="spec-name" placeholder="e.g. btc-ema-trend-v1" style="flex:1;min-width:200px">
+          </div>
+          <div class="form-row" style="flex-direction:column;align-items:stretch">
+            <label style="margin-bottom:4px">Description</label>
+            <textarea id="spec-desc" rows="3" placeholder="What does this strategy do? Any caveats?"
+              style="padding:6px 12px;border-radius:6px;border:1px solid #30363d;background:#0d1117;color:#e6edf3;font-size:13px;font-family:inherit;resize:vertical"></textarea>
+          </div>
+        </div>
+
+        <!-- Regime slot: optional; 0 or 1 block. Registry currently has
+             no regime blocks — the dropdown shows only "None" until someone
+             registers one. -->
+        <div class="card">
+          <h2>Regime</h2>
+          <div class="form-row">
+            <label>Regime block</label>
+            <select id="spec-regime" style="flex:1;min-width:200px">
+              <option value="">None</option>
+            </select>
+          </div>
+          <div id="spec-regime-empty" style="font-size:12px;color:#6e7681;margin-left:92px;display:none">
+            No regime blocks registered yet.
+          </div>
+        </div>
+
+        <!-- Entries: multi-block list with mode + threshold. Threshold row
+             is hidden in app.js when mode ≠ 'score'. -->
+        <div class="card">
+          <h2>Entries</h2>
+          <div class="form-row">
+            <label>Mode</label>
+            <select id="spec-entries-mode" style="width:200px">
+              <option value="all">all — every block must fire</option>
+              <option value="any">any — ≥1 block fires</option>
+              <option value="score" selected>score — count, use threshold</option>
+            </select>
+          </div>
+          <div class="form-row" id="spec-entries-threshold-row">
+            <label>Threshold</label>
+            <input type="number" id="spec-entries-threshold-min" value="1" min="1" style="width:60px">
+            <span style="font-size:12px;color:#8b949e">min</span>
+            <input type="number" id="spec-entries-threshold-max" value="3" min="1" style="width:60px">
+            <span style="font-size:12px;color:#8b949e">max (GA-optimized; set min=max to pin)</span>
+          </div>
+          <div id="spec-entries-list" style="margin:8px 0"></div>
+          <button type="button" id="spec-entries-add">+ Add entry block</button>
+        </div>
+
+        <!-- Filters: multi-block with mode. -->
+        <div class="card">
+          <h2>Filters</h2>
+          <div class="form-row">
+            <label>Mode</label>
+            <select id="spec-filters-mode" style="width:200px">
+              <option value="all" selected>all — every filter must pass</option>
+              <option value="any">any — ≥1 filter passes</option>
+            </select>
+          </div>
+          <div id="spec-filters-list" style="margin:8px 0"></div>
+          <button type="button" id="spec-filters-add">+ Add filter block</button>
+          <div id="spec-filters-empty" style="font-size:12px;color:#6e7681;margin-top:6px;display:none">
+            No filter blocks registered yet.
+          </div>
+        </div>
+
+        <!-- Exits: three fixed slots. Each filters to blocks whose
+             exitSlot matches (hardStop / target / trail). -->
+        <div class="card">
+          <h2>Exits</h2>
+          <div class="form-row">
+            <label>Hard Stop</label>
+            <select id="spec-exit-hardstop" style="flex:1;min-width:200px"><option value="">None</option></select>
+          </div>
+          <div class="form-row">
+            <label>Target</label>
+            <select id="spec-exit-target" style="flex:1;min-width:200px"><option value="">None</option></select>
+          </div>
+          <div class="form-row">
+            <label>Trail</label>
+            <select id="spec-exit-trail" style="flex:1;min-width:200px"><option value="">None</option></select>
+          </div>
+        </div>
+
+        <!-- Sizing: required. Show declared sizingRequirements as a hint
+             so the user knows if the sizing block needs a stop distance
+             (→ hardStop slot must be filled) or trade stats. -->
+        <div class="card">
+          <h2>Sizing</h2>
+          <div class="form-row">
+            <label>Sizing block</label>
+            <select id="spec-sizing" style="flex:1;min-width:200px"></select>
+          </div>
+          <div id="spec-sizing-req" style="font-size:12px;color:#8b949e;margin-left:92px;min-height:14px"></div>
+        </div>
+      </div>
+
+      <!-- Right column: live JSON preview + copy button -->
+      <div>
+        <div class="card" style="position:sticky;top:16px">
+          <h2 style="display:flex;align-items:center;justify-content:space-between">
+            JSON Preview
+            <span id="spec-preview-validity" style="font-size:11px;font-weight:400"></span>
+          </h2>
+          <div id="spec-preview-issues" style="font-size:12px;color:#d29922;margin-bottom:8px;min-height:14px"></div>
+          <pre id="spec-json-preview" style="max-height:60vh;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6edf3;white-space:pre;margin:0"></pre>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:12px">
+            <button type="button" id="spec-copy-json" class="primary">Copy JSON</button>
+            <span id="spec-copy-status" style="font-size:12px;color:#8b949e"></span>
+          </div>
+          <p style="font-size:11px;color:#6e7681;margin-top:12px;line-height:1.5">
+            Save as <code style="background:#0d1117;padding:1px 5px;border-radius:3px">strategies/&lt;name&gt;.json</code>
+            to make it available in the New Run modal. Auto-save via
+            POST /api/specs is coming in Phase 4.3e. Per-param narrowing
+            (tighter min/max/step, pinning) is Phase 4.3d — for now each
+            block's params use the registry's declared range as-is.
+          </p>
+        </div>
       </div>
     </div>
   </div>
