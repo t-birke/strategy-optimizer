@@ -418,6 +418,27 @@
       <div id="detail-params" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px"></div>
     </div>
 
+    <!-- Phase 4.6: Pine indicator export. Button is disabled for
+         legacy runs (the codegen needs a hydrated spec). Result area
+         shows a one-line summary with the file path + byte/line count
+         and a <details> collapsible source preview so a user can
+         spot-check the output without leaving the page. -->
+    <div class="card" id="detail-pine-card" style="margin-bottom:16px">
+      <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em"
+          title="Generate a Pine v5 entry-alerts indicator from this run's spec + winning gene. Output is content-addressed by gene hash, so the same inputs always produce the same file.">
+        Pine Export
+      </h3>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button id="btn-pine-export"
+                onclick="generatePine()"
+                style="font-size:12px;padding:6px 14px">
+          Generate Pine indicator
+        </button>
+        <span id="pine-export-status" style="font-size:12px;color:#8b949e"></span>
+      </div>
+      <div id="pine-export-result" style="margin-top:12px"></div>
+    </div>
+
     <!-- Phase 4.5a: three spec-mode-only cards surface the persisted
          WF / regime / fitness data that used to be computed-but-hidden.
          All three start display:none — app.js flips them on only if

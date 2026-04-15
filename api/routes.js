@@ -25,6 +25,7 @@ import { loadDataBundle } from '../engine/data-bundle.js';
 import { buildParamSpace } from '../optimizer/param-space.js';
 import * as registry from '../engine/blocks/registry.js';
 import { validateSpec, DEFAULT_FITNESS, DEFAULT_WALK_FORWARD } from '../engine/spec.js';
+import { generateEntryAlertsPine, geneHash } from '../engine/pine-codegen.js';
 
 const router = Router();
 
@@ -505,6 +506,146 @@ router.get('/api/runs/:id/trades', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+/**
+ * POST /api/runs/:id/pine-export — generate a Pine v5 entry-alerts
+ * indicator from a spec-mode run's stored (spec, gene) pair and write
+ * it to `pine/generated/<spec.name>-<hash12>.pine`.
+ *
+ * Response: { path, filename, hash12, title, shortTitle, bytes, lines,
+ *             source, reused }
+ *
+ * `reused: true` means the file already existed on disk with the same
+ * content-addressable name — the endpoint is idempotent so re-clicking
+ * the button is cheap.
+ *
+ * Errors:
+ *   404 run not found
+ *   400 legacy run (no spec_hash) — Pine codegen needs `hydrated` which
+ *       only spec-mode genes produce
+ *   400 run has no best_gene yet
+ *   404 spec_hash doesn't resolve (e.g., spec was deleted)
+ *   409 paramSpace.hydrate threw (gene shape doesn't match current
+ *       spec — almost certainly the spec was edited after the run)
+ *
+ * Output directory is overridable via OPTIMIZER_PINE_OUT_DIR (used by
+ * the regression gate to avoid dirtying the repo's real pine/generated/
+ * tree — same pattern as OPTIMIZER_DB_PATH for the DB).
+ */
+router.post('/api/runs/:id/pine-export', async (req, res) => {
+  try {
+    const runs = await query(`SELECT * FROM runs WHERE id = ${req.params.id}`);
+    if (runs.length === 0) return res.status(404).json({ error: 'Run not found' });
+    const run = runs[0];
+
+    for (const field of ['config', 'best_gene']) {
+      if (run[field] && typeof run[field] === 'string') {
+        try { run[field] = JSON.parse(run[field]); } catch {}
+      }
+    }
+
+    if (!run.spec_hash) {
+      return res.status(400).json({
+        error: 'Legacy runs cannot export Pine. Codegen requires a spec — ' +
+               'run a spec-mode optimization first.',
+      });
+    }
+    if (!run.best_gene) {
+      return res.status(400).json({ error: 'Run has no best gene yet' });
+    }
+
+    await registry.ensureLoaded();
+    const persisted = await getSpec(run.spec_hash);
+    if (!persisted) {
+      return res.status(404).json({
+        error: `Spec ${run.spec_hash} not found (run ${run.id} points at a missing spec)`,
+      });
+    }
+    const spec = validateSpec(persisted.json);
+    const paramSpace = buildParamSpace(spec);
+
+    // Hydrate the gene into per-block params. If the spec was edited
+    // after this run completed, the stored gene may reference qids the
+    // current spec doesn't have — that's a 409 (conflict) rather than a
+    // 500, so the UI can say "the spec has changed, re-run the optimizer".
+    let hydrated;
+    try {
+      hydrated = paramSpace.hydrate(run.best_gene);
+    } catch (hydrationErr) {
+      return res.status(409).json({
+        error: `Gene no longer matches spec ${run.spec_hash} — spec was likely edited after the run completed. ${hydrationErr.message}`,
+      });
+    }
+
+    const { source, title, shortTitle } = generateEntryAlertsPine({
+      spec, hydrated,
+      meta: {
+        ticker:    run.symbol,
+        timeframe: tfString(run.timeframe),
+        source:    `api/routes.js  (run #${run.id})`,
+      },
+    });
+
+    const hash12 = geneHash(run.best_gene);
+    const outDir = process.env.OPTIMIZER_PINE_OUT_DIR
+      ? resolve(process.env.OPTIMIZER_PINE_OUT_DIR)
+      : resolve(process.cwd(), 'pine/generated');
+    const filename = `${spec.name}-${hash12}.pine`;
+    const outPath = resolve(outDir, filename);
+
+    // Content-addressable path — same (spec, gene) writes the same file.
+    // Stat-first-then-write surfaces "already generated" to the UI so a
+    // re-click doesn't masquerade as fresh work.
+    let reused = false;
+    try {
+      await stat(outPath);
+      reused = true;
+    } catch { /* doesn't exist yet — fall through to write */ }
+
+    if (!reused) {
+      await mkdir(outDir, { recursive: true });
+      await writeFile(outPath, source, 'utf8');
+    }
+
+    return res.json({
+      path:       outPath,
+      filename,
+      hash12,
+      title,
+      shortTitle,
+      bytes:      source.length,
+      lines:      source.split('\n').length,
+      source,
+      reused,
+    });
+  } catch (err) {
+    console.error('pine-export:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Turn timeframe-in-minutes into a Pine-friendly short label for the
+ * generated file's header. Matches the strings the UI uses in `tfLabel`
+ * so a generated Pine file's comment matches what the user sees on the
+ * run-detail page. Only covers the common ones — anything else falls
+ * back to "<n>m".
+ */
+function tfString(tfMin) {
+  switch (tfMin) {
+    case 1:    return '1m';
+    case 5:    return '5m';
+    case 15:   return '15m';
+    case 30:   return '30m';
+    case 60:   return '1H';
+    case 120:  return '2H';
+    case 240:  return '4H';
+    case 360:  return '6H';
+    case 720:  return '12H';
+    case 1440: return '1D';
+    default:   return `${tfMin}m`;
+  }
+}
 
 // Debug endpoint: get raw candle data for a symbol/timeframe/date range
 router.get('/api/candles/:symbol', async (req, res) => {

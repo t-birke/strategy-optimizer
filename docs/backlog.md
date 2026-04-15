@@ -947,12 +947,63 @@ the JM Simple 3TP simulator.
   a spec-not-found error (the spec branch fired).
 
 ### 4.6 Pine export
-- "Generate Pine indicator" button per winning run.
-- Runs codegen over active (entry + filter + regime) blocks with the
-  tuned params, writes `pine/generated/<spec-name>-<hash>.pine`.
-- Auto-push via `tools/pine-push.js`. **NEVER** overwrite an existing
-  editor script without confirmation — user feedback note already
-  captured in MEMORY.md.
+
+**✅ 4.6 — Generate Pine indicator button on run-detail — done.**
+- IN scope (shipped):
+  - `engine/pine-codegen.js` exports `canonicalJson()` + `geneHash()`
+    so the API endpoint and CLI scripts (`pine-export.js`,
+    `pine-deploy.js`) produce byte-identical filenames for the same
+    `(spec, gene)` pair. CLI scripts refactored to import these
+    rather than maintaining local copies.
+  - **POST `/api/runs/:id/pine-export`** — pulls the stored spec via
+    `getSpec(spec_hash)`, runs `validateSpec` → `buildParamSpace` →
+    `paramSpace.hydrate(best_gene)` → `generateEntryAlertsPine()`,
+    writes a content-addressable file
+    `pine/generated/<spec.name>-<hash12>.pine`, and returns
+    `{ path, filename, hash12, title, shortTitle, bytes, lines, source, reused }`.
+    Idempotent: if the target file already exists, returns
+    `reused: true` without rewriting. Output dir is overridable via
+    `OPTIMIZER_PINE_OUT_DIR` (gate uses tmpdir to avoid dirtying
+    `pine/generated/`). Error matrix: 404 unknown run, 400 legacy
+    run (no spec_hash), 400 missing best_gene, 404 missing spec, 409
+    hydrate failure (spec edited post-run).
+  - **UI**: "Pine Export" card on the run-detail page with a
+    "Generate Pine indicator" button. `openRunDetail` toggles the
+    button's disabled state on `run.spec_hash` (legacy runs get a
+    disabled button + tooltip explaining "spec-mode only — legacy GA
+    runs have no spec to codegen from"). On success, renders
+    title / shortTitle / filename / hash / size / path plus a
+    collapsible HTML-escaped source preview, and surfaces
+    "Already generated" when `reused: true`.
+  - Regression gate: `scripts/ui-pine-export-check.js` (47 checks)
+    covers DOM declarations, JS wiring (button-state branch, fetch
+    URL, escape-on-render, status reset), and full server contract:
+    happy-path response shape + filename pattern + on-disk file
+    presence; idempotency (re-call returns `reused: true` with the
+    same path); 404 unknown run; 400 legacy run; 400 missing-gene
+    run; 404 missing-spec run.
+- DEFERRED:
+  - **Auto-push to TradingView from the UI button.** MEMORY.md says
+    `pine-push.js` destroys current editor content; we'd need a
+    conflict-detection step (Pine script-name collision check via the
+    TV API) before adding a one-click push. Until then, the UI
+    surfaces the deploy command as a "Next step" hint and the user
+    runs `node scripts/pine-deploy.js` themselves.
+  - **`mode: "inputs"` codegen.** All values are emitted as numeric
+    literals ("frozen" mode) to match the parity-gate reference
+    indicator. Generic tunable-input output is a separate task.
+  - **Filter / regime codegen review on real specs.** Code paths exist
+    in `pine-codegen.js` but the legacy spec only exercises entry
+    blocks. Coverage will fall out naturally as we add filter-heavy
+    specs in Phase 4.7+.
+
+- (Original scope — kept for context):
+  - "Generate Pine indicator" button per winning run.
+  - Runs codegen over active (entry + filter + regime) blocks with the
+    tuned params, writes `pine/generated/<spec-name>-<hash>.pine`.
+  - Auto-push via `tools/pine-push.js`. **NEVER** overwrite an existing
+    editor script without confirmation — user feedback note already
+    captured in MEMORY.md.
 
 ### 4.7 Deployment (= portfolio automation)
 - Winning strategies → alert-only Pine indicator pushed live.

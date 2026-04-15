@@ -1567,6 +1567,26 @@ window.openRunDetail = async (id) => {
     } else {
       document.getElementById('detail-params').innerHTML = '<span style="color:#8b949e">No gene data yet</span>';
     }
+
+    // Phase 4.6: Pine-export button state. The codegen requires a
+    // hydrated spec (i.e. spec-mode only) — the server returns 400 for
+    // legacy runs, but disabling the button up-front with a tooltip is
+    // a better UX than letting the user click into an error. Mirrors
+    // the Send-to-TV button's legacy/spec guard on the expand row.
+    const pineBtn = document.getElementById('btn-pine-export');
+    const pineStatus = document.getElementById('pine-export-status');
+    const pineResult = document.getElementById('pine-export-result');
+    if (pineBtn) {
+      if (isSpecMode) {
+        pineBtn.disabled = false;
+        pineBtn.title = 'Generate a Pine v5 entry-alerts indicator from this run';
+      } else {
+        pineBtn.disabled = true;
+        pineBtn.title = 'Pine export is spec-mode only — legacy GA runs have no spec to codegen from';
+      }
+    }
+    if (pineStatus) pineStatus.textContent = '';
+    if (pineResult) pineResult.innerHTML = '';
   } catch (err) {
     document.getElementById('detail-title').textContent = 'Error loading run';
     console.error(err);
@@ -2200,6 +2220,76 @@ window.recalcRun = async () => {
     renderCharts(data.ohlc ?? [], data.equity ?? [], detailTradeList);
     renderTradeTable(detailTradeList);
   } catch (err) {
+    status.textContent = 'Error: ' + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+/**
+ * Phase 4.6: Generate a Pine v5 entry-alerts indicator for the currently-
+ * open run. POSTs to /api/runs/:id/pine-export; server writes a .pine
+ * file under pine/generated/ (content-addressed by gene hash) and
+ * returns the source. We surface a one-line summary + a `<details>`
+ * collapsible preview so the user can spot-check without leaving the
+ * page. Re-clicking a run that's already been exported is cheap —
+ * the server returns `reused: true` when the file already exists.
+ *
+ * Errors render inline in red. Button is pre-disabled for legacy runs
+ * in openRunDetail so the click path is only reached when the server
+ * is expected to succeed; any error surfaced here is a real failure
+ * (missing spec, gene/spec mismatch, disk write failure) rather than
+ * a "you clicked on a legacy run" usability miss.
+ */
+window.generatePine = async () => {
+  if (!detailRunId) return;
+  const btn = document.getElementById('btn-pine-export');
+  const status = document.getElementById('pine-export-status');
+  const result = document.getElementById('pine-export-result');
+
+  btn.disabled = true;
+  status.textContent = 'Generating…';
+  status.style.color = '#8b949e';
+  result.innerHTML = '';
+
+  try {
+    const res = await fetch(`/api/runs/${detailRunId}/pine-export`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+    status.style.color = '#3fb950';
+    status.textContent = data.reused
+      ? 'Already generated — reused existing file'
+      : 'Generated';
+
+    // Escape the source for the <pre> — don't interpret HTML from
+    // the codegen even though we trust it, because Pine code can
+    // contain characters like `<=` that look fine but let one slip
+    // through and the DOM eats the rest of the page.
+    const esc = (s) => String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    result.innerHTML = `
+      <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;font-size:12px">
+        <div style="display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-family:monospace;margin-bottom:10px">
+          <div style="color:#8b949e">title</div>         <div>${esc(data.title)}</div>
+          <div style="color:#8b949e">shortTitle</div>    <div>${esc(data.shortTitle)}</div>
+          <div style="color:#8b949e">filename</div>      <div>${esc(data.filename)}</div>
+          <div style="color:#8b949e">hash</div>          <div>${esc(data.hash12)}</div>
+          <div style="color:#8b949e">size</div>          <div>${data.bytes} bytes · ${data.lines} lines</div>
+          <div style="color:#8b949e">path</div>          <div style="word-break:break-all;color:#6e7681">${esc(data.path)}</div>
+        </div>
+        <details>
+          <summary style="cursor:pointer;color:#58a6ff;font-size:12px">Show Pine source</summary>
+          <pre style="margin:8px 0 0;padding:10px;background:#010409;border:1px solid #30363d;border-radius:4px;max-height:400px;overflow:auto;font-size:11px;line-height:1.45">${esc(data.source)}</pre>
+        </details>
+        <div style="margin-top:10px;font-size:11px;color:#6e7681">
+          Next step: push to TradingView via <code style="color:#8b949e">node scripts/pine-deploy.js --spec strategies/${esc(data.filename).replace(/-[0-9a-f]+\.pine$/,'.json')}</code>
+          (reads MEMORY.md guardrails — won't overwrite an existing editor script without <code style="color:#8b949e">--allow-overwrite</code>).
+        </div>
+      </div>`;
+  } catch (err) {
+    status.style.color = '#f85149';
     status.textContent = 'Error: ' + err.message;
   } finally {
     btn.disabled = false;

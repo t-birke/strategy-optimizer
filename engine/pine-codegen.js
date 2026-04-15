@@ -34,7 +34,32 @@
  * the runtime honors regime for entry eligibility.
  */
 
+import { createHash } from 'node:crypto';
 import * as registry from './blocks/registry.js';
+
+/**
+ * Deterministic JSON stringify with sorted keys. Two genes with the same
+ * numeric content always produce the same string, regardless of how the
+ * caller assembled them. Shared between the API (`/api/runs/:id/pine-
+ * export`) and CLI scripts so both produce byte-identical gene hashes →
+ * identical `pine/generated/<spec-name>-<hash12>.pine` filenames for the
+ * same (spec, gene) pair.
+ */
+export function canonicalJson(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(canonicalJson).join(',') + ']';
+  const keys = Object.keys(v).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJson(v[k])).join(',') + '}';
+}
+
+/**
+ * First 12 hex chars of SHA-256(canonicalJson(gene)). Stable, short
+ * enough to fit a filename cleanly, collision-resistant for the few
+ * thousand winners a single user will ever generate.
+ */
+export function geneHash(gene) {
+  return createHash('sha256').update(canonicalJson(gene)).digest('hex').slice(0, 12);
+}
 
 // Scripts map spec name → friendly Pine `indicator()` short-title. Keeping
 // short-title ≤ 10 chars is a TV convention.

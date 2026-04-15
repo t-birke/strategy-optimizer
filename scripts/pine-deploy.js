@@ -39,13 +39,12 @@ import { readFile, writeFile, mkdir, unlink } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, basename } from 'node:path';
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 
 import * as registry from '../engine/blocks/registry.js';
 import { validateSpec } from '../engine/spec.js';
 import { buildParamSpace } from '../optimizer/param-space.js';
-import { generateEntryAlertsPine } from '../engine/pine-codegen.js';
+import { generateEntryAlertsPine, geneHash } from '../engine/pine-codegen.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -98,15 +97,9 @@ function buildBtcGene(paramSpace, p = BTC_LEGACY) {
   return g;
 }
 
-function canonicalJson(v) {
-  if (v === null || typeof v !== 'object') return JSON.stringify(v);
-  if (Array.isArray(v)) return '[' + v.map(canonicalJson).join(',') + ']';
-  const keys = Object.keys(v).sort();
-  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJson(v[k])).join(',') + '}';
-}
-function geneHash(gene) {
-  return createHash('sha256').update(canonicalJson(gene)).digest('hex').slice(0, 12);
-}
+// canonicalJson + geneHash now live in engine/pine-codegen.js so the API
+// endpoint, pine-export CLI, and this deploy script produce byte-identical
+// hashes for the same gene — filenames stay stable across entry points.
 
 // Parse `indicator("Title", "Short", ...)` first string arg out of Pine source
 // so we can collision-check before sending. If the regex misses, abort — we'd
