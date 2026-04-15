@@ -5,10 +5,15 @@
 import { Router } from 'express';
 import { readFile, readdir, stat, writeFile, rename, mkdir, unlink } from 'node:fs/promises';
 import { resolve, basename } from 'node:path';
+import { timingSafeEqual } from 'node:crypto';
 import os from 'node:os';
 import { getSymbolStats, getLastTimestamp, deleteSymbol } from '../db/candles.js';
 import { query, exec } from '../db/connection.js';
 import { upsertSpec, listSpecs, getSpec } from '../db/specs.js';
+import {
+  createDeployment, getDeployment, listDeployments,
+  recordWebhookEvent, countWebhookEvents,
+} from '../db/deployments.js';
 import {
   claimNextRun, heartbeat, completeRun,
   requestCancel, listQueue, recoverStaleRuns,
@@ -1195,6 +1200,263 @@ router.get('/api/diagnose/:symbol/:tf', async (req, res) => {
  * Exported so tests can drive it without a running server (inject a
  * stubbed `runOptimization` via module mocking if needed).
  */
+
+// ─── Phase 4.7a: Deployments + webhook receiver ─────────────
+//
+// Three endpoints:
+//   POST /api/deployments            — create a draft from a run
+//   GET  /api/deployments            — list (secret redacted)
+//   GET  /api/deployments/:id        — single deployment (secret revealed)
+//   POST /webhook/:id/:secret        — TV alert receiver
+//
+// Auth model: bearer-secret-in-URL. TV's "Webhook URL" alert config
+// can't add custom headers, so we accept the secret as a path segment
+// and compare it against `deployments.secret_key` with
+// `crypto.timingSafeEqual` (constant-time, no string-length leak).
+// The spec calls this "HMAC-signed" — strictly it's bearer-secret
+// auth, equivalent in this threat model since TV-as-client can't
+// compute a body-MAC dynamically per alert.
+//
+// Bytes-budget: TV alert payloads from our codegen are ~150-200
+// bytes; we cap at 4 KB to bound JSON-parse cost (the global
+// express.json() limit is 100 KB).
+//
+// Logging guideline (enforced by convention, not middleware): never
+// log `req.params.secret` or `deployment.secret_key`. The handler
+// uses `req.params.secret` for the comparison only and never
+// echoes it.
+
+const WEBHOOK_MAX_BYTES   = 4096;
+const WEBHOOK_MAX_AGE_MUL = 2;       // payload.bar_time may be at most
+                                     // 2 * timeframe minutes in the past
+                                     // — guards against alert replay.
+
+/**
+ * Constant-time secret comparison. Returns false on length mismatch
+ * without leaking that fact via timing — `timingSafeEqual` itself
+ * requires equal-length buffers, so we pad the shorter one and AND
+ * the equal-length-check at the end.
+ */
+function secretsMatch(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  // timingSafeEqual throws on length mismatch; pad and tag the result.
+  const len = Math.max(ab.length, bb.length);
+  const pa = Buffer.alloc(len); ab.copy(pa);
+  const pb = Buffer.alloc(len); bb.copy(pb);
+  const equalContent = timingSafeEqual(pa, pb);
+  return equalContent && ab.length === bb.length;
+}
+
+/**
+ * Strip the secret key for list responses. Single-deployment GET
+ * returns the secret in full (the UI's "reveal secret" affordance
+ * gates this on the client side — server doesn't track who's
+ * looking, since this is a single-user box).
+ */
+function redactSecret(d) {
+  if (!d) return d;
+  const { secret_key, ...rest } = d;
+  return { ...rest, secret_key_preview: secret_key ? `${secret_key.slice(0, 4)}…` : null };
+}
+
+/**
+ * POST /api/deployments
+ * Body: { run_id (required), mode? ('paper'), max_position_size?,
+ *         max_loss_per_day_usd?, config? }
+ *
+ * Creates a draft deployment by copying spec_hash / symbol / timeframe
+ * from the run. Mints a fresh secret. Returns the FULL deployment
+ * (including secret) — caller is the UI which immediately renders the
+ * secret for the user to copy into TV.
+ *
+ * 400 on missing/invalid run, legacy run, missing best_gene.
+ */
+router.post('/api/deployments', async (req, res) => {
+  try {
+    const { run_id, mode, max_position_size, max_loss_per_day_usd, config } = req.body || {};
+    if (!Number.isInteger(run_id)) {
+      return res.status(400).json({ error: 'run_id (integer) required' });
+    }
+    const runs = await query(`SELECT * FROM runs WHERE id = ${run_id}`);
+    if (runs.length === 0) return res.status(404).json({ error: 'Run not found' });
+    const run = runs[0];
+
+    // Same gating as Pine export — codegen needs a spec, and a run
+    // without a winning gene has nothing to deploy.
+    if (!run.spec_hash) {
+      return res.status(400).json({
+        error: 'Legacy runs cannot be deployed — spec-mode optimization required',
+      });
+    }
+    if (!run.best_gene) {
+      return res.status(400).json({ error: 'Run has no best gene yet' });
+    }
+
+    const d = await createDeployment({
+      run_id,
+      spec_hash:            run.spec_hash,
+      symbol:               run.symbol,
+      timeframe:            Number(run.timeframe),
+      mode:                 mode || 'paper',
+      max_position_size:    max_position_size ?? null,
+      max_loss_per_day_usd: max_loss_per_day_usd ?? null,
+      config:               config ?? null,
+    });
+    res.json(d);
+  } catch (err) {
+    console.error('POST /api/deployments:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/deployments?status=<status>
+ * Secret is REDACTED in list responses (only a 4-char preview), so
+ * accidental log-streaming of this list never leaks credentials.
+ */
+router.get('/api/deployments', async (req, res) => {
+  try {
+    const { status } = req.query;
+    const rows = await listDeployments({ status });
+    res.json(rows.map(redactSecret));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/deployments/:id
+ * Single deployment, secret in full. The UI gates the "reveal" on a
+ * click; this endpoint always returns it. (Single-user box; full
+ * auth is out of scope until we run remotely.)
+ */
+router.get('/api/deployments/:id', async (req, res) => {
+  try {
+    const d = await getDeployment(req.params.id);
+    if (!d) return res.status(404).json({ error: 'Deployment not found' });
+    const eventCount = await countWebhookEvents(d.id);
+    res.json({ ...d, event_count: eventCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /webhook/:deployment_id/:secret
+ *
+ * TV alert receiver. Validates secret, parses payload, deduplicates,
+ * persists. Does NOT dispatch — that's 4.7b. For now, every accepted
+ * event just lands in `webhook_events` and the dispatcher (when it
+ * exists) will pick it up.
+ *
+ * Response shape:
+ *   200  { ok:true,  event_id, deduped:false }   first time we've seen this signal
+ *   200  { ok:true,  event_id, deduped:true }    we've seen it; idempotent — TV stops retrying
+ *   400  { error }                               malformed payload, or stale (>2*tf old)
+ *   401  { error }                               bad secret (constant-time compared)
+ *   404  { error }                               unknown deployment_id
+ *   413  { error }                               body > 4 KB
+ *
+ * NOTE: 4.7a accepts events for ANY deployment status (draft included),
+ * since the dispatcher gates on `status='armed'` itself in 4.7b. This
+ * means a deployment can collect events while still in draft for
+ * end-to-end testing without arming.
+ */
+router.post('/webhook/:deployment_id/:secret', async (req, res) => {
+  try {
+    // ── Body-size guard ──
+    // Cheap pre-check via Content-Length; the global express.json()
+    // already capped at its default (100 KB), but we want a tighter
+    // budget on this route. Reject before we touch the DB.
+    const cl = parseInt(req.headers['content-length'] || '0', 10);
+    if (cl > WEBHOOK_MAX_BYTES) {
+      return res.status(413).json({ error: 'Body too large (max 4 KB)' });
+    }
+
+    // ── Resolve deployment ──
+    const id = Number(req.params.deployment_id);
+    if (!Number.isInteger(id)) {
+      return res.status(404).json({ error: 'Deployment not found' });
+    }
+    const d = await getDeployment(id);
+    if (!d) return res.status(404).json({ error: 'Deployment not found' });
+
+    // ── Auth (constant-time secret comparison) ──
+    // Whether the secret matches or not, we still record the attempt
+    // (with signature_ok=false) so abuse is auditable. But we record
+    // it ONLY if we got past the body-size + deployment-exists checks
+    // — otherwise we'd have an attacker-controlled write amp.
+    const ok = secretsMatch(req.params.secret, d.secret_key);
+    if (!ok) {
+      // Persist failed-auth attempt for audit (no secret in payload).
+      // Use a distinct dedup key so multiple failed attempts don't
+      // collapse into one row — bar_time may be missing, action 'auth_fail'.
+      const failPayload = {
+        action: 'auth_fail',
+        time:   new Date().toISOString().slice(0, 16) + 'Z',
+        ip:     req.ip || req.socket?.remoteAddress || null,
+      };
+      // Best-effort; swallow errors so a DB issue doesn't change the
+      // 401 we owe the caller.
+      try {
+        await recordWebhookEvent({
+          deployment_id: id,
+          payload:       failPayload,
+          signature_ok:  false,
+        });
+      } catch { /* ignore */ }
+      return res.status(401).json({ error: 'Invalid secret' });
+    }
+
+    // ── Parse + validate payload ──
+    const payload = req.body;
+    if (!payload || typeof payload !== 'object') {
+      return res.status(400).json({ error: 'JSON body required' });
+    }
+    if (!payload.action || !payload.time) {
+      return res.status(400).json({
+        error: 'Payload missing required fields (action, time)',
+      });
+    }
+
+    // Staleness guard. Payload time format from the codegen is
+    // 'YYYY-MM-DDTHH:MMZ' (no seconds). Date.parse handles it.
+    const payloadTs = Date.parse(payload.time);
+    if (Number.isNaN(payloadTs)) {
+      return res.status(400).json({ error: 'Invalid payload.time' });
+    }
+    const ageMs = Date.now() - payloadTs;
+    const maxAgeMs = WEBHOOK_MAX_AGE_MUL * d.timeframe * 60_000;
+    // We allow events up to maxAgeMs in the past AND up to one
+    // timeframe in the future (clock skew between TV server and ours).
+    if (ageMs > maxAgeMs) {
+      return res.status(400).json({
+        error: `Payload too stale (age ${Math.round(ageMs / 1000)}s > ${Math.round(maxAgeMs / 1000)}s allowed)`,
+      });
+    }
+    if (ageMs < -d.timeframe * 60_000) {
+      return res.status(400).json({ error: 'Payload time in the future' });
+    }
+
+    // ── Insert (with dedup) ──
+    const result = await recordWebhookEvent({
+      deployment_id: id,
+      payload,
+      signature_ok:  true,
+    });
+    return res.json({
+      ok:       true,
+      event_id: result.event.id,
+      deduped:  result.duplicate,
+    });
+  } catch (err) {
+    console.error('POST /webhook/:id/:secret:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 export async function processQueue() {
   if (processing) return;
   processing = true;

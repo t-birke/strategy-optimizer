@@ -1095,32 +1095,57 @@ won't notice.
 
 #### Sub-phases
 
-##### 4.7a — Webhook receiver + dedup (foundations)
-- **Goal:** TV alerts reach our server, get authenticated, deduped, and
-  persisted — no execution yet.
-- **Why first:** everything downstream assumes a reliable event stream.
-- **IN scope:**
-  - Schema: `deployments` table (id, spec_hash, symbol, timeframe, mode,
-    status, secret_key, pine_filename, pine_hash12, max_position_size,
-    max_loss_per_day_usd, config_json, created_at, armed_at, paused_at,
-    pause_reason). `webhook_events` table with
+##### ✅ 4.7a — Webhook receiver + dedup (foundations) — done.
+- IN scope (shipped):
+  - **Schema** (`db/schema.sql`): `deployments` table with CHECK
+    constraints on `mode IN ('dry-run','paper','live-stub')` (no `live`
+    value — defense in depth) and `status IN ('draft','armed','paused',
+    'retired')`. `webhook_events` table with
     `UNIQUE(deployment_id, dedup_key)`.
-  - Endpoints: `POST /webhook/:deployment_id/:secret` (HMAC-verify,
-    insert event, 200-on-dedup, 401-on-bad-sig). `POST /api/deployments`
-    (draft from a run). `GET /api/deployments`, `GET /api/deployments/:id`.
-  - **Process topology:** receiver in the same Express process for now;
-    split to `webhookd` in 4.7d.
-- **DEFERRED:** position model, dispatcher, Pine auto-push, UI deploy
-  button, tax pool, live-stub adapter.
-- **Gate (`scripts/deployment-webhook-check.js`):**
-  valid HMAC → 200 + row. Bad HMAC → 401 + no row. Duplicate
-  `(deployment_id, bar_time, action)` → 200 + `deduped:true`, only one
-  row persisted. Stale (>2*tf old) → 400. Unknown deployment → 404.
-- **Risks:** secret leakage (log redaction must strip `secret`), HMAC
-  timing attack (timingSafeEqual, never `===`), JSON parse DoS (cap body
-  at 4 KB on the webhook route specifically).
-- **Exit:** `curl` a fake TV payload → row in `webhook_events` with
-  `signature_ok=true`. Replay → row count still 1, `deduped:true`.
+  - **Helpers** (`db/deployments.js`): `createDeployment` (mints
+    64-hex secret via `randomBytes(32)`), `getDeployment`,
+    `listDeployments({status})`, `recordWebhookEvent` (probe-then-insert
+    dedup), `countWebhookEvents`, plus exported `mintSecret` + `dedupKey`
+    so the gate can compose colliding keys.
+  - **Endpoints** (`api/routes.js`):
+    - `POST /api/deployments` — draft from a run; rejects legacy runs
+      and runs without `best_gene` with the same gating as Pine export.
+    - `GET /api/deployments` — list with secret REDACTED to a 4-char
+      preview (`secret_key_preview`), so log-streaming can't leak.
+    - `GET /api/deployments/:id` — single deployment, secret revealed
+      (single-user-box convention; UI gates the reveal client-side).
+    - `POST /webhook/:deployment_id/:secret` — TV alert receiver.
+      Bearer-secret-in-URL auth via `crypto.timingSafeEqual` (constant
+      time, padded for length safety). Failed-auth attempts STILL get
+      persisted (signature_ok=false) for audit. Body cap 4 KB → 413,
+      stale (>2*tf) → 400, future-dated > 1tf → 400, missing
+      `action`/`time` → 400, unknown deployment → 404. Duplicates
+      (same dedup_key) return 200 + `deduped:true` + the original
+      `event_id` so callers can correlate.
+  - **Process topology:** receiver runs in the same Express process —
+    splits to a separate `webhookd` in 4.7d.
+- DEFERRED:
+  - Position model, dispatcher (4.7b)
+  - UI deploy button, Pine auto-push linkage (4.7c)
+  - `webhookd` process split, reconciler (4.7d)
+  - Independent price feed, live-stub adapter (4.7e)
+  - Status transitions (`arm`, `pause`, `retire`) — needed by 4.7c
+  - Tax pool (Phase 4.8 / Phase 5)
+- Regression gate `scripts/deployment-webhook-check.js` — **93 checks**,
+  three-section pattern: (1) schema columns + DB-level CHECK rejects
+  `mode='live'`; (2) `db/deployments.js` round-trips + helper rejects
+  `mode='live'`; (3) full server contract — happy path, redaction,
+  reveal-by-id, dedup, bad-secret-with-audit, unknown deployment, stale,
+  missing fields, body too large, AND a "close action does NOT dedup
+  with prior open" check (the dispatcher in 4.7b will rely on this to
+  distinguish entries from exits on the same bar).
+- Notes:
+  - "HMAC" in the original spec was aspirational. TV's webhook config
+    can't add custom headers, so per-alert body MAC is impossible —
+    the bearer-secret-in-URL pattern is the actual auth, equivalent
+    in this threat model.
+  - Schema is migration-safe (CREATE TABLE IF NOT EXISTS + the same
+    WAL-replay-safe pattern from the existing schema migrations).
 
 ##### 4.7b — Paper-mode dispatcher + position ledger
 - **Goal:** webhook events drive a paper-mode position state machine
