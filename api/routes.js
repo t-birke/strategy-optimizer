@@ -3,8 +3,16 @@
  */
 
 import { Router } from 'express';
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import os from 'node:os';
 import { getSymbolStats, getLastTimestamp, deleteSymbol } from '../db/candles.js';
 import { query, exec } from '../db/connection.js';
+import { upsertSpec, listSpecs, getSpec } from '../db/specs.js';
+import {
+  claimNextRun, heartbeat, completeRun,
+  requestCancel, listQueue,
+} from '../db/queue.js';
 import { checkSymbol, ingestSymbol, updateSymbol } from '../data/ingest.js';
 import { runOptimization } from '../optimizer/runner.js';
 import { geneShort } from '../optimizer/params.js';
@@ -12,14 +20,41 @@ import { broadcast } from './websocket.js';
 import { sendToTradingView, checkTradingViewConnection } from './tradingview.js';
 import { loadCandles } from '../db/candles.js';
 import { runStrategy } from '../engine/strategy.js';
+import * as registry from '../engine/blocks/registry.js';
+import { validateSpec } from '../engine/spec.js';
 
 const router = Router();
 
 // ─── Active state ────────────────────────────────────────────
-let activeRun = null;        // currently running optimization
+// Phase 4.2b: the queue itself is now DB-backed (runs.status='pending' IS
+// the queue). We still keep a handful of in-process variables for the
+// single active run's coordination:
+//   activeRun         — { runId, symbol, timeframe, label } of the run
+//                       currently holding the GA. `null` when idle.
+//   cancelRequested   — mid-GA cancel flag. Flipped true by the cancel
+//                       endpoint when the active run's id matches. The
+//                       runner reads it via shouldCancel().
+//   hyperRequested    — one-shot super-mutator trigger, consumed by runner.
+//   heartbeatTimer    — interval that bumps runs.heartbeat_at while the
+//                       GA is running. Cleared on completion/error.
+//   processing        — guard so processQueue is effectively single-threaded
+//                       against itself (drop re-entrant kicks).
+// The old `runQueue = []` array is gone — `claimNextRun` is the source of
+// truth. Pending rows survive server restarts (previous bug: they didn't).
+let activeRun = null;
 let cancelRequested = false;
-let hyperRequested = false;  // manual "Super Mutator" trigger — consumed once by runner
-const runQueue = [];          // pending optimization configs
+let hyperRequested = false;
+let heartbeatTimer = null;
+let processing = false;
+
+// Heartbeat interval during a running GA. 10s matches the db-schema-check
+// timing budget and is well below recoverStaleRuns's default 60s timeout.
+const HEARTBEAT_MS = 10_000;
+
+// Worker identifier stamped into runs.claimed_by when the in-process
+// drain claims a row. Mostly for debugging — even single-process mode
+// benefits from seeing which pid owned a stuck row.
+const WORKER_ID = `inproc.${os.hostname()}.${process.pid}`;
 
 // ─── Data management ─────────────────────────────────────────
 
@@ -177,10 +212,45 @@ router.post('/api/runs', async (req, res) => {
       spaceTravelInterval = 2, spaceTravelCount = 1,
       minTrades = 30, maxDrawdownPct = 50,
       knockoutMode = 'none', knockoutValueMode = 'midpoint',
+      spec: specInput = null,       // Phase 4.1: optional spec-mode run. Accepts
+                                    // an inline object or a filename string
+                                    // under `strategies/` (e.g.
+                                    // `"20260414-001-jm-simple-3tp-legacy.json"`).
     } = req.body;
 
     if (!symbols?.length || !intervals?.length) {
       return res.status(400).json({ error: 'symbols and intervals required' });
+    }
+
+    // ─── Spec-mode setup (Phase 4.1) ─────────────────────
+    // If the caller provided a spec, resolve → validate → upsert into the
+    // `specs` table. The run rows get spec_hash + spec_name pointers so
+    // we can always look back at the exact spec that produced them.
+    // Validation errors surface as 400 — misconfigured specs shouldn't
+    // silently fall back to legacy mode.
+    let rawSpec = null;
+    let validatedSpec = null;
+    if (specInput !== null && specInput !== undefined) {
+      await registry.ensureLoaded();
+      try {
+        if (typeof specInput === 'string') {
+          // Filename under strategies/. Reject absolute paths and
+          // "../" traversal for safety — this is a server-side read.
+          if (specInput.includes('..') || specInput.startsWith('/')) {
+            return res.status(400).json({ error: `spec path rejected: ${specInput}` });
+          }
+          const path = resolve(process.cwd(), 'strategies', specInput);
+          rawSpec = JSON.parse(await readFile(path, 'utf8'));
+        } else if (typeof specInput === 'object') {
+          rawSpec = specInput;
+        } else {
+          return res.status(400).json({ error: `spec must be a filename or object, got ${typeof specInput}` });
+        }
+        validatedSpec = validateSpec(rawSpec);
+        await upsertSpec(validatedSpec);
+      } catch (err) {
+        return res.status(400).json({ error: `spec error: ${err.message}` });
+      }
     }
 
     const INTERVAL_MAP = {
@@ -213,21 +283,49 @@ router.post('/api/runs', async (req, res) => {
           spaceTravelInterval, spaceTravelCount,
           minTrades, maxDrawdownPct: maxDrawdownPct / 100,
           knockoutMode, knockoutValueMode,
+          // Spec-mode fields (null in legacy mode).
+          //   spec      — raw spec JSON, consumed by runOptimization.
+          //   specHash  — persisted to runs.spec_hash at completion.
+          //   specName  — persisted to runs.spec_name (denormalized for UI listing).
+          spec:     rawSpec,
+          specHash: validatedSpec?.hash ?? null,
+          specName: validatedSpec?.name ?? null,
         });
       }
     }
 
     const runIds = [];
     for (const rc of runConfigs) {
-      const configJson = JSON.stringify({ populationSize: rc.populationSize, generations: rc.generations, mutationRate: rc.mutationRate, numIslands: rc.numIslands, numPlanets: rc.numPlanets, migrationInterval: rc.migrationInterval, migrationCount: rc.migrationCount, migrationTopology: rc.migrationTopology, spaceTravelInterval: rc.spaceTravelInterval, spaceTravelCount: rc.spaceTravelCount, minTrades: rc.minTrades, maxDrawdownPct: rc.maxDrawdownPct, endDate: rc.endDate, knockoutMode: rc.knockoutMode, knockoutValueMode: rc.knockoutValueMode });
-      await exec(`INSERT INTO runs (symbol, timeframe, start_date, status, config) VALUES ('${rc.symbol}', ${rc.timeframe}, '${rc.startDate}', 'pending', '${configJson}')`);
+      // Phase 4.2b: persist the full GA config on the row so a later
+      // claimNextRun can reconstruct runOptimization's args without any
+      // in-memory sidecar. The spec itself is NOT inlined here — it's
+      // already in the `specs` table, reachable via `spec_hash`.
+      const configJson = JSON.stringify({
+        populationSize: rc.populationSize, generations: rc.generations, mutationRate: rc.mutationRate,
+        numIslands: rc.numIslands, numPlanets: rc.numPlanets,
+        migrationInterval: rc.migrationInterval, migrationCount: rc.migrationCount, migrationTopology: rc.migrationTopology,
+        spaceTravelInterval: rc.spaceTravelInterval, spaceTravelCount: rc.spaceTravelCount,
+        minTrades: rc.minTrades, maxDrawdownPct: rc.maxDrawdownPct,
+        endDate: rc.endDate,
+        knockoutMode: rc.knockoutMode, knockoutValueMode: rc.knockoutValueMode,
+        label: rc.label,
+      }).replace(/'/g, "''");
+      // Set spec_hash / spec_name at enqueue so even pending runs carry
+      // the link — listings can show "spec: <name>" before the run starts.
+      const specCols = rc.specHash
+        ? `, spec_hash, spec_name`
+        : '';
+      const specVals = rc.specHash
+        ? `, '${rc.specHash}', '${rc.specName.replace(/'/g, "''")}'`
+        : '';
+      await exec(`INSERT INTO runs (symbol, timeframe, start_date, status, config${specCols}) VALUES ('${rc.symbol}', ${rc.timeframe}, '${rc.startDate}', 'pending', '${configJson}'${specVals})`);
       const rows = await query('SELECT MAX(id) AS id FROM runs');
       const runId = rows[0].id;
       runIds.push(runId);
-      runQueue.push({ ...rc, runId });
     }
 
-    // Start processing queue if not already running
+    // Kick the drain loop. processQueue is idempotent — a second kick
+    // while it's already draining is a no-op.
     processQueue();
 
     res.json({ status: 'queued', runIds, totalRuns: runConfigs.length });
@@ -349,32 +447,59 @@ router.post('/api/runs/:id/hypermutate', async (req, res) => {
 
 router.post('/api/runs/:id/cancel', async (req, res) => {
   const id = parseInt(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid id' });
 
-  // Check if it's the active run
+  // Phase 4.2b cancel semantics:
+  //   - If it's the active run: flip the in-process cancelRequested flag
+  //     so the runner sees it via shouldCancel() and stops within the
+  //     current generation. ALSO set runs.cancel_requested = TRUE via
+  //     requestCancel so the DB is the source of truth (and future 4.2d
+  //     cancel-propagation in the runner itself can use the same signal).
+  //   - If it's a pending row: requestCancel flips the flag; the next
+  //     claimNextRun sweeps it to 'cancelled' and moves on. No need to
+  //     manually UPDATE status here.
+  //   - If the row doesn't exist or is already terminal, requestCancel
+  //     returns false and we 404.
+  const flagged = await requestCancel(id);
+  if (!flagged) return res.status(404).json({ error: 'Run not in queue or active' });
+
   if (activeRun?.runId === id) {
     cancelRequested = true;
-    res.json({ status: 'cancelling' });
-    return;
+    return res.json({ status: 'cancelling' });
   }
-
-  // Remove from queue
-  const idx = runQueue.findIndex(r => r.runId === id);
-  if (idx >= 0) {
-    runQueue.splice(idx, 1);
-    await exec(`UPDATE runs SET status = 'cancelled' WHERE id = ${id}`);
-    broadcast({ type: 'run_cancelled', runId: id });
-    res.json({ status: 'cancelled' });
-    return;
-  }
-
-  res.status(404).json({ error: 'Run not in queue or active' });
+  res.json({ status: 'cancel_requested' });
 });
 
-router.get('/api/queue', (req, res) => {
-  res.json({
-    active: activeRun ? { runId: activeRun.runId, symbol: activeRun.symbol, timeframe: activeRun.timeframe } : null,
-    pending: runQueue.map(r => ({ runId: r.runId, symbol: r.symbol, timeframe: r.timeframe, label: r.label })),
-  });
+router.get('/api/queue', async (req, res) => {
+  try {
+    // Phase 4.2b: queue is DB-backed. listQueue returns pending + running
+    // rows (cheap metadata, no big JSON payloads). We still surface the
+    // active run via the in-process singleton so the UI gets the friendly
+    // `label` we stashed on the config.
+    const rows = await listQueue();
+    const active = activeRun
+      ? { runId: activeRun.runId, symbol: activeRun.symbol, timeframe: activeRun.timeframe, label: activeRun.label }
+      : null;
+    const pending = rows
+      .filter(r => r.status === 'pending')
+      .map(r => ({
+        runId: r.id,
+        symbol: r.symbol,
+        timeframe: r.timeframe,
+        priority: r.priority,
+        specName: r.spec_name,
+        // `label` lives in the config JSON — parse best-effort.
+        label: (() => {
+          try {
+            const c = typeof r.config === 'string' ? JSON.parse(r.config) : r.config;
+            return c?.label ?? null;
+          } catch { return null; }
+        })(),
+      }));
+    res.json({ active, pending });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─── TradingView bridge ────────────────────────────────────
@@ -484,68 +609,161 @@ router.get('/api/diagnose/:symbol/:tf', async (req, res) => {
   }
 });
 
-// ─── Queue processor ────────────────────────────────────────
+// ─── Queue processor (Phase 4.2b — DB-backed) ──────────────
 
-async function processQueue() {
-  if (activeRun) return; // already processing
+/**
+ * Drain the run queue. Claims the highest-priority pending row via
+ * `claimNextRun`, reconstructs `runOptimization` args from `runs.config`
+ * + `specs.json`, runs the GA (with heartbeat pings), and persists the
+ * result via `completeRun`.
+ *
+ * Idempotent — a second call while already draining is a no-op
+ * (`processing` guard). Callers that enqueue should always kick this
+ * function; it takes care of looping until the queue empties.
+ *
+ * Exported so tests can drive it without a running server (inject a
+ * stubbed `runOptimization` via module mocking if needed).
+ */
+export async function processQueue() {
+  if (processing) return;
+  processing = true;
 
-  while (runQueue.length > 0) {
-    const config = runQueue.shift();
-    activeRun = config;
-    cancelRequested = false;
-    hyperRequested = false;
+  try {
+    while (true) {
+      const row = await claimNextRun({ workerId: WORKER_ID });
+      if (!row) break; // queue empty
 
-    const { runId } = config;
+      const runId = row.id;
 
-    try {
-      await exec(`UPDATE runs SET status = 'running', started_at = current_timestamp WHERE id = ${runId}`);
-      broadcast({ type: 'run_started', runId, symbol: config.symbol, timeframe: config.timeframe, label: config.label });
+      // Rebuild the runOptimization args from persisted state. The DB row
+      // carries symbol/timeframe/start_date as columns; everything else
+      // lives in the `config` JSON (written at enqueue). The spec, if any,
+      // is reached via spec_hash → specs.json.
+      let cfg;
+      try {
+        cfg = typeof row.config === 'string' ? JSON.parse(row.config) : (row.config || {});
+      } catch (err) {
+        await completeRun(runId, {
+          status: 'failed',
+          error: `config JSON parse error: ${err.message}`,
+        });
+        broadcast({ type: 'run_error', runId, error: `config JSON parse error: ${err.message}` });
+        continue;
+      }
 
-      const result = await runOptimization({
-        ...config,
-        onProgress: (progress) => {
-          if (progress.setup) {
-            broadcast({ type: 'run_status', runId, phase: progress.phase, detail: progress.detail });
-            return;
-          }
-          broadcast({ type: 'generation', runId, ...progress });
-          // Update DB periodically
-          if (progress.gen % 10 === 0) {
-            exec(`UPDATE runs SET generations_completed = ${progress.gen}, total_evaluations = ${progress.evalCount} WHERE id = ${runId}`).catch(() => {});
-          }
-        },
-        shouldCancel: () => cancelRequested,
-        shouldHypermutate: () => {
-          // Consume-once: flag flips false after the runner reads it true
-          if (hyperRequested) { hyperRequested = false; return true; }
-          return false;
-        },
-      });
+      let spec = null;
+      if (row.spec_hash) {
+        try {
+          const persisted = await getSpec(row.spec_hash);
+          spec = persisted?.json ?? null;
+          if (!spec) throw new Error(`spec not found for hash ${row.spec_hash}`);
+        } catch (err) {
+          await completeRun(runId, { status: 'failed', error: `spec load error: ${err.message}` });
+          broadcast({ type: 'run_error', runId, error: `spec load error: ${err.message}` });
+          continue;
+        }
+      }
 
-      // Store results (including partial results from aborted runs)
-      const finalStatus = cancelRequested ? 'cancelled' : 'completed';
-      const bestGene = JSON.stringify(result.bestGene).replace(/'/g, "''");
-      const bestMetrics = JSON.stringify(result.bestMetrics).replace(/'/g, "''");
-      const topResults = JSON.stringify(result.topResults).replace(/'/g, "''");
-      const genLog = JSON.stringify(result.generationLog).replace(/'/g, "''");
-
-      await exec(`UPDATE runs SET status = '${finalStatus}', best_gene = '${bestGene}', best_metrics = '${bestMetrics}', top_results = '${topResults}', generation_log = '${genLog}', generations_completed = ${result.completedGens}, total_evaluations = ${result.totalEvaluations}, completed_at = current_timestamp WHERE id = ${runId}`);
+      // Publish active-run state + start heartbeat interval. Heartbeat
+      // failures are silent — recoverStaleRuns will catch a truly dead
+      // runner on next server boot.
+      activeRun = {
+        runId,
+        symbol: row.symbol,
+        timeframe: row.timeframe,
+        label: cfg.label ?? null,
+        specHash: row.spec_hash ?? null,
+        specName: row.spec_name ?? null,
+      };
+      cancelRequested = false;
+      hyperRequested = false;
+      heartbeatTimer = setInterval(() => {
+        heartbeat(runId).catch(() => {});
+      }, HEARTBEAT_MS);
 
       broadcast({
-        type: cancelRequested ? 'run_cancelled' : 'run_completed',
-        runId,
-        bestScore: result.bestScore,
-        bestMetrics: result.bestMetrics,
-        bestConfig: geneShort(result.bestGene),
-        totalTimeMs: result.totalTimeMs,
+        type: 'run_started', runId,
+        symbol: row.symbol, timeframe: row.timeframe, label: cfg.label ?? null,
       });
-    } catch (err) {
-      const errorMsg = err.message.replace(/'/g, "''");
-      await exec(`UPDATE runs SET status = 'failed', error = '${errorMsg}', completed_at = current_timestamp WHERE id = ${runId}`).catch(() => {});
-      broadcast({ type: 'run_error', runId, error: err.message });
-    }
 
-    activeRun = null;
+      try {
+        const result = await runOptimization({
+          symbol: row.symbol,
+          timeframe: row.timeframe,
+          startDate: row.start_date,
+          endDate: cfg.endDate,
+          populationSize: cfg.populationSize,
+          generations:    cfg.generations,
+          mutationRate:   cfg.mutationRate,
+          numIslands:     cfg.numIslands,
+          numPlanets:     cfg.numPlanets,
+          migrationInterval: cfg.migrationInterval,
+          migrationCount:    cfg.migrationCount,
+          migrationTopology: cfg.migrationTopology,
+          spaceTravelInterval: cfg.spaceTravelInterval,
+          spaceTravelCount:    cfg.spaceTravelCount,
+          minTrades:      cfg.minTrades,
+          maxDrawdownPct: cfg.maxDrawdownPct,
+          knockoutMode:   cfg.knockoutMode,
+          knockoutValueMode: cfg.knockoutValueMode,
+          spec,
+          onProgress: (progress) => {
+            if (progress.setup) {
+              broadcast({ type: 'run_status', runId, phase: progress.phase, detail: progress.detail });
+              return;
+            }
+            broadcast({ type: 'generation', runId, ...progress });
+            if (progress.gen % 10 === 0) {
+              exec(`UPDATE runs SET generations_completed = ${progress.gen}, total_evaluations = ${progress.evalCount} WHERE id = ${runId}`).catch(() => {});
+            }
+          },
+          shouldCancel: () => cancelRequested,
+          shouldHypermutate: () => {
+            // Consume-once: flag flips false after the runner reads it true
+            if (hyperRequested) { hyperRequested = false; return true; }
+            return false;
+          },
+        });
+
+        // Persist the result. completeRun handles all NULL-safe JSON
+        // columns and terminal-status semantics. Spec-mode rows get the
+        // fitness/regime/wf breakdowns; legacy rows leave them null.
+        const specMode = Boolean(spec);
+        await completeRun(runId, {
+          status: cancelRequested ? 'cancelled' : 'completed',
+          bestGene:      result.bestGene,
+          bestMetrics:   result.bestMetrics,
+          topResults:    result.topResults,
+          generationLog: result.generationLog,
+          fitnessBreakdownJson: specMode ? (result.bestMetrics?._fitness ?? null) : null,
+          regimeBreakdownJson:  specMode ? (result.bestMetrics?.regimeBreakdown ?? null) : null,
+          wfReportJson:         specMode ? (result.wfReport ?? null) : null,
+          generationsCompleted: result.completedGens,
+          totalEvaluations:     result.totalEvaluations,
+        });
+
+        broadcast({
+          type: cancelRequested ? 'run_cancelled' : 'run_completed',
+          runId,
+          bestScore: result.bestScore,
+          bestMetrics: result.bestMetrics,
+          bestConfig: geneShort(result.bestGene),
+          totalTimeMs: result.totalTimeMs,
+        });
+      } catch (err) {
+        await completeRun(runId, { status: 'failed', error: err.message })
+          .catch(() => {});
+        broadcast({ type: 'run_error', runId, error: err.message });
+      } finally {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+        activeRun = null;
+        cancelRequested = false;
+        hyperRequested = false;
+      }
+    }
+  } finally {
+    processing = false;
   }
 }
 

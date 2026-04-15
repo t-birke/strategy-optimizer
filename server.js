@@ -32,12 +32,21 @@ initWebSocket(server);
 // Initialize DB on startup
 await getConn();
 
-// Reset any runs left in 'running' state from a previous crash
-import { query, exec } from './db/connection.js';
-const staleRuns = await query("SELECT id FROM runs WHERE status = 'running'");
-if (staleRuns.length > 0) {
-  await exec("UPDATE runs SET status = 'failed', error = 'Server restarted during run' WHERE status = 'running'");
-  console.log(`Reset ${staleRuns.length} stale 'running' run(s) to 'failed'`);
+// Phase 4.2b: sweep any rows left in 'running' state from a prior session.
+// In single-process mode there are no other workers, so every `running`
+// row at boot is definitionally stale — no heartbeat could have fired
+// while we were down. recoverStaleRuns sends them back to `pending` (not
+// `failed`) so the queue can pick them up again, which is the right
+// default: the user enqueued the run, a crash/restart shouldn't silently
+// drop it.
+//
+// If you want crashed rows to stay failed instead, change the follow-up
+// in processQueue() to cap re-claim attempts (e.g. increment an `attempts`
+// counter and mark failed at N).
+import { recoverStaleRuns } from './db/queue.js';
+const recovered = await recoverStaleRuns({ timeoutMs: 1_000 });
+if (recovered > 0) {
+  console.log(`Recovered ${recovered} stale 'running' run(s) → 'pending'`);
 }
 
 server.listen(PORT, () => {
