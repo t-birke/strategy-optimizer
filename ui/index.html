@@ -13,6 +13,7 @@
     <a href="#optimizer" class="nav-link" data-page="optimizer">Optimizer</a>
     <a href="#specs" class="nav-link" data-page="specs">Specs</a>
     <a href="#run-detail" class="nav-link" data-page="run-detail" id="nav-run-detail" style="display:none">Run Detail</a>
+    <a href="#compare" class="nav-link" data-page="compare" id="nav-compare" style="display:none">Compare Runs</a>
     <span id="tv-badge" class="badge" style="display:none;margin-left:auto;font-size:11px"></span>
   </nav>
 
@@ -58,8 +59,26 @@
 
   <!-- ═══════════ OPTIMIZER PAGE ═══════════ -->
   <div id="page-optimizer" class="page">
-    <div style="display:flex;gap:16px;margin-bottom:16px">
+    <div style="display:flex;gap:16px;margin-bottom:16px;align-items:center">
       <button id="btn-new-run" class="primary">New Run</button>
+      <!-- Phase 4.5b: compare-runs toolbar. `btn-compare-toggle` flips the
+           runs table into select mode (reveals a checkbox column); once
+           2+ rows are checked, `btn-compare-go` navigates to
+           #compare?ids=a,b (bookmarkable URL form). Legacy/non-spec-mode
+           runs can still be selected — the compare page itself surfaces
+           "no WF data" rather than hiding them, which is honest and
+           keeps the table simple. -->
+      <button id="btn-compare-toggle" style="font-size:13px;padding:6px 14px"
+              title="Pick 2+ runs via checkboxes, then click Compare to view their walk-forward reports side-by-side.">
+        Select to compare
+      </button>
+      <button id="btn-compare-go" class="primary"
+              style="font-size:13px;padding:6px 14px;display:none;background:#6e40c9;border-color:#6e40c9">
+        Compare (<span id="compare-count">0</span>)
+      </button>
+      <span id="compare-hint" style="font-size:12px;color:#8b949e;display:none">
+        Check 2 or more rows to enable Compare
+      </span>
     </div>
 
     <!-- Live progress panel -->
@@ -104,6 +123,14 @@
       <table id="runs-table">
         <thead>
           <tr>
+            <!-- Phase 4.5b: compare-select column. Hidden until the user
+                 clicks "Select to compare" (app.js toggles the `.compare-mode`
+                 class on the table). Keeps the default table width unchanged
+                 so non-compare users don't see empty whitespace. -->
+            <th class="compare-col" style="display:none;width:28px">
+              <input type="checkbox" id="compare-select-all"
+                     title="Select/deselect all visible runs" />
+            </th>
             <th>ID</th>
             <th>Symbol</th>
             <th>TF</th>
@@ -528,6 +555,110 @@
           </thead>
           <tbody id="detail-trades-tbody"></tbody>
         </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ COMPARE RUNS PAGE (Phase 4.5b) ═══════════ -->
+  <!--
+    Side-by-side walk-forward comparison. Reached via
+    #compare?ids=<id1>,<id2>. Mirrors the structure of #page-run-detail's
+    Walk-Forward card twice (suffix -a / -b) so renderWalkForwardReport
+    can fill either column with the same helper.
+
+    MVP scope (4.5b):
+      - 2 runs side-by-side. 3+ way compare deferred to 4.5c.
+      - Per-column header strip: spec name, symbol / tf / start_date,
+        fitness score chip.
+      - Walk-Forward Report card per column (summary chips + per-window
+        table).
+      - Cross-column highlights: winner OOS PF green / loser red per
+        window row (only if the gap is >10%), amber banner if scheme
+        or nWindows don't match (comparing apples to oranges).
+
+    Deferred (4.5c+): regime-breakdown diff, fitness-breakdown chip
+    diff, 3+ way grid, "winner dominates" verdict, CSV export.
+  -->
+  <div id="page-compare" class="page">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+      <button onclick="closeCompare()" style="font-size:13px;padding:4px 12px">← Back</button>
+      <h2 style="margin:0;font-size:18px">Compare Runs</h2>
+      <span id="compare-title" style="font-size:13px;color:#8b949e;font-family:monospace"></span>
+    </div>
+
+    <!-- Mismatch banner: shown when the two runs' WF reports disagree
+         on `scheme` or `nWindows`. A silent side-by-side of apples and
+         oranges is worse than an explicit flag. -->
+    <div id="compare-mismatch-banner" class="card cmp-mismatch" style="display:none;margin-bottom:16px">
+      <div id="compare-mismatch-body" style="font-size:13px;color:#e6edf3"></div>
+    </div>
+
+    <!-- Empty-state message when one or both runs has no WF data (legacy
+         GA runs, still-running runs, failed runs). renderWalkForwardReport
+         already hides its card on null input; this line tells the user why. -->
+    <div id="compare-empty-note" style="display:none;margin-bottom:16px;font-size:13px;color:#d29922"></div>
+
+    <div class="compare-grid">
+      <!-- Column A -->
+      <div>
+        <div class="card" id="compare-header-a" style="margin-bottom:16px">
+          <div id="compare-header-body-a"></div>
+        </div>
+
+        <div class="card" id="detail-wf-card-a" style="display:none;margin-bottom:16px">
+          <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em"
+              title="Walk-forward analysis. Each window fits the strategy on an in-sample slice, then evaluates it on the next OOS slice. High WFE (OOS PF / IS PF) means the strategy generalizes; low WFE means it overfit to IS data.">
+            Walk-Forward Report
+          </h3>
+          <div id="detail-wf-summary-a" style="margin-bottom:12px"></div>
+          <div style="overflow-x:auto">
+            <table id="detail-wf-table-a" style="width:100%;font-size:12px;border-collapse:collapse">
+              <thead>
+                <tr style="color:#8b949e;border-bottom:1px solid #30363d">
+                  <th style="text-align:left;padding:6px 8px">Window</th>
+                  <th style="text-align:right;padding:6px 8px" title="In-sample trade count">IS trades</th>
+                  <th style="text-align:right;padding:6px 8px" title="In-sample profit factor">IS PF</th>
+                  <th style="text-align:right;padding:6px 8px" title="In-sample net return %">IS net %</th>
+                  <th style="text-align:right;padding:6px 8px" title="Out-of-sample trade count">OOS trades</th>
+                  <th style="text-align:right;padding:6px 8px" title="Out-of-sample profit factor">OOS PF</th>
+                  <th style="text-align:right;padding:6px 8px" title="Out-of-sample net return %">OOS net %</th>
+                </tr>
+              </thead>
+              <tbody id="detail-wf-tbody-a"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Column B -->
+      <div>
+        <div class="card" id="compare-header-b" style="margin-bottom:16px">
+          <div id="compare-header-body-b"></div>
+        </div>
+
+        <div class="card" id="detail-wf-card-b" style="display:none;margin-bottom:16px">
+          <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em"
+              title="Walk-forward analysis. Each window fits the strategy on an in-sample slice, then evaluates it on the next OOS slice. High WFE (OOS PF / IS PF) means the strategy generalizes; low WFE means it overfit to IS data.">
+            Walk-Forward Report
+          </h3>
+          <div id="detail-wf-summary-b" style="margin-bottom:12px"></div>
+          <div style="overflow-x:auto">
+            <table id="detail-wf-table-b" style="width:100%;font-size:12px;border-collapse:collapse">
+              <thead>
+                <tr style="color:#8b949e;border-bottom:1px solid #30363d">
+                  <th style="text-align:left;padding:6px 8px">Window</th>
+                  <th style="text-align:right;padding:6px 8px" title="In-sample trade count">IS trades</th>
+                  <th style="text-align:right;padding:6px 8px" title="In-sample profit factor">IS PF</th>
+                  <th style="text-align:right;padding:6px 8px" title="In-sample net return %">IS net %</th>
+                  <th style="text-align:right;padding:6px 8px" title="Out-of-sample trade count">OOS trades</th>
+                  <th style="text-align:right;padding:6px 8px" title="Out-of-sample profit factor">OOS PF</th>
+                  <th style="text-align:right;padding:6px 8px" title="Out-of-sample net return %">OOS net %</th>
+                </tr>
+              </thead>
+              <tbody id="detail-wf-tbody-b"></tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </div>
   </div>

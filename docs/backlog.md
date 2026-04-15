@@ -861,7 +861,62 @@ case.
   and the server contract end-to-end via an in-memory DuckDB INSERT
   (points at a temp DB via `OPTIMIZER_DB_PATH` so it coexists with the
   long-running dev server).
-- 4.5b (compare-runs side-by-side) deferred.
+
+**✅ 4.5b — compare runs (side-by-side WF view) — done.**
+- IN scope:
+  - New `#page-compare` in `ui/index.html`: two-column grid with mirrored
+    Walk-Forward Report cards (`detail-wf-card-a` / `-b`), each carrying
+    its own summary block + per-window table. Mismatch banner and empty-
+    state note sit above the grid.
+  - `renderWalkForwardReport(wf, idSuffix = '')` refactored to interpolate
+    `${idSuffix}` into all `getElementById` calls — same function now
+    drives both the run-detail page (suffix `''`) and the compare page
+    (suffixes `'-a'` / `'-b'`).
+  - Runs-table grew a hidden `.compare-col` column (checkbox per row,
+    select-all in the header). A **Compare** toggle button next to
+    New Run reveals the column, builds a `selectedRunIds` Set, and
+    enables a **Compare (N)** button once at least two runs are ticked.
+    Expand-row `colspan` bumped 15 → 16 to cover the new column.
+  - Hash routing: clicking Compare sets `location.hash =
+    #compare?ids=a,b`, a `hashchange` listener calls
+    `routeCompareFromHash`, and the URL is bookmarkable / shareable.
+  - `openCompare(ids)` fans out via `Promise.all` over two
+    `/api/runs/:id` fetches, renders a header chip row per column
+    (Run #id · spec_name · symbol/TF · start · fitness chip), then
+    delegates the WF card to the shared helper. A deleted / unreachable
+    run shows a red "Run #id not found" header without blanking the
+    other column.
+  - `highlightCompareWindows(wfA, wfB)` walks `min(len_a, len_b)` OOS
+    PF pairs; when the relative gap (`|a-b| / max(|a|,|b|)`) exceeds
+    10 %, it tags the winner row with `.cmp-best` (green) and the loser
+    with `.cmp-worst` (red). Near-ties and non-finite PFs render plain —
+    same 10 % threshold surfaces meaningful divergence without coloring
+    noise.
+  - Mismatch banner fires when both runs have WF data but disagree on
+    `scheme` (anchored vs rolling) or `nWindows` — aligning unlike
+    windows side-by-side would be misleading without the callout.
+  - `closeCompare()` returns to the optimizer page and hides the
+    `#nav-compare` breadcrumb (revealed on open, same pattern as
+    `#nav-run-detail`).
+  - CSS: `.compare-grid` (1fr 1fr, collapses to single column under
+    900 px), `tr.cmp-best` / `tr.cmp-worst` backgrounds, and a yellow
+    `.cmp-mismatch` border for the banner.
+  - Gate: `scripts/ui-compare-check.js` — three sections (DOM markers,
+    JS wiring with a behavioral subsection that extracts
+    `highlightCompareWindows` and runs it against a mock DOM, and a
+    server-contract round-trip that seeds two runs with contrasting
+    WF reports and verifies both come back as parsed objects).
+    Reuses the `OPTIMIZER_DB_PATH` temp-DB pattern from 4.5a plus the
+    `BigInt.prototype.toJSON` shim so the gate coexists with a running
+    dev server.
+- DEFERRED (intentionally out of scope for this slice):
+  - N-way compare (> 2 runs). Current UI picks the first two ticked.
+  - Non-WF compare panels (fitness breakdown delta, regime delta,
+    param-diff). Today's compare is WF-only.
+  - Server-side `/api/runs/compare` endpoint. We reuse two calls to the
+    existing `/api/runs/:id` — no backend changes.
+  - Legacy-run compare (no `wf_report_json`). Surfaced via the
+    empty-state note rather than synthesized.
 
 ### 4.6 Pine export
 - "Generate Pine indicator" button per winning run.

@@ -60,6 +60,122 @@ if (location.hash === '#optimizer') {
   document.querySelector('[data-page="optimizer"]').click();
 }
 
+// ─── Phase 4.5b: compare-runs state + wiring ───────────────────
+//
+// UX: user clicks "Select to compare" → runs-table reveals a
+// checkbox column (`.compare-col` `display:none` default, flipped via
+// compareMode). When 2+ rows are checked, the "Compare (N)" button
+// lights up and navigates to `#compare?ids=a,b`. The URL is the
+// single source of truth for which runs are on screen — so the
+// comparison is shareable/bookmarkable and Back works normally.
+//
+// Rebuilds of the runs table (auto-refresh every 10s, or after a
+// new-run completion) re-apply compareMode via applyCompareModeToTable()
+// at the tail of loadRuns, so the checkbox column doesn't vanish
+// mid-selection. Selection state lives in `selectedRunIds` (Set) and
+// survives rebuilds — checkboxes render `checked` for ids in the Set.
+const selectedRunIds = new Set();
+let compareMode = false;
+
+function applyCompareModeToTable() {
+  const show = compareMode;
+  document.querySelectorAll('#runs-table .compare-col')
+    .forEach(el => { el.style.display = show ? '' : 'none'; });
+  const toggleBtn = document.getElementById('btn-compare-toggle');
+  if (toggleBtn) toggleBtn.textContent = show ? 'Cancel select' : 'Select to compare';
+}
+
+function updateCompareButtons() {
+  const n = selectedRunIds.size;
+  const countEl = document.getElementById('compare-count');
+  if (countEl) countEl.textContent = n;
+  const goBtn = document.getElementById('btn-compare-go');
+  const hint  = document.getElementById('compare-hint');
+  if (!compareMode) {
+    if (goBtn) goBtn.style.display = 'none';
+    if (hint)  hint.style.display  = 'none';
+  } else if (n >= 2) {
+    if (goBtn) goBtn.style.display = '';
+    if (hint)  hint.style.display  = 'none';
+  } else {
+    if (goBtn) goBtn.style.display = 'none';
+    if (hint)  hint.style.display  = '';
+  }
+}
+
+document.getElementById('btn-compare-toggle')?.addEventListener('click', () => {
+  compareMode = !compareMode;
+  if (!compareMode) {
+    // Leaving compare mode clears the selection — "Cancel select" is
+    // a reset, not just a hide. Otherwise a stale Set would resurface
+    // next time the user re-enters compare mode.
+    selectedRunIds.clear();
+    document.querySelectorAll('.compare-row-check').forEach(cb => { cb.checked = false; });
+  }
+  applyCompareModeToTable();
+  updateCompareButtons();
+});
+
+// Per-row checkbox changes via event delegation. The tbody is rebuilt
+// on every loadRuns(); delegating avoids re-binding N listeners each
+// refresh.
+document.querySelector('#runs-table tbody')?.addEventListener('change', (e) => {
+  const cb = e.target.closest('.compare-row-check');
+  if (!cb) return;
+  const id = Number(cb.dataset.runId);
+  if (!Number.isFinite(id)) return;
+  if (cb.checked) selectedRunIds.add(id);
+  else selectedRunIds.delete(id);
+  updateCompareButtons();
+});
+
+document.getElementById('compare-select-all')?.addEventListener('change', (e) => {
+  const checked = e.target.checked;
+  document.querySelectorAll('.compare-row-check').forEach(cb => {
+    cb.checked = checked;
+    const id = Number(cb.dataset.runId);
+    if (!Number.isFinite(id)) return;
+    if (checked) selectedRunIds.add(id);
+    else selectedRunIds.delete(id);
+  });
+  updateCompareButtons();
+});
+
+document.getElementById('btn-compare-go')?.addEventListener('click', () => {
+  // MVP is 2-way — take the two lowest-numbered selections for a
+  // deterministic URL. 3+ way compare deferred to 4.5c.
+  const ids = [...selectedRunIds].sort((a, b) => a - b).slice(0, 2);
+  if (ids.length < 2) return;
+  location.hash = `#compare?ids=${ids.join(',')}`;
+});
+
+// Hash routing — #compare?ids=a,b opens the compare page. Separate
+// branch from the standard nav-link router because this route carries
+// query args (ids) and triggers an async fetch.
+function routeCompareFromHash() {
+  const hash = location.hash;
+  if (!hash.startsWith('#compare')) return false;
+  const m = hash.match(/ids=([^&]+)/);
+  if (!m) return false;
+  const ids = m[1].split(',').map(Number).filter(Number.isFinite);
+  if (ids.length < 2) return false;
+  openCompare(ids);
+  return true;
+}
+
+window.addEventListener('hashchange', routeCompareFromHash);
+// Initial route (e.g. user pasted a #compare URL).
+routeCompareFromHash();
+
+window.closeCompare = () => {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-optimizer').classList.add('active');
+  document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+  document.querySelector('[data-page="optimizer"]').classList.add('active');
+  document.getElementById('nav-compare').style.display = 'none';
+  history.pushState(null, '', '#optimizer');
+};
+
 // ─── Data Page ──────────────────────────────────────────────
 const $newSymbol = document.getElementById('new-symbol');
 const $checkResult = document.getElementById('check-result');
@@ -695,8 +811,12 @@ async function loadRuns() {
         ? Math.round((new Date(testTo) - new Date(testFrom)) / 86400000)
         : '-';
 
+      const isChecked = selectedRunIds.has(r.id) ? 'checked' : '';
       return `
-        <tr onclick="toggleRunDetails(${r.id})" style="cursor:pointer">
+        <tr onclick="toggleRunDetails(${r.id})" style="cursor:pointer" data-run-id="${r.id}">
+          <td class="compare-col" style="display:none" onclick="event.stopPropagation()">
+            <input type="checkbox" class="compare-row-check" data-run-id="${r.id}" ${isChecked} />
+          </td>
           <td><span style="font-family:monospace;font-weight:700;color:#58a6ff">#${r.id}</span></td>
           <td><strong>${r.symbol}</strong></td>
           <td>${tfLabel(r.timeframe)}</td>
@@ -713,9 +833,15 @@ async function loadRuns() {
           <td>${elapsed}</td>
           <td><button onclick="event.stopPropagation();openRunDetail(${r.id})" style="font-size:11px;padding:2px 8px">Detail →</button></td>
         </tr>
-        <tr class="expand-row" id="expand-${r.id}"><td colspan="15" id="expand-content-${r.id}">Loading...</td></tr>
+        <tr class="expand-row" id="expand-${r.id}"><td colspan="16" id="expand-content-${r.id}">Loading...</td></tr>
       `;
     }).join('');
+
+    // Phase 4.5b: if compare mode was on before the table rebuilt (e.g.
+    // the auto-refresh interval fired), re-apply it so the user doesn't
+    // lose their selection context. Hooked after innerHTML so the freshly-
+    // added <td> cells get revealed.
+    if (compareMode) applyCompareModeToTable();
   } catch (err) {
     console.error('Failed to load runs:', err);
   }
@@ -1664,8 +1790,12 @@ function renderFitnessBreakdown(fit) {
  * IS performance), amber 0.3–0.5, red below 0.3. This matches the
  * semantic meaning of the default `wfeMin=0.5` gate.
  */
-function renderWalkForwardReport(wf) {
-  const card = document.getElementById('detail-wf-card');
+// Phase 4.5b: `idSuffix` lets the compare-runs page render two WF
+// reports into parallel DOM trees (`detail-wf-card-a` and `-b`) using
+// the same helper. Run-detail page passes no suffix; compare page
+// passes '-a' / '-b'. The DOM in index.html mirrors both layouts.
+function renderWalkForwardReport(wf, idSuffix = '') {
+  const card = document.getElementById(`detail-wf-card${idSuffix}`);
   if (!wf || typeof wf !== 'object' || !Array.isArray(wf.windows)) {
     card.style.display = 'none'; return;
   }
@@ -1683,7 +1813,7 @@ function renderWalkForwardReport(wf) {
       <div style="font-size:16px;font-weight:700;color:${color};font-family:monospace">${value}</div>
     </div>`;
 
-  document.getElementById('detail-wf-summary').innerHTML = `
+  document.getElementById(`detail-wf-summary${idSuffix}`).innerHTML = `
     <div style="display:flex;gap:10px;flex-wrap:wrap">
       ${chip('Scheme',       wf.scheme ?? '—', '#e6edf3',
         'anchored = expanding in-sample window; rolling = fixed-width in-sample window')}
@@ -1700,7 +1830,7 @@ function renderWalkForwardReport(wf) {
   // Per-window rows. Coloured cells for OOS PF (red < 1.0) make
   // underperforming windows jump out without the user reading every
   // value.
-  const tbody = document.getElementById('detail-wf-tbody');
+  const tbody = document.getElementById(`detail-wf-tbody${idSuffix}`);
   tbody.innerHTML = wf.windows.map(w => {
     const oosColor = !Number.isFinite(w.oosPf) ? '#e6edf3'
       : w.oosPf >= 1.2 ? '#3fb950'
@@ -1719,6 +1849,145 @@ function renderWalkForwardReport(wf) {
   }).join('');
 
   card.style.display = '';
+}
+
+// ─── Phase 4.5b: compare-runs renderers ────────────────────────
+//
+// openCompare(ids) drives the #page-compare view. Fetches both runs
+// in parallel, fills the mirrored DOM (-a / -b) via
+// renderWalkForwardReport with idSuffix, and then walks the two WF
+// reports row-by-row to highlight winners/losers and flag mismatched
+// WF schemes. Fetch failures surface as a "Run not found" header in
+// the affected column rather than crashing the whole page — a missing
+// or deleted run shouldn't eat both cards.
+
+async function openCompare(ids) {
+  // Reveal the page. nav-link `#nav-compare` was hidden by default in
+  // index.html; un-hide it here so the user has a breadcrumb to come
+  // back to this view (same pattern as #nav-run-detail).
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-compare').classList.add('active');
+  document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+  const nav = document.getElementById('nav-compare');
+  if (nav) { nav.style.display = ''; nav.classList.add('active'); }
+  document.getElementById('compare-title').textContent = `#${ids[0]} vs #${ids[1]}`;
+
+  // Reset transient warnings.
+  document.getElementById('compare-mismatch-banner').style.display = 'none';
+  document.getElementById('compare-empty-note').style.display = 'none';
+
+  const pickTwo = ids.slice(0, 2);
+  const runs = await Promise.all(pickTwo.map(async (id) => {
+    try {
+      const r = await fetch(`/api/runs/${id}`);
+      if (!r.ok) return null;
+      return await r.json();
+    } catch { return null; }
+  }));
+  const [runA, runB] = runs;
+
+  renderCompareColumn(runA, '-a', pickTwo[0]);
+  renderCompareColumn(runB, '-b', pickTwo[1]);
+
+  // Empty-state note when a selected run has no WF data. The
+  // renderWalkForwardReport helper already hides its card, but the
+  // user deserves an explanation rather than a silent blank column.
+  const missing = [];
+  if (!runA?.wf_report_json) missing.push(`#${pickTwo[0]}`);
+  if (!runB?.wf_report_json) missing.push(`#${pickTwo[1]}`);
+  if (missing.length) {
+    const note = document.getElementById('compare-empty-note');
+    note.style.display = '';
+    note.textContent =
+      `${missing.join(' and ')} ${missing.length === 1 ? 'has' : 'have'} ` +
+      'no walk-forward data. Legacy GA runs and spec-mode runs without ' +
+      'a WF report can\u2019t be compared on WF metrics.';
+  }
+
+  // Mismatch banner. A silent side-by-side of apples and oranges is
+  // misleading; surface it explicitly when both reports exist but
+  // disagree on scheme or window count.
+  const wfA = runA?.wf_report_json;
+  const wfB = runB?.wf_report_json;
+  if (wfA && wfB) {
+    const mismatches = [];
+    if (wfA.scheme !== wfB.scheme) {
+      mismatches.push(`scheme (${wfA.scheme} vs ${wfB.scheme})`);
+    }
+    if (wfA.nWindows !== wfB.nWindows) {
+      mismatches.push(`nWindows (${wfA.nWindows} vs ${wfB.nWindows})`);
+    }
+    if (mismatches.length) {
+      const banner = document.getElementById('compare-mismatch-banner');
+      banner.style.display = '';
+      document.getElementById('compare-mismatch-body').innerHTML =
+        `<strong style="color:#d29922">\u26a0 Walk-forward mismatch:</strong> ` +
+        `${mismatches.join(', ')}. Per-window comparisons may not be meaningful ` +
+        `\u2014 the two runs sliced time differently.`;
+    }
+    highlightCompareWindows(wfA, wfB);
+  }
+}
+
+function renderCompareColumn(run, suffix, id) {
+  const headerBody = document.getElementById(`compare-header-body${suffix}`);
+  if (!run) {
+    headerBody.innerHTML =
+      `<div style="color:#f85149">Run #${id} not found.</div>`;
+    renderWalkForwardReport(null, suffix);
+    return;
+  }
+  const fit = run.fitness_breakdown_json;
+  const fitChip = fit ? `
+    <div style="background:#21262d;border:1px solid #30363d;border-radius:6px;padding:6px 10px"
+         title="Composite fitness score. Red = eliminated by a hard gate.">
+      <div style="font-size:11px;color:#8b949e">Fitness</div>
+      <div style="font-size:13px;font-family:monospace;color:${fit.eliminated ? '#f85149' : '#3fb950'}">${fit.score != null ? fit.score.toFixed(3) : '\u2014'}</div>
+    </div>` : '';
+  headerBody.innerHTML = `
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+      <div>
+        <div style="font-size:11px;color:#8b949e;margin-bottom:2px">Run</div>
+        <div style="font-size:15px;font-weight:700">
+          <span style="color:#58a6ff">#${run.id}</span>
+          ${run.spec_name ? `<span style="margin-left:6px;font-family:monospace;font-size:13px;color:#c9d1d9">${run.spec_name}</span>` : '<span style="margin-left:6px;color:#8b949e;font-size:13px">&lt;legacy&gt;</span>'}
+        </div>
+      </div>
+      <div style="margin-left:auto;display:flex;gap:10px;flex-wrap:wrap">
+        <div style="background:#21262d;border:1px solid #30363d;border-radius:6px;padding:6px 10px">
+          <div style="font-size:11px;color:#8b949e">Symbol / TF</div>
+          <div style="font-size:13px;font-family:monospace">${run.symbol} \u00b7 ${tfLabel(run.timeframe)}</div>
+        </div>
+        <div style="background:#21262d;border:1px solid #30363d;border-radius:6px;padding:6px 10px">
+          <div style="font-size:11px;color:#8b949e">Start</div>
+          <div style="font-size:13px;font-family:monospace">${run.start_date}</div>
+        </div>
+        ${fitChip}
+      </div>
+    </div>`;
+  renderWalkForwardReport(run.wf_report_json, suffix);
+}
+
+// Per-window highlight: green on the winner, red on the loser, only
+// when OOS PF differs by more than 10% (keeps near-ties uncoloured so
+// the eye focuses on real divergence). Handles different window counts
+// by walking min(len_a, len_b) — extra windows on the longer side
+// render plain.
+function highlightCompareWindows(wfA, wfB) {
+  const n = Math.min(wfA.windows.length, wfB.windows.length);
+  const rowsA = document.querySelectorAll('#detail-wf-tbody-a tr');
+  const rowsB = document.querySelectorAll('#detail-wf-tbody-b tr');
+  for (let i = 0; i < n; i++) {
+    const pfA = wfA.windows[i]?.oosPf;
+    const pfB = wfB.windows[i]?.oosPf;
+    if (!Number.isFinite(pfA) || !Number.isFinite(pfB)) continue;
+    const denom = Math.max(Math.abs(pfA), Math.abs(pfB), 1e-9);
+    const gap = Math.abs(pfA - pfB) / denom;
+    if (gap < 0.10) continue;
+    const aWins = pfA > pfB;
+    if (rowsA[i]) rowsA[i].classList.add(aWins ? 'cmp-best' : 'cmp-worst');
+    if (rowsB[i]) rowsB[i].classList.add(aWins ? 'cmp-worst' : 'cmp-best');
+  }
 }
 
 /**

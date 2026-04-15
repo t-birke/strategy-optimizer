@@ -178,13 +178,16 @@ async function main() {
 
     // Each renderer flips its card visible on the happy path. Same
     // shape check but with an empty string (the CSS default).
+    // Phase 4.5b: renderWalkForwardReport switched to template-literal
+    // IDs (e.g. `detail-wf-card${idSuffix}`) so the card string now
+    // appears inside a backtick, not a quote — accept either delimiter.
     for (const [fn, cardId] of [
       ['renderFitnessBreakdown',  'detail-fitness-card'],
       ['renderWalkForwardReport', 'detail-wf-card'],
       ['renderRegimeBreakdown',   'detail-regime-card'],
     ]) {
       assertTrue(`${fn} un-hides ${cardId} on happy path`,
-        new RegExp(`function\\s+${fn}\\b[\\s\\S]{0,5000}['"]${cardId}['"]`).test(js));
+        new RegExp(`function\\s+${fn}\\b[\\s\\S]{0,5000}['"\`]${cardId}`).test(js));
     }
 
     // Formatters handle Infinity + NaN. PF is +Infinity when no

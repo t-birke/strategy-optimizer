@@ -585,3 +585,36 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
   text-decoration: underline dotted rgba(139, 148, 158, 0.4);
   text-underline-offset: 3px;
 }
+
+/* ─── Phase 4.5b: compare-runs page ─────────────────────────────
+   2-up grid for side-by-side run compare. Each column hosts a header
+   card + a Walk-Forward Report card. Past 1440px screens the columns
+   stay readable; below ~900px they stack (single column) so the page
+   remains usable on narrower windows — the per-window tables are the
+   densest elements and they already scroll horizontally inside their
+   own wrappers, so stacking doesn't compromise the data.             */
+.compare-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+@media (max-width: 900px) {
+  .compare-grid { grid-template-columns: 1fr; }
+}
+
+/* Winner/loser per-window row highlights. Applied by
+   highlightCompareWindows() when the OOS PF gap between the two runs
+   on the same window exceeds 10%. Colours match the rest of the app's
+   green = good / red = bad convention, and use a left border instead
+   of a full background wash so the existing per-cell OOS colouring
+   inside the row remains readable. */
+#page-compare tr.cmp-best  { background: rgba(63, 185, 80, 0.08);  border-left: 3px solid #3fb950; }
+#page-compare tr.cmp-worst { background: rgba(248, 81, 73, 0.08);  border-left: 3px solid #f85149; }
+
+/* Mismatch banner card — shown when scheme or nWindows differ between
+   the two runs. Amber matches the "warning" weight already used for
+   abort-pending states and the WFE amber band. */
+.cmp-mismatch {
+  border-color: rgba(210, 153, 34, 0.5) !important;
+  background: rgba(210, 153, 34, 0.06);
+}
