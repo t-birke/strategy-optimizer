@@ -196,6 +196,56 @@ async function main() {
       assertTrue(`spec-fitness-gate-${g}-def chip present`,
         contains(slice, `id="spec-fitness-gate-${g}-def"`));
     }
+
+    // Every label and section header in the Fitness card must carry a
+    // `title=` attribute — that's what powers the hover tooltips the
+    // user relies on to understand what each knob does. Catching a
+    // silent regression here is cheap and the meaning of these terms
+    // (especially "WFE min") is opaque without the tooltip.
+    //
+    // Approach: extract the Fitness card slice, then scan every
+    // `<label …>LABEL_TEXT</label>` or `<h3 …>HEADING</h3>` in it and
+    // assert the opening tag had a `title="..."` attribute.
+    const fitStart = slice.indexOf('id="spec-fitness-card"');
+    assertTrue('fitness-card slice locatable', fitStart > -1);
+    if (fitStart > -1) {
+      // Fitness card extends to the end of the left-column div — take
+      // everything from the fitness card to the end of `slice` (which
+      // is already bounded at the next `<div id="page-…">`).
+      const fitSlice = slice.slice(fitStart);
+
+      // Require a title on the section headers ("Weights", "Caps",
+      // "Gates") — these explain the umbrella concept for their group.
+      for (const heading of ['Weights', 'Caps', 'Gates']) {
+        assertTrue(`${heading} <h3> has title tooltip`,
+          new RegExp(`<h3[^>]*title="[^"]{20,}"[^>]*>\\s*${heading}\\s*<\\/h3>`).test(fitSlice));
+      }
+
+      // And on every user-visible label — the ones adjacent to the
+      // actual inputs. Using visible label text as the needle rather
+      // than an id, since `<label>` has no for= attribute here.
+      const labeled = [
+        'PF \\(profit factor\\)',
+        'DD \\(drawdown\\)',
+        'ret \\(return\\)',
+        'PF cap',
+        'ret cap',
+        'Min trades \\/ window',
+        'Worst regime PF floor',
+        'WFE min',
+      ];
+      for (const lbl of labeled) {
+        assertTrue(`label "${lbl.replace(/\\/g, '')}" has title tooltip`,
+          new RegExp(`<label[^>]*title="[^"]{20,}"[^>]*>\\s*${lbl}\\s*<\\/label>`).test(fitSlice));
+      }
+
+      // WFE min in particular: make sure the tooltip actually spells
+      // out the acronym. If it ever drifts back to just "WFE" with no
+      // explanation, flag it — this is the knob users were most
+      // confused by in the pre-tooltip version.
+      assertTrue('WFE min tooltip explains the acronym',
+        /title="[^"]*[Ww]alk[- ][Ff]orward [Ee]fficiency[^"]*"[^>]*>\s*WFE min/.test(fitSlice));
+    }
   }
 
   // ── 2. JS wiring in app.js ───────────────────────────────────

@@ -572,3 +572,16 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
   color: #e6edf3;
   font-size: 14px;
 }
+
+/* Any element carrying a `title` attribute inside the Fitness card gets a
+   help cursor and a subtle dotted underline, so users notice that
+   hovering yields an explanation. Keeps us on native `title` tooltips —
+   no custom popover widget to maintain — while still cueing the user
+   that documentation is a hover away. */
+#spec-fitness-card label[title],
+#spec-fitness-card h3[title],
+#spec-fitness-card h2[title] {
+  cursor: help;
+  text-decoration: underline dotted rgba(139, 148, 158, 0.4);
+  text-underline-offset: 3px;
+}
