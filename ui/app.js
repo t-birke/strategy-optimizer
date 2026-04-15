@@ -1168,9 +1168,13 @@ document.getElementById('modal-islands').addEventListener('input', (e) => {
     parseInt(e.target.value) > 1 ? '' : 'none';
 });
 
+// Planets=1 → Space Travel fields are visible but disabled (irrelevant
+// with a single planet). Planets>1 → enable them. We keep them in the DOM
+// either way so the Planets tab isn't nearly-empty in single-planet mode.
 document.getElementById('modal-planets').addEventListener('input', (e) => {
-  document.getElementById('planet-options').style.display =
-    parseInt(e.target.value) > 1 ? '' : 'none';
+  const enabled = parseInt(e.target.value) > 1;
+  document.getElementById('modal-space-interval').disabled = !enabled;
+  document.getElementById('modal-space-count').disabled = !enabled;
 });
 
 document.getElementById('modal-start').addEventListener('click', async () => {
