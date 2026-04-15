@@ -2015,11 +2015,13 @@ function populateSpecEditorPickers() {
   const hasFilter = blocksByKind('filter').length > 0;
   document.getElementById('spec-filters-empty').style.display = hasFilter ? 'none' : '';
 
-  // Seed the description line under each fixed picker so they aren't
-  // blank on first render. The "change" listeners keep them in sync
-  // thereafter.
+  // Seed the description line and per-param narrowing controls under each
+  // fixed picker so they aren't blank on first render. The "change"
+  // listeners keep them in sync thereafter.
   for (const id of ['spec-regime', 'spec-exit-hardstop', 'spec-exit-target', 'spec-exit-trail', 'spec-sizing']) {
     updateBlockDescription(id);
+    const sel = document.getElementById(id);
+    renderParamControls(document.getElementById(id + '-params'), sel?.value || '');
   }
 }
 
@@ -2037,6 +2039,247 @@ function updateSizingReqHint() {
     return r;
   }).join(', ');
   el.textContent = `requires: ${human}`;
+}
+
+// ═══ Phase 4.3d: per-param narrowing controls ═══════════════════════════
+//
+// Every block instance in the spec can narrow the registry-declared param
+// space. For each declared param we render one row:
+//
+//   [name]   [pin☐]   [min]  [max]  [step]   [↺ reset]
+//            └─ when unchecked we emit { min, max, step }
+//   [name]   [pin☑]   [       value        ]  [↺ reset]
+//            └─ when checked we emit { value }
+//
+// State lives in the DOM (dataset attributes on the .param-row) so there's
+// no parallel JS state array. The central readParamOverrides() function
+// walks the DOM to produce the JSON fragment for a block instance.
+
+// Format a number for display in the input, avoiding unnecessary trailing
+// zeros on integers and keeping float precision sensible.
+function formatParamNumber(n, type) {
+  if (!Number.isFinite(n)) return '';
+  if (type === 'int') return String(Math.round(n));
+  // Floats: keep up to 6 significant digits, strip trailing zeros.
+  return parseFloat(n.toPrecision(6)).toString();
+}
+
+// Clamp a raw user input to the registry's declared bounds.
+// Returns null for non-finite input so the caller can decide what to do.
+function clampToParam(raw, param) {
+  const n = parseFloat(raw);
+  if (!Number.isFinite(n)) return null;
+  let v = n;
+  if (typeof param.min === 'number') v = Math.max(v, param.min);
+  if (typeof param.max === 'number') v = Math.min(v, param.max);
+  if (param.type === 'int') v = Math.round(v);
+  return v;
+}
+
+// Build the DOM node for one param's controls. `param` comes from the
+// registry; `override` is optional and seeds the inputs from a prior state
+// (used when re-rendering after a block change restores a known override).
+function makeParamControlRow(param, override) {
+  const row = document.createElement('div');
+  row.className = 'param-row';
+  row.dataset.paramId = param.id;
+  row.dataset.paramType = param.type;
+  // Store registry bounds so the JSON emitter and the reset button have
+  // a source of truth without re-looking-up the block.
+  row.dataset.registryMin  = String(param.min);
+  row.dataset.registryMax  = String(param.max);
+  row.dataset.registryStep = String(param.step);
+
+  // Decide initial mode (pinned or range) from the override shape.
+  const pinned = override && Object.prototype.hasOwnProperty.call(override, 'value');
+  if (pinned) row.classList.add('pinned');
+
+  // [name][type]
+  const name = document.createElement('span');
+  name.className = 'param-name';
+  name.textContent = param.id;
+  const type = document.createElement('span');
+  type.className = 'param-type';
+  type.textContent = param.type;
+  name.appendChild(type);
+  row.appendChild(name);
+
+  // Pin checkbox
+  const pinLabel = document.createElement('label');
+  pinLabel.className = 'param-pin';
+  pinLabel.title = 'Pin this param to a single value (removes from the GA genome)';
+  const pinBox = document.createElement('input');
+  pinBox.type = 'checkbox';
+  pinBox.dataset.role = 'pin';
+  pinBox.checked = pinned;
+  pinLabel.appendChild(pinBox);
+  const pinTxt = document.createElement('span');
+  pinTxt.textContent = 'pin';
+  pinLabel.appendChild(pinTxt);
+  row.appendChild(pinLabel);
+
+  // Range inputs: min / max / step
+  const minIn = document.createElement('input');
+  minIn.type = 'number';
+  minIn.step = 'any';
+  minIn.className = 'param-min';
+  minIn.dataset.role = 'min';
+  minIn.title = `registry min: ${param.min}`;
+  minIn.value = formatParamNumber(
+    override && 'min' in override ? override.min : param.min, param.type);
+
+  const maxIn = document.createElement('input');
+  maxIn.type = 'number';
+  maxIn.step = 'any';
+  maxIn.className = 'param-max';
+  maxIn.dataset.role = 'max';
+  maxIn.title = `registry max: ${param.max}`;
+  maxIn.value = formatParamNumber(
+    override && 'max' in override ? override.max : param.max, param.type);
+
+  const stepIn = document.createElement('input');
+  stepIn.type = 'number';
+  stepIn.step = 'any';
+  stepIn.className = 'param-step';
+  stepIn.dataset.role = 'step';
+  stepIn.title = `registry step: ${param.step}`;
+  stepIn.value = formatParamNumber(
+    override && 'step' in override ? override.step : param.step, param.type);
+
+  // Pin value input — single value when pinned. Default to the midpoint
+  // (clamped to a representable step) when user flips into pin mode.
+  const valIn = document.createElement('input');
+  valIn.type = 'number';
+  valIn.step = 'any';
+  valIn.className = 'param-value';
+  valIn.dataset.role = 'value';
+  const pinDefault = override && 'value' in override
+    ? override.value
+    : (param.min + param.max) / 2;
+  valIn.value = formatParamNumber(pinDefault, param.type);
+
+  row.appendChild(minIn);
+  row.appendChild(maxIn);
+  row.appendChild(stepIn);
+  row.appendChild(valIn);
+
+  // Reset button — restore registry defaults, clear pin.
+  const reset = document.createElement('button');
+  reset.type = 'button';
+  reset.className = 'param-reset';
+  reset.textContent = '↺';
+  reset.title = 'Reset to registry defaults';
+  row.appendChild(reset);
+
+  // ── Validation + live preview ─────────────────────────────────
+  const markInvalid = (el, bad) => el.classList.toggle('invalid', bad);
+
+  const validateRange = () => {
+    const mn = clampToParam(minIn.value, param);
+    const mx = clampToParam(maxIn.value, param);
+    const sp = parseFloat(stepIn.value);
+    markInvalid(minIn,  mn === null);
+    markInvalid(maxIn,  mx === null);
+    markInvalid(stepIn, !(sp > 0));
+    // min > max is a structural error worth flagging.
+    if (mn !== null && mx !== null && mn > mx) {
+      markInvalid(minIn, true);
+      markInvalid(maxIn, true);
+    }
+  };
+  const validateValue = () => {
+    const v = clampToParam(valIn.value, param);
+    markInvalid(valIn, v === null);
+  };
+
+  minIn.addEventListener('input',  () => { validateRange(); renderSpecPreview(); });
+  maxIn.addEventListener('input',  () => { validateRange(); renderSpecPreview(); });
+  stepIn.addEventListener('input', () => { validateRange(); renderSpecPreview(); });
+  valIn.addEventListener('input',  () => { validateValue(); renderSpecPreview(); });
+
+  // On blur, clamp the visible input text to registry bounds so the user
+  // can see their entry got clipped. JSON emission re-clamps too.
+  const clampAndWrite = (el, which) => {
+    const c = clampToParam(el.value, param);
+    if (c !== null) el.value = formatParamNumber(c, param.type);
+    if (which === 'range') validateRange(); else validateValue();
+    renderSpecPreview();
+  };
+  minIn.addEventListener('blur', () => clampAndWrite(minIn, 'range'));
+  maxIn.addEventListener('blur', () => clampAndWrite(maxIn, 'range'));
+  valIn.addEventListener('blur', () => clampAndWrite(valIn, 'value'));
+
+  pinBox.addEventListener('change', () => {
+    row.classList.toggle('pinned', pinBox.checked);
+    renderSpecPreview();
+  });
+
+  reset.addEventListener('click', () => {
+    pinBox.checked = false;
+    row.classList.remove('pinned');
+    minIn.value  = formatParamNumber(param.min,  param.type);
+    maxIn.value  = formatParamNumber(param.max,  param.type);
+    stepIn.value = formatParamNumber(param.step, param.type);
+    valIn.value  = formatParamNumber((param.min + param.max) / 2, param.type);
+    [minIn, maxIn, stepIn, valIn].forEach(el => el.classList.remove('invalid'));
+    renderSpecPreview();
+  });
+
+  return row;
+}
+
+// Populate (or clear) a slot's param-controls container based on the
+// currently-selected block. If blockId is empty, the container is emptied
+// and CSS (`.spec-params:empty`) hides it entirely.
+function renderParamControls(containerEl, blockId) {
+  if (!containerEl) return;
+  containerEl.innerHTML = '';
+  if (!blockId) return;
+  const block = blocksById[blockId];
+  if (!block || !Array.isArray(block.params) || block.params.length === 0) return;
+  for (const p of block.params) {
+    containerEl.appendChild(makeParamControlRow(p));
+  }
+}
+
+// Walk a param-controls container and return a {paramId: entry} dict
+// matching the spec schema: `{min, max, step}` or `{value}` when pinned.
+// Falls back to registry defaults for any paramId whose row is missing
+// (e.g., the user hasn't yet filled the container on a fresh block pick).
+function readParamOverrides(containerEl, block) {
+  const out = {};
+  if (!block) return out;
+  const rowById = {};
+  if (containerEl) {
+    containerEl.querySelectorAll('.param-row').forEach(r => {
+      rowById[r.dataset.paramId] = r;
+    });
+  }
+  for (const p of (block.params || [])) {
+    const row = rowById[p.id];
+    if (!row) { out[p.id] = paramToSpecEntry(p); continue; }
+    const pinBox = row.querySelector('input[data-role="pin"]');
+    if (pinBox && pinBox.checked) {
+      const v = clampToParam(row.querySelector('input[data-role="value"]').value, p);
+      out[p.id] = { value: v ?? p.min };
+    } else {
+      const mn = clampToParam(row.querySelector('input[data-role="min"]').value,  p);
+      const mx = clampToParam(row.querySelector('input[data-role="max"]').value,  p);
+      const sp = parseFloat(row.querySelector('input[data-role="step"]').value);
+      // If the narrowed range collapses to a single value, emit {value}
+      // rather than {min,max,step} so the spec reads as intended.
+      if (mn !== null && mx !== null && mn === mx) {
+        out[p.id] = { value: mn };
+      } else {
+        out[p.id] = {
+          min:  mn !== null ? mn : p.min,
+          max:  mx !== null ? mx : p.max,
+          step: (sp > 0)    ? sp : p.step,
+        };
+      }
+    }
+  }
+  return out;
 }
 
 // Row management for entries + filters. Each row is a flex container
@@ -2085,8 +2328,17 @@ function makeBlockRow(kind, value = '') {
   desc.style.cssText = 'font-size:12px;color:#8b949e;line-height:1.5;margin:4px 0 0 0;min-height:14px';
   desc.textContent = blockDescriptionFor(select.value);
 
+  // Per-row param controls — one row per declared param on the currently
+  // selected block. Rebuilt whenever the select changes.
+  const paramBox = document.createElement('div');
+  paramBox.className = 'spec-params';
+  paramBox.dataset.role = 'params';
+  paramBox.style.cssText = 'margin-top:6px';
+  renderParamControls(paramBox, select.value);
+
   select.addEventListener('change', () => {
     desc.textContent = blockDescriptionFor(select.value);
+    renderParamControls(paramBox, select.value);
     renderSpecPreview();
   });
   row.appendChild(select);
@@ -2104,6 +2356,7 @@ function makeBlockRow(kind, value = '') {
 
   wrap.appendChild(row);
   wrap.appendChild(desc);
+  wrap.appendChild(paramBox);
   return wrap;
 }
 
@@ -2116,20 +2369,32 @@ function addFilterRow() {
   renderSpecPreview();
 }
 
-// Reads all rows of a given container and returns [{blockId, ...}] for
-// rows with a non-empty selection. Empty picks are skipped from the
-// emitted spec so the preview is always a runnable-ish shape.
-function readRowBlockIds(containerId) {
+// Reads all rows of a given container and returns [{blockId, paramsEl}]
+// for rows with a non-empty selection. Empty picks are skipped so the
+// emitted spec is always a runnable-ish shape. The `paramsEl` lets the
+// caller read per-row param overrides out of the DOM.
+function readRows(containerId) {
   const out = [];
   document.querySelectorAll(`#${containerId} .spec-block-row`).forEach(row => {
     const sel = row.querySelector('select[data-role="block-select"]');
-    if (sel && sel.value) out.push(sel.value);
+    if (sel && sel.value) {
+      out.push({
+        blockId: sel.value,
+        paramsEl: row.querySelector('.spec-params[data-role="params"]'),
+      });
+    }
   });
   return out;
 }
+// Back-compat shim — some call sites and gates probe for this name.
+function readRowBlockIds(containerId) {
+  return readRows(containerId).map(r => r.blockId);
+}
 
 // Build a {min,max,step} (or {value} when min===max) fragment for one
-// registry-declared param. 4.3d will replace this with per-param overrides.
+// registry-declared param. This is the "no UI override" path — used as
+// the fallback when a row's param-controls container hasn't been rendered
+// yet (e.g., the select just changed but the preview ran first).
 function paramToSpecEntry(p) {
   if (p.min !== undefined && p.max !== undefined && p.min === p.max) {
     return { value: p.min };
@@ -2141,13 +2406,20 @@ function paramToSpecEntry(p) {
   return out;
 }
 
-// Build a full spec-block dict {block, version, instanceId, params}
-// from a registry block id. Returns null if the id isn't in the registry.
-function blockRefToSpec(blockId) {
+// Build a full spec-block dict {block, version, instanceId, params} from
+// a registry block id. `paramsEl` is the `.spec-params` container whose
+// rows describe this instance's overrides; if absent we fall back to the
+// registry-declared defaults so the preview never crashes mid-render.
+function blockRefToSpec(blockId, paramsEl) {
   const b = blocksById[blockId];
   if (!b) return null;
-  const params = {};
-  for (const p of b.params || []) params[p.id] = paramToSpecEntry(p);
+  const params = paramsEl
+    ? readParamOverrides(paramsEl, b)
+    : (() => {
+        const out = {};
+        for (const p of b.params || []) out[p.id] = paramToSpecEntry(p);
+        return out;
+      })();
   return {
     block: b.id,
     version: b.version ?? 1,
@@ -2163,18 +2435,26 @@ function buildSpecFromUi() {
   const name = (document.getElementById('spec-name').value || '').trim();
   const description = (document.getElementById('spec-desc').value || '').trim();
 
+  // Shorthand: read a fixed slot (its <select> and its -params container)
+  // and produce the spec-block dict. Returns null for the "None" pick.
+  const fixedSlotSpec = (selectId, paramsId) => {
+    const id = document.getElementById(selectId).value;
+    if (!id) return null;
+    return blockRefToSpec(id, document.getElementById(paramsId));
+  };
+
   // Regime: single block, optional.
-  const regimeId = document.getElementById('spec-regime').value;
-  const regime = regimeId ? blockRefToSpec(regimeId) : null;
+  const regime = fixedSlotSpec('spec-regime', 'spec-regime-params');
 
   // Entries.
   const entriesMode = document.getElementById('spec-entries-mode').value;
   const thrMin = parseInt(document.getElementById('spec-entries-threshold-min').value, 10) || 1;
   const thrMax = parseInt(document.getElementById('spec-entries-threshold-max').value, 10) || thrMin;
-  const entryIds = readRowBlockIds('spec-entries-list');
   const entries = {
     mode: entriesMode,
-    blocks: entryIds.map(blockRefToSpec).filter(Boolean),
+    blocks: readRows('spec-entries-list')
+      .map(r => blockRefToSpec(r.blockId, r.paramsEl))
+      .filter(Boolean),
   };
   if (entriesMode === 'score') {
     entries.threshold = thrMin === thrMax ? { value: thrMin } : { min: thrMin, max: thrMax, step: 1 };
@@ -2183,21 +2463,22 @@ function buildSpecFromUi() {
   // Filters.
   const filters = {
     mode: document.getElementById('spec-filters-mode').value,
-    blocks: readRowBlockIds('spec-filters-list').map(blockRefToSpec).filter(Boolean),
+    blocks: readRows('spec-filters-list')
+      .map(r => blockRefToSpec(r.blockId, r.paramsEl))
+      .filter(Boolean),
   };
 
   // Exits: three optional slots.
   const exits = {};
-  const hardStopId = document.getElementById('spec-exit-hardstop').value;
-  const targetId   = document.getElementById('spec-exit-target').value;
-  const trailId    = document.getElementById('spec-exit-trail').value;
-  if (hardStopId) exits.hardStop = blockRefToSpec(hardStopId);
-  if (targetId)   exits.target   = blockRefToSpec(targetId);
-  if (trailId)    exits.trail    = blockRefToSpec(trailId);
+  const hardStop = fixedSlotSpec('spec-exit-hardstop', 'spec-exit-hardstop-params');
+  const target   = fixedSlotSpec('spec-exit-target',   'spec-exit-target-params');
+  const trail    = fixedSlotSpec('spec-exit-trail',    'spec-exit-trail-params');
+  if (hardStop) exits.hardStop = hardStop;
+  if (target)   exits.target   = target;
+  if (trail)    exits.trail    = trail;
 
   // Sizing: required.
-  const sizingId = document.getElementById('spec-sizing').value;
-  const sizing = sizingId ? blockRefToSpec(sizingId) : null;
+  const sizing = fixedSlotSpec('spec-sizing', 'spec-sizing-params');
 
   return {
     name,
@@ -2286,12 +2567,18 @@ function renderSpecPreview() {
 // Sizing change also updates the requirements hint.
 document.getElementById('spec-sizing').addEventListener('change', updateSizingReqHint);
 
-// Fixed-picker change also refreshes its description line. The selects
-// already bubble a preview rebuild via the loop above; this extra handler
-// just keeps the human-readable description next to each slot in sync.
+// Fixed-picker change refreshes its description line AND rebuilds the
+// per-param narrowing controls for the newly selected block. The selects
+// already bubble a preview rebuild via the listener loop above, so we
+// only need to re-render the decoration here.
 for (const id of ['spec-regime', 'spec-exit-hardstop', 'spec-exit-target', 'spec-exit-trail', 'spec-sizing']) {
   const el = document.getElementById(id);
-  if (el) el.addEventListener('change', () => updateBlockDescription(id));
+  if (el) {
+    el.addEventListener('change', () => {
+      updateBlockDescription(id);
+      renderParamControls(document.getElementById(id + '-params'), el.value);
+    });
+  }
 }
 
 document.getElementById('spec-entries-add').addEventListener('click', addEntryRow);

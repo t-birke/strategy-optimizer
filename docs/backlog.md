@@ -633,6 +633,58 @@ rendered in the spec editor:
   and that `blockDescriptionFor`/`updateBlockDescription` are wired to
   each fixed picker + the row builder.
 
+### 4.3d Per-block param narrowing — ✅ done
+Every block instance in the spec editor now shows one control row per
+declared param:
+
+    [paramId:type]  [☐ pin]  [min]  [max]  [step]  [↺ reset]
+
+- **Range mode** (default): three number inputs pre-filled from the
+  registry's declared bounds. User can narrow but not widen — inputs
+  clamp to the registry min/max on blur. The spec emits `{min, max, step}`.
+- **Pin mode** (checkbox): collapses to a single value input; spec emits
+  `{value: X}`. When a user narrows until `min === max` in range mode,
+  the emitter also collapses to `{value}` so the JSON reads as intended.
+- **Reset** restores the registry's declared defaults and unpins.
+- **Live preview**: every input fires the existing `renderSpecPreview`
+  path, so the right-hand JSON panel updates as the user types. No
+  debouncing — the build is trivially fast.
+- **DOM-as-state**: each `.param-row` stores its registry bounds in
+  `dataset.*` and its pin state via the `.pinned` class; no parallel JS
+  state array to keep in sync. `readParamOverrides()` walks the DOM on
+  every preview build.
+- **Fallback**: if a `.spec-params` container hasn't been rendered yet
+  (e.g., the select just changed), `blockRefToSpec` falls back to
+  `paramToSpecEntry`'s registry-defaults path so the preview never
+  crashes mid-render.
+
+Implementation entry points in `ui/app.js`:
+- `makeParamControlRow(param, override?)` builds one param row with all
+  four inputs + pin checkbox + reset button, and wires live validation
+  (out-of-bounds, NaN, and `min > max`).
+- `renderParamControls(containerEl, blockId)` (re)builds the full grid
+  for a given slot.
+- `readParamOverrides(containerEl, block)` returns the `{paramId: entry}`
+  dict that slots straight into the spec JSON.
+- `readRows(containerId)` replaces `readRowBlockIds` so multi-block
+  slots (entries/filters) feed their per-row params container into
+  `blockRefToSpec`.
+
+**Verification** — `ui-spec-editor-check.js` (257 checks ✓):
+- All 5 `-params` fixed-slot containers present.
+- `makeParamControlRow`/`renderParamControls`/`readParamOverrides`
+  helpers defined.
+- Each fixed picker passes its `-params` container to
+  `renderParamControls` on both init and change.
+- `makeBlockRow` creates a `.spec-params` container per row and rebuilds
+  it on select change.
+- `readParamOverrides` emits both `{value}` (pinned) and
+  `{min,max,step}` (ranged) shapes.
+
+Still parked for 4.3e: server-side validation of narrowed ranges
+against registry bounds (client clamps are advisory — POST /api/specs
+will re-validate authoritatively).
+
 ### 4.3b Spec picker in the New Run modal — ✅ done
 Users can now pick an existing spec from a dropdown in the New Run modal
 instead of hand-editing JSON. Minimum-viable UI for spec-mode runs.

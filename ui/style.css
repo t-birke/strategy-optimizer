@@ -449,3 +449,74 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
 /* TV button */
 .btn-tv { background: #1f6feb; border-color: #1f6feb; }
 .btn-tv:hover { background: #388bfd; }
+
+/* ─── Spec editor param-narrowing controls (Phase 4.3d) ───────────
+   One row per declared param: [name] [mode] [min | max | step] [reset].
+   Kept compact so a block with 4-6 params doesn't blow out the form. */
+.spec-params:empty { display: none; }
+.spec-params .param-row {
+  display: grid;
+  grid-template-columns: 140px 56px repeat(3, 1fr) 28px;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 8px;
+  background: #0d1117;
+  border: 1px solid #21262d;
+  border-radius: 5px;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+.spec-params .param-row .param-name {
+  color: #c9d1d9;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.spec-params .param-row .param-name .param-type {
+  color: #6e7681;
+  margin-left: 4px;
+  font-size: 10px;
+}
+.spec-params .param-row input[type="number"] {
+  width: 100%;
+  min-width: 0;
+  padding: 3px 6px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: #010409;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+}
+.spec-params .param-row input[type="number"]:focus {
+  outline: none;
+  border-color: #1f6feb;
+}
+.spec-params .param-row .param-pin {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  color: #8b949e;
+  user-select: none;
+  cursor: pointer;
+}
+.spec-params .param-row .param-reset {
+  padding: 2px 6px;
+  font-size: 11px;
+  line-height: 1;
+  background: transparent;
+  color: #6e7681;
+  border: 1px solid #30363d;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.spec-params .param-row .param-reset:hover { color: #c9d1d9; border-color: #484f58; }
+.spec-params .param-row.pinned .param-max,
+.spec-params .param-row.pinned .param-step { visibility: hidden; }
+.spec-params .param-row .param-value { grid-column: 3 / span 3; }
+.spec-params .param-row.pinned .param-min { display: none; }
+.spec-params .param-row:not(.pinned) .param-value { display: none; }
+.spec-params .param-row input.invalid { border-color: #f85149; }

@@ -135,6 +135,18 @@ async function main() {
       assertTrue(`${id} container present`, contains(slice, `id="${id}"`));
     }
 
+    // Param-narrowing containers (Phase 4.3d) — one per fixed picker so
+    // the editor can render per-param min/max/step/pin controls under it.
+    for (const id of [
+      'spec-regime-params',
+      'spec-exit-hardstop-params',
+      'spec-exit-target-params',
+      'spec-exit-trail-params',
+      'spec-sizing-params',
+    ]) {
+      assertTrue(`${id} params container present`, contains(slice, `id="${id}"`));
+    }
+
     // Preview + copy.
     assertTrue('spec-json-preview pre present', contains(slice, 'id="spec-json-preview"'));
     assertTrue('spec-copy-json button present', contains(slice, 'id="spec-copy-json"'));
@@ -223,6 +235,45 @@ async function main() {
     // Row-level description line in makeBlockRow.
     assertTrue('makeBlockRow renders an inline block description',
       /makeBlockRow[\s\S]{0,2500}blockDescriptionFor\(/.test(js));
+
+    // 2h. Per-param narrowing controls (Phase 4.3d). The editor must be
+    // able to render one control row per declared param (min/max/step or
+    // pin), and buildSpecFromUi must read those overrides into the emitted
+    // JSON — otherwise narrowing has no effect on the preview.
+    assertTrue('defines makeParamControlRow helper',
+      /function\s+makeParamControlRow\b/.test(js));
+    assertTrue('defines renderParamControls helper',
+      /function\s+renderParamControls\b/.test(js));
+    assertTrue('defines readParamOverrides helper',
+      /function\s+readParamOverrides\b/.test(js));
+
+    // Fixed pickers hand their -params container to renderParamControls
+    // both on init (populateSpecEditorPickers) and on change.
+    for (const id of ['spec-regime', 'spec-exit-hardstop', 'spec-exit-target', 'spec-exit-trail', 'spec-sizing']) {
+      assertTrue(`${id}-params is fed to renderParamControls`,
+        new RegExp(`'${id}'[\\s\\S]{0,400}renderParamControls\\(`).test(js));
+    }
+
+    // makeBlockRow must attach a per-row params container and re-render
+    // it when the block selection changes.
+    assertTrue('makeBlockRow creates a .spec-params container',
+      /makeBlockRow[\s\S]{0,2500}class(?:Name|=)?\s*=?\s*['"]spec-params['"]/.test(js));
+    assertTrue('makeBlockRow renders param controls on select change',
+      /makeBlockRow[\s\S]{0,3000}renderParamControls\(/.test(js));
+
+    // blockRefToSpec/buildSpecFromUi must feed the params container (not
+    // just the block id) so overrides reach the emitted JSON.
+    assertTrue('blockRefToSpec accepts a params container',
+      /function\s+blockRefToSpec\s*\([^)]*,\s*\w+/.test(js));
+    assertTrue('buildSpecFromUi uses readRows (per-row params plumbing)',
+      /readRows\('spec-entries-list'\)/.test(js)
+      && /readRows\('spec-filters-list'\)/.test(js));
+    // Pin emits {value}; unpinned emits {min,max,step}. Both shapes must
+    // be present in the override reader.
+    assertTrue('readParamOverrides emits {value} for pinned params',
+      /readParamOverrides[\s\S]{0,2500}value\s*:/.test(js));
+    assertTrue('readParamOverrides emits {min,max,step} for ranged params',
+      /readParamOverrides[\s\S]{0,3500}min\s*:[\s\S]{0,200}max\s*:[\s\S]{0,200}step\s*:/.test(js));
   }
 
   // ── 3. Server contract: GET /api/blocks shape matches editor reads ──
