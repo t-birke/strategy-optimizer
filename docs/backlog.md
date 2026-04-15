@@ -1005,11 +1005,254 @@ the JM Simple 3TP simulator.
     editor script without confirmation — user feedback note already
     captured in MEMORY.md.
 
-### 4.7 Deployment (= portfolio automation)
-- Winning strategies → alert-only Pine indicator pushed live.
-- Alerts post to a webhook that executes on exchange (out of scope; stub API).
-- Each trade returns a configurable "tax" (fraction of net P&L) to a pool
-  that funds new experiments (Phase 5 feedstock).
+### 4.7 Deployment (= portfolio automation) — SPEC LOCKED 2026-04-15
+
+**Scope:** turn a winning run into a live (paper-mode) trading loop —
+TV indicator pushed → alerts hit our webhook → dispatcher updates a
+position ledger → reconciler watches for drift. NO real-money execution
+in 4.7; live tier explicitly disabled in code, schema, and UI.
+
+#### Architectural overview
+
+**State machine (DuckDB is source of truth):**
+```
+runs.status=completed
+        │  (user clicks "Deploy" on a winning spec-mode run)
+        ▼
+deployments.status=draft         [config prepared, not serving webhooks]
+        │  (Pine pushed via existing pine-deploy + secret minted)
+        ▼
+deployments.status=armed         [webhook URL live, mode=paper]
+        │  (TV alert → webhook_events row → dispatcher)
+        ▼
+positions.state=opening → open   [paper fill simulated OR live-stub logged]
+        │  (TP/SL/Structural/Reversal alert)
+        ▼
+positions.state=closing → closed [reconciliation records realized P&L]
+        │
+        ▼
+deployments.status=paused|retired (kill-switched or explicitly retired)
+```
+
+**Storage:** all state in DuckDB. Files are artifacts only — generated
+`.pine` under `pine/generated/`, plus a per-deployment append-only
+`data/deployments/<id>/events.jsonl` audit trail (the JSONL is also the
+ingest queue once we split the webhookd process — see 4.7d).
+
+**Boundary — we own / exchange owns:**
+- WE own: signal generation (Pine on TV), webhook ingestion, dedup, the
+  canonical position ledger (our model of what *should* be true),
+  reconciliation, P&L accounting.
+- EXCHANGE owns: actual fills, fees, slippage, position state. In 4.7
+  the "exchange" is `paper` (simulated via `engine/execution-costs.js`
+  shared with the backtest) or `live-stub` (logs the order it *would*
+  have sent, returns a fake fill). The `adapters/exchange.js` interface
+  is the swap point for a future real adapter.
+
+#### Safety model (layered, each independently sufficient)
+
+1. **Tier flag per deployment** — `mode ∈ {dry-run, paper, live-stub}`.
+   No `live` value in the CHECK constraint. Mode change requires DB
+   update + server restart; no UI path in 4.7.
+2. **Global kill switch** — env var `DEPLOYMENT_KILL_SWITCH=1` +
+   `system.kill_switch` row. Tripping pauses dispatch but does NOT
+   auto-close positions (humans decide).
+3. **Per-deployment circuit breakers** — `max_position_size`,
+   `max_loss_per_day_usd`, `max_consecutive_losses`,
+   `max_positions_open`. Breach → `status=paused` with `pause_reason`.
+   Unpause is manual.
+4. **Alert dedup** — `UNIQUE(deployment_id, bar_time, action, direction)`.
+   Duplicate payloads return 200 + `deduped:true` so TV stops retrying.
+5. **HMAC-signed webhooks** — `HMAC-SHA256(body, secret)` validated
+   with `crypto.timingSafeEqual`. Bad sig → 401, logged but not
+   dispatched.
+6. **Staleness guard** — reject `abs(now - payload.bar_time) > 2*tf`.
+   Protects against replay and chart-scrolled-back-in-time cases.
+7. **Per-symbol locks** — only one open position per
+   `(deployment, symbol)`. Second "open" while position=open is logged
+   as a drift event, not acted on.
+
+#### Tax pool — DEFERRED to Phase 4.8 / Phase 5
+
+The tax pool is an accounting abstraction with no consumer until the AI
+idea generator wants to spend GPU budget. Building it now means
+designing a ledger with no reader. **Mitigation:** capture
+`realized_pnl_usd` on every closed `positions` row from day one — the
+pool is derivable retroactively from the trade log, no schema debt.
+
+#### Build vs stub — exchange adapter is STUBBED in 4.7
+
+Real execution would require API keys, rate-limit handling, fill
+reconciliation against the exchange's state, and risk thinking the rest
+of the system isn't ready for. The "NO real money" constraint makes
+this decision for us. The `adapters/exchange.js` interface
+(`{ openPosition, closePosition, getPosition, listPositions }`) is the
+swap point — `paper` and `live-stub` are both stub impls; a future
+`binance-perp` adapter implements the same interface and the dispatcher
+won't notice.
+
+---
+
+#### Sub-phases
+
+##### 4.7a — Webhook receiver + dedup (foundations)
+- **Goal:** TV alerts reach our server, get authenticated, deduped, and
+  persisted — no execution yet.
+- **Why first:** everything downstream assumes a reliable event stream.
+- **IN scope:**
+  - Schema: `deployments` table (id, spec_hash, symbol, timeframe, mode,
+    status, secret_key, pine_filename, pine_hash12, max_position_size,
+    max_loss_per_day_usd, config_json, created_at, armed_at, paused_at,
+    pause_reason). `webhook_events` table with
+    `UNIQUE(deployment_id, dedup_key)`.
+  - Endpoints: `POST /webhook/:deployment_id/:secret` (HMAC-verify,
+    insert event, 200-on-dedup, 401-on-bad-sig). `POST /api/deployments`
+    (draft from a run). `GET /api/deployments`, `GET /api/deployments/:id`.
+  - **Process topology:** receiver in the same Express process for now;
+    split to `webhookd` in 4.7d.
+- **DEFERRED:** position model, dispatcher, Pine auto-push, UI deploy
+  button, tax pool, live-stub adapter.
+- **Gate (`scripts/deployment-webhook-check.js`):**
+  valid HMAC → 200 + row. Bad HMAC → 401 + no row. Duplicate
+  `(deployment_id, bar_time, action)` → 200 + `deduped:true`, only one
+  row persisted. Stale (>2*tf old) → 400. Unknown deployment → 404.
+- **Risks:** secret leakage (log redaction must strip `secret`), HMAC
+  timing attack (timingSafeEqual, never `===`), JSON parse DoS (cap body
+  at 4 KB on the webhook route specifically).
+- **Exit:** `curl` a fake TV payload → row in `webhook_events` with
+  `signature_ok=true`. Replay → row count still 1, `deduped:true`.
+
+##### 4.7b — Paper-mode dispatcher + position ledger
+- **Goal:** webhook events drive a paper-mode position state machine
+  with realistic P&L.
+- **Why now:** the moment events flow we need to do *something* — paper
+  is the safe default.
+- **IN scope:**
+  - Schema: `positions` (id, deployment_id, symbol, direction, state,
+    entry_time, entry_price, entry_size, exit_time, exit_price,
+    exit_reason, realized_pnl_usd, fees_usd, drift_notes JSON).
+    `deployment_events` JSONL mirror.
+  - `adapters/exchange.js` with `paper` impl. For 4.7b "price source"
+    is the payload's `price` field (4.7e adds an independent feed).
+  - `api/dispatcher.js`: claim-next-event (mirrors `claimNextRun`
+    pattern), apply to adapter, update `positions`, append JSONL.
+    Idempotent per `webhook_events.id`.
+  - Circuit breakers evaluated at dispatch time (keep ingest cheap).
+- **DEFERRED:** independent price feed, multi-symbol concurrent
+  positions per deployment (one-per-deployment for now), Pine-push
+  integration, UI.
+- **Gate (`scripts/deployment-dispatcher-check.js`):**
+  full long trip (open → TP1 → close) lands correct entry/exit/PnL.
+  Duplicate open while open → logged to `drift_notes`, not acted on.
+  `max_loss_per_day_usd` breach → auto-pause. Same spec + same event
+  sequence → same realized P&L as `runtime.js` for that bar (≤ $0.01).
+- **Risks:** P&L drift vs runtime backtest (share execution-costs
+  math, don't reimpl); out-of-order events (sort by `bar_time`, not
+  `received_at`); clock skew on dedup (use TV's `bar_time`, not server
+  clock).
+- **Exit:** simulate a week of alerts offline → realized P&L matches
+  `runSpec()` of the same spec on the same window.
+
+##### 4.7c — Deploy-from-run UI + Pine auto-push with collision safety
+- **Goal:** one-click "Deploy this run" from run-detail that codegens,
+  pushes to TV, creates `deployments.status=draft`, walks user through
+  arming.
+- **IN scope:**
+  - UI: "Deploy" button on run-detail (spec-mode only, mirror 4.6
+    gating). Modal: Pine filename preview, webhook URL with freshly
+    minted secret (copyable), alert-message template to paste into TV,
+    mode selector (`paper` only — `live` grayed-out with tooltip).
+    Save → draft. Explicit Arm button → armed.
+  - Server endpoint `POST /api/deployments/:id/push-pine` reusing
+    `scripts/pine-deploy.js` logic. Never overwrite without
+    `?allow_overwrite=1` (MEMORY.md guardrail).
+  - Deployments list page: status chip, last event time, open positions
+    count, P&L 24h.
+- **DEFERRED:** unarm/retire flows (manual DB), editing a deployed spec
+  (must retire + redeploy), live-position charts.
+- **Gate (`scripts/ui-deployment-check.js`):**
+  three-section pattern. DOM (button, modal fields, deployments page),
+  JS (webhook URL construction, secret copy-to-clipboard, mode selector
+  disables `live`), server (create draft → row; arm w/o Pine pushed →
+  409; push w/o `allow_overwrite` on collision → 409 echoing existing
+  script name).
+- **Risks:** accidental overwrite of an armed deployment's Pine (arming
+  locks `pine_filename`); secret rotation voids in-flight TV alerts
+  (surface this hard in UI, never silent).
+- **Exit:** Deploy Run #N → Pine in TV → paste alert message → first
+  real alert lands in `webhook_events` and dispatches to a `positions`
+  row.
+
+##### 4.7d — Reconciler + process split (`webhookd`)
+- **Goal:** continuously compare our ledger to adapter truth; move the
+  webhook receiver out-of-process so UI restarts don't drop alerts.
+- **Why now:** once 4.7c is in daily use the UI gets restarted often;
+  TV alerts arriving during a restart vanish today.
+- **IN scope:**
+  - **`bin/webhookd.js`** — minimal Express app exposing only
+    `POST /webhook/:id/:secret`, **appending to JSONL only** (writer of
+    record). Main UI process polls + ingests on a tick. Picked over
+    DuckDB-direct because DuckDB is single-writer; JSONL is bulletproof
+    and decouples cleanly.
+  - **Reconciler** — periodic (60s): for each `armed` deployment,
+    `adapter.getPosition(symbol)` vs `positions` row; log diffs to
+    `drift_notes` and trip `paused` if severity > threshold.
+  - `docs/deployment-ops.md` — systemd / pm2 docs.
+- **DEFERRED:** live-stub adapter, multi-node deployments, alerting
+  (email/slack on drift).
+- **Gate (`scripts/deployment-reconcile-check.js`):**
+  webhookd receives event while ingester down → JSONL grows. Restart
+  ingester → DB catches up, dispatcher fires. Mutate `positions` row
+  directly to fake drift → reconciler logs + pauses.
+- **Risks:** double-write race (JSONL approach avoids it); reconciler
+  false-positive on transient backlog (gate: 100 queued events drain
+  → no false pause); JSONL torn writes (use `fs.write` with `O_APPEND`,
+  skip malformed trailing lines on restart).
+- **Exit:** kill main UI mid-TV-alert → restart 60s later → alert that
+  arrived during downtime is in DB and dispatched correctly.
+
+##### 4.7e — Independent price feed + live-stub adapter + hardening
+- **Goal:** trust-but-verify TV's price; ship the live-stub adapter so
+  the interface is exercised end-to-end.
+- **IN scope:**
+  - Price feed: dispatcher looks up the last close from
+    `db/candles.js` for `(symbol, timeframe, bar_time)` as canonical
+    fill price. Log TV's price alongside; flag drift if delta exceeds
+    `max_price_deviation_bps`.
+  - `live-stub` adapter: identical behavior to `paper` but writes an
+    `orders` table row marked `stub=true` so we have a realistic
+    "would have sent X" log.
+  - Hardening: 10 alerts/sec rate limit per deployment (sliding window),
+    body-size cap, structured log output ready for a future aggregator.
+- **DEFERRED:** tax pool, real exchange adapter, portfolio-level
+  allocation across strategies, position sizing that consults live
+  equity.
+- **Gate (`scripts/deployment-live-stub-check.js`):**
+  payload price $100 vs candle close $100.50 → fill at $100.50, drift
+  logged at 50 bps. 11 events in 1s → 11th = 429. Runtime mode-flip
+  request → 403 (mode change requires restart).
+- **Risks:** candle not yet ingested for most-recent bar (fall back to
+  TV price with warning, don't block); rate-limiter memory leak
+  (sliding window per deployment, cap at N).
+- **Exit:** run a live-stub deployment on a real symbol for a week.
+  Reconciler shows zero drift; `orders` table captures every intended
+  order with realistic timestamps.
+
+---
+
+#### Critical files (touched across 4.7)
+- `db/schema.sql` — 4 new tables (deployments, webhook_events,
+  positions, orders) + `system` k/v table for kill switch
+- `api/routes.js` — webhook + deployments endpoints
+- `api/dispatcher.js` (new) — event → position state machine
+- `api/reconciler.js` (new) — periodic drift check
+- `adapters/exchange.js` (new) — `paper` + `live-stub` impls behind a
+  swap-friendly interface
+- `bin/webhookd.js` (new, 4.7d) — out-of-process receiver
+- `ui/index.html` + `ui/app.js` — Deploy button, modal, deployments
+  list page
+- `scripts/pine-deploy.js` — already exists, reused via a server
+  endpoint in 4.7c
 
 ---
 
