@@ -1553,22 +1553,16 @@ window.openRunDetail = async (id) => {
     renderWalkForwardReport(run.wf_report_json);
     renderRegimeBreakdown(run.regime_breakdown_json, run.fitness_breakdown_json);
 
-    // Render parameter cards
+    // Render parameter cards. Spec-mode genes use qualified-ID keys
+    // (`emaTrend.main.emaFast`) rather than the flat legacy keys in
+    // PARAM_LABELS, so looking up by legacy key returns null for every
+    // field and the panel renders empty. Branch on run.spec_hash and
+    // walk the gene entries directly for spec-mode runs.
+    const isSpecMode = !!run.spec_hash;
     if (gene) {
-      const tp3Pct = 100 - (gene.tp1Pct ?? 0) - (gene.tp2Pct ?? 0);
-      const paramsHtml = Object.entries(PARAM_LABELS).map(([key, meta]) => {
-        const raw = gene[key];
-        if (raw == null) return '';
-        // Special display for tp3Pct
-        const displayVal = key === 'tp2Pct'
-          ? `${raw}${meta.unit} <span style="color:#6e7681;font-size:11px">(TP3 gets ${tp3Pct}%)</span>`
-          : `${typeof raw === 'number' && !Number.isInteger(raw) ? raw.toFixed(2) : raw}${meta.unit ? ' ' + meta.unit : ''}`;
-        return `<div style="background:#21262d;border:1px solid #30363d;border-radius:6px;padding:10px 12px">
-          <div style="font-size:11px;color:#8b949e;margin-bottom:4px">${meta.label}</div>
-          <div style="font-size:16px;font-weight:700;color:#e6edf3;font-family:monospace">${displayVal}</div>
-          <div style="font-size:10px;color:#6e7681;margin-top:4px">${meta.desc}</div>
-        </div>`;
-      }).join('');
+      const paramsHtml = isSpecMode
+        ? renderSpecGeneCards(gene)
+        : renderLegacyGeneCards(gene);
       document.getElementById('detail-params').innerHTML = paramsHtml;
     } else {
       document.getElementById('detail-params').innerHTML = '<span style="color:#8b949e">No gene data yet</span>';
@@ -1657,6 +1651,91 @@ function formatWinnerConfig(gene, isSpecMode) {
   );
   const prefix = entryThreshold != null ? `E${entryThreshold} ` : '';
   return prefix + groups.join(' · ');
+}
+
+/**
+ * Legacy parameter cards — the pre-4.1 flat-gene layout. Each key in
+ * PARAM_LABELS gets one card; missing keys are skipped. Preserved
+ * verbatim (down to the tp3Pct footnote) so legacy-run detail pages
+ * keep rendering exactly the way they did before the spec-mode split.
+ */
+function renderLegacyGeneCards(gene) {
+  const tp3Pct = 100 - (gene.tp1Pct ?? 0) - (gene.tp2Pct ?? 0);
+  return Object.entries(PARAM_LABELS).map(([key, meta]) => {
+    const raw = gene[key];
+    if (raw == null) return '';
+    const displayVal = key === 'tp2Pct'
+      ? `${raw}${meta.unit} <span style="color:#6e7681;font-size:11px">(TP3 gets ${tp3Pct}%)</span>`
+      : `${typeof raw === 'number' && !Number.isInteger(raw) ? raw.toFixed(2) : raw}${meta.unit ? ' ' + meta.unit : ''}`;
+    return `<div style="background:#21262d;border:1px solid #30363d;border-radius:6px;padding:10px 12px">
+      <div style="font-size:11px;color:#8b949e;margin-bottom:4px">${meta.label}</div>
+      <div style="font-size:16px;font-weight:700;color:#e6edf3;font-family:monospace">${displayVal}</div>
+      <div style="font-size:10px;color:#6e7681;margin-top:4px">${meta.desc}</div>
+    </div>`;
+  }).join('');
+}
+
+/**
+ * Spec-mode parameter cards. Gene keys are qualified IDs like
+ * `emaTrend.main.emaFast` or `_meta.entries.threshold`. We parse each
+ * key into block / instance / param, group cards under a block header,
+ * and render every numeric value with the same compact formatter the
+ * winner-config line uses. No label/desc dictionary yet — PARAM_LABELS
+ * only covers legacy keys, and blocks ship param metadata separately.
+ * For now the qualified-ID suffix doubles as the card title, which is
+ * accurate and also matches what the user typed in the spec editor.
+ */
+function renderSpecGeneCards(gene) {
+  // Surface the entries-threshold meta gene as a standalone card at
+  // the top. It isn't owned by any block so the block-grouping pass
+  // would otherwise drop it.
+  const metaCards = [];
+  const blocks = Object.create(null); // blockId -> Map<instance, [{param, value}]>
+
+  for (const [k, v] of Object.entries(gene)) {
+    if (k === '_meta.entries.threshold') {
+      metaCards.push(paramCardHtml('Entries', 'min signals to open', v, '_meta.entries.threshold'));
+      continue;
+    }
+    if (k.startsWith('_meta.')) continue;
+    const parts = k.split('.');
+    if (parts.length < 2) continue; // malformed — skip
+
+    const blockId = parts[0];
+    const instance = parts.length >= 3 ? parts[1] : 'main';
+    const param = parts.length >= 3 ? parts.slice(2).join('.') : parts.slice(1).join('.');
+
+    const byInstance = (blocks[blockId] ??= Object.create(null));
+    (byInstance[instance] ??= []).push({ param, value: v, qid: k });
+  }
+
+  const blockSections = Object.entries(blocks).map(([blockId, byInstance]) => {
+    const instanceSections = Object.entries(byInstance).map(([instance, params]) => {
+      const label = instance === 'main' ? blockId : `${blockId} · ${instance}`;
+      const cards = params
+        .map(p => paramCardHtml(p.param, label, p.value, p.qid))
+        .join('');
+      return cards;
+    }).join('');
+    return instanceSections;
+  }).join('');
+
+  return metaCards.join('') + blockSections;
+}
+
+/**
+ * Single-param card used by renderSpecGeneCards. Keeps the visual
+ * shape in lock-step with renderLegacyGeneCards so the grid layout
+ * (the caller's parent container) lines up whether the run is legacy
+ * or spec-mode.
+ */
+function paramCardHtml(paramName, subtitle, value, qid) {
+  const displayVal = formatGeneNum(value);
+  return `<div style="background:#21262d;border:1px solid #30363d;border-radius:6px;padding:10px 12px" title="${qid}">
+    <div style="font-size:11px;color:#8b949e;margin-bottom:4px">${paramName}</div>
+    <div style="font-size:16px;font-weight:700;color:#e6edf3;font-family:monospace">${displayVal}</div>
+    <div style="font-size:10px;color:#6e7681;margin-top:4px">${subtitle}</div>
+  </div>`;
 }
 
 /** Compact number formatter for the winner-config line — strips

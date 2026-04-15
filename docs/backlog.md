@@ -918,6 +918,34 @@ case.
   - Legacy-run compare (no `wf_report_json`). Surfaced via the
     empty-state note rather than synthesized.
 
+**✅ 4.5c — spec-mode detail page fixes — done.**
+Two regressions surfaced together in a bug report (Run #58 BTCUSDT 4H):
+the Strategy Parameters card rendered empty and Recalculate produced $0.
+Both had the same root cause — legacy paths assumed flat gene keys /
+the JM Simple 3TP simulator.
+- `ui/app.js`: `openRunDetail` now branches on `run.spec_hash`. Pulled
+  the param-card rendering out of the inline loop into two helpers —
+  `renderLegacyGeneCards` (unchanged behaviour for legacy runs, still
+  reads `PARAM_LABELS`) and `renderSpecGeneCards` (walks the gene,
+  parses qualified IDs into block / instance / param, groups cards
+  under the block name with the qualified ID as a hover tooltip).
+  `_meta.entries.threshold` surfaces as a standalone "Entries" card at
+  the top; other `_meta.*` keys are intentionally dropped.
+- `api/routes.js` (`GET /api/runs/:id/trades`): new spec-mode branch
+  mirrors `island-worker` — `registry.ensureLoaded()` → `getSpec` →
+  `validateSpec` → `buildParamSpace` → `loadDataBundle` → `runSpec`
+  with `collectTrades` + `collectEquity`. Response gains a `specMode`
+  flag so the UI can tell which engine produced the numbers. A missing
+  spec row returns 404 rather than silently falling through. Legacy
+  branch is preserved verbatim for runs without `spec_hash`.
+- `?sizing=flat` is ignored in the spec branch (sizing is spec-owned)
+  but still echoed in the response to keep the UI's dropdown stable.
+- Gate: `scripts/ui-spec-recalc-check.js` — static import / branch
+  checks on routes.js, static + behavioral tests on the two card
+  renderers (extracted and run against mock genes), and a server
+  round-trip proving a run with a missing `spec_hash` returns 404 with
+  a spec-not-found error (the spec branch fired).
+
 ### 4.6 Pine export
 - "Generate Pine indicator" button per winning run.
 - Runs codegen over active (entry + filter + regime) blocks with the

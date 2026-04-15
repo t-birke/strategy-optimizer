@@ -20,6 +20,9 @@ import { broadcast } from './websocket.js';
 import { sendToTradingView, checkTradingViewConnection } from './tradingview.js';
 import { loadCandles } from '../db/candles.js';
 import { runStrategy } from '../engine/strategy.js';
+import { runSpec } from '../engine/runtime.js';
+import { loadDataBundle } from '../engine/data-bundle.js';
+import { buildParamSpace } from '../optimizer/param-space.js';
 import * as registry from '../engine/blocks/registry.js';
 import { validateSpec, DEFAULT_FITNESS, DEFAULT_WALK_FORWARD } from '../engine/spec.js';
 
@@ -375,6 +378,73 @@ router.get('/api/runs/:id/trades', async (req, res) => {
     const config = run.config || {};
     const startTs = new Date(run.start_date).getTime();
     const endTs = config.endDate ? new Date(config.endDate).getTime() : Infinity;
+    const flatSizing = req.query.sizing === 'flat';
+
+    // ── Spec-mode branch ────────────────────────────────────
+    // Phase 4.5c: runs with a spec_hash carry qualified-ID genes
+    // (`emaTrend.main.emaFast` etc.) and must be re-evaluated via
+    // the runtime, not the legacy JM Simple 3TP simulator — calling
+    // runStrategy on a spec-mode gene silently returns zero trades.
+    // Behaviour mirrors island-worker: ensureLoaded → validate →
+    // buildParamSpace → loadDataBundle → runSpec. Sizing is spec-
+    // controlled (the sizing block decides), so `?sizing=flat` is
+    // ignored in this branch — we still echo the query param back
+    // but the block is authoritative.
+    if (run.spec_hash) {
+      await registry.ensureLoaded();
+      const persisted = await getSpec(run.spec_hash);
+      if (!persisted) {
+        return res.status(404).json({
+          error: `Spec ${run.spec_hash} not found (run ${run.id} points at a missing spec)`,
+        });
+      }
+      const spec = validateSpec(persisted.json);
+      const paramSpace = buildParamSpace(spec);
+      const bundle = await loadDataBundle({
+        symbol:    run.symbol,
+        baseTfMin: run.timeframe,
+        spec,
+        startTs,
+        endTs,
+      });
+
+      const metrics = runSpec({
+        spec, paramSpace, bundle, gene: run.best_gene,
+        opts: { collectTrades: true, collectEquity: true },
+      });
+
+      const base = bundle.base;
+      const tradingStartBar = bundle.tradingStartBar ?? 0;
+      const ohlc = [];
+      for (let i = tradingStartBar; i < base.close.length; i++) {
+        ohlc.push({
+          time:  Math.floor(Number(base.ts[i]) / 1000),
+          open:  base.open[i],
+          high:  base.high[i],
+          low:   base.low[i],
+          close: base.close[i],
+        });
+      }
+
+      // runSpec's equityHistory items are `{ ts, equity }` — same
+      // shape as the legacy engine. The UI remaps to
+      // `{ time, value }` via the same adapter below.
+      const equity = (metrics.equityHistory ?? []).map(e => ({
+        time:  Math.floor(e.ts / 1000),
+        value: e.equity,
+      }));
+
+      return res.json({
+        metrics,
+        sizing: flatSizing ? 'flat' : 'compounding',
+        specMode: true,
+        tradeList: metrics.tradeList ?? [],
+        ohlc,
+        equity,
+      });
+    }
+
+    // ── Legacy branch ───────────────────────────────────────
     const WARMUP_BARS = 200;
     const preloadTs = startTs - WARMUP_BARS * run.timeframe * 60000;
     let candles = await loadCandles(run.symbol, run.timeframe, preloadTs);
@@ -401,7 +471,6 @@ router.get('/api/runs/:id/trades', async (req, res) => {
       if (candles.ts[i] >= startTs) { tradingStartBar = i; break; }
     }
 
-    const flatSizing = req.query.sizing === 'flat';
     const metrics = runStrategy(candles, run.best_gene, {
       tradingStartBar, collectTrades: true, collectEquity: true, flatSizing,
     });
@@ -427,6 +496,7 @@ router.get('/api/runs/:id/trades', async (req, res) => {
     res.json({
       metrics,
       sizing: flatSizing ? 'flat' : 'compounding',
+      specMode: false,
       tradeList: metrics.tradeList ?? [],
       ohlc,
       equity,
