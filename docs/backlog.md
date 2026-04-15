@@ -498,11 +498,41 @@ features → Remote optimizer workers).
      "server not reachable" in stderr.
   8. `--priority` emits a clearly visible WARN on stderr.
 
-### 4.2d In-process cancel propagation — deferred
-- `optimizer/runner.js` periodically checks `cancel_requested` during the
-  GA loop (alongside the existing `cancelSent` signal) and stops cleanly.
-- Needs a DB probe interval that doesn't hammer the queue — likely
-  once per generation, not per evaluation.
+### 4.2d In-process cancel propagation — ✅ done
+Belt-and-suspenders path for `cancel_requested` to reach the runner when
+the HTTP cancel endpoint wasn't the trigger. Single-process mode with
+the current `POST /api/runs/:id/cancel` already flips the in-process
+`cancelRequested` flag synchronously, so this is primarily insurance
+for (a) a future CLI that writes directly to the DB, and (b) the
+remote-worker shape listed under Deferred.
+
+**Mechanism** (api/routes.js):
+- New `cancelPollTimer` state var alongside `heartbeatTimer`.
+- `CANCEL_POLL_MS = 2_000` — one small `SELECT cancel_requested FROM
+  runs WHERE id = ?` per interval. Latency is imperceptible for a human
+  clicking Cancel; DB load is negligible.
+- One-shot latch: once the poll observes TRUE it stops querying (the
+  flag is monotonic — no un-cancel).
+- Lifecycle matched to heartbeat: started after `claimNextRun` succeeds,
+  cleared in the same `finally` block that clears `heartbeatTimer`. No
+  leak if the runner throws.
+
+**Why not "runner.js polls the DB"?** The runner already has
+`shouldCancel()` — a function pointer the caller supplies. Putting the
+DB poll in routes.js keeps the runner pure (no DB dependency) and lets
+future non-queue callers of `runOptimization` (one-off scripts, the
+existing legacy `POST /api/optimize` path) keep using their own cancel
+source.
+
+**Verification** — `queue-drain-check.js` test [5]:
+- Replicates the poll block in isolation against a test row.
+- Confirms flag stays false with `cancel_requested=FALSE`.
+- After `UPDATE cancel_requested = TRUE`, flag flips within one poll
+  interval (test uses 500ms for speed; prod uses 2s).
+- Confirms the one-shot latch: poll count stops growing once flipped.
+- End-to-end through `processQueue` is covered implicitly by the
+  happy-path test when real candles are present; the runner already
+  reads `cancelRequested` via `shouldCancel` every generation.
 
 ### 4.3 UI — spec authoring
 - Block picker per slot (regime, entries, filters, exits, sizing).

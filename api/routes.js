@@ -45,11 +45,28 @@ let activeRun = null;
 let cancelRequested = false;
 let hyperRequested = false;
 let heartbeatTimer = null;
+let cancelPollTimer = null;
 let processing = false;
 
 // Heartbeat interval during a running GA. 10s matches the db-schema-check
 // timing budget and is well below recoverStaleRuns's default 60s timeout.
 const HEARTBEAT_MS = 10_000;
+
+// Phase 4.2d — DB-polling interval for `runs.cancel_requested`. The
+// HTTP cancel path already flips the in-process `cancelRequested` flag
+// synchronously, so single-process users never wait on this. The poll
+// is belt-and-suspenders:
+//   - A future CLI or admin tool that flips the DB column directly
+//     (bypassing the HTTP endpoint) still reaches the runner within
+//     ~2s.
+//   - A future remote-worker shape (see "Remote optimizer workers" in
+//     the backlog's Deferred section) can propagate cancel by writing
+//     to `cancel_requested` on the central DB — this timer is what
+//     turns that write into a runner-visible signal.
+// 2s is a compromise: fast enough that cancel latency is imperceptible
+// to a human clicking Cancel, slow enough that it doesn't hammer the
+// DB (the poll is one small SELECT per interval).
+const CANCEL_POLL_MS = 2_000;
 
 // Worker identifier stamped into runs.claimed_by when the in-process
 // drain claims a row. Mostly for debugging — even single-process mode
@@ -710,6 +727,21 @@ export async function processQueue() {
       heartbeatTimer = setInterval(() => {
         heartbeat(runId).catch(() => {});
       }, HEARTBEAT_MS);
+      // Phase 4.2d: poll the DB for cancel_requested. One-shot latch —
+      // once we see TRUE we stop polling (the flag is monotonic; there's
+      // no un-cancel). The runner reads cancelRequested via shouldCancel
+      // every generation, so setting it here propagates within the next
+      // generation boundary.
+      cancelPollTimer = setInterval(async () => {
+        if (cancelRequested) return;   // HTTP path already flipped it
+        try {
+          const rows = await query(`SELECT cancel_requested FROM runs WHERE id = ${runId}`);
+          if (rows[0]?.cancel_requested) {
+            console.log(`[queue] cancel_requested flipped on DB for run ${runId}; propagating to runner`);
+            cancelRequested = true;
+          }
+        } catch { /* transient DB error — try again next tick */ }
+      }, CANCEL_POLL_MS);
 
       broadcast({
         type: 'run_started', runId,
@@ -786,7 +818,9 @@ export async function processQueue() {
         broadcast({ type: 'run_error', runId, error: err.message });
       } finally {
         clearInterval(heartbeatTimer);
+        clearInterval(cancelPollTimer);
         heartbeatTimer = null;
+        cancelPollTimer = null;
         activeRun = null;
         cancelRequested = false;
         hyperRequested = false;

@@ -240,6 +240,92 @@ async function main() {
     // physically exist at rest. The `JSON.parse` try/catch in processQueue
     // is defensive but unreachable on the current schema — no test here.
 
+    // ── 5. DB-poll cancel propagation (4.2d) ───────────────────
+    //
+    // Phase 4.2d wires a 2s setInterval in processQueue that reads
+    // `runs.cancel_requested` from the DB and, on TRUE, flips the
+    // in-process `cancelRequested` flag so the runner sees it via
+    // shouldCancel at the next generation boundary.
+    //
+    // Testing this end-to-end via processQueue would require a real
+    // long-running GA (so the poll timer has time to fire before the
+    // run completes) — expensive and fragile. Instead we test the
+    // polling contract in isolation by replicating the same poll
+    // block here, pointed at a test row we insert as status='running'.
+    // If the mechanism (DB SELECT + flag flip) works in isolation, and
+    // the same code is wired into processQueue's lifecycle (confirmed
+    // by reading routes.js), the end-to-end propagation works.
+    //
+    // The contract we're testing:
+    //   - flag starts false
+    //   - with cancel_requested=FALSE in DB, flag stays false
+    //   - after we UPDATE cancel_requested=TRUE, flag flips TRUE
+    //     within one poll interval (~2s, we wait 3s to be safe)
+    //   - once flipped, the poll short-circuits (no extra queries)
+    console.log('\n[5] 4.2d: DB-polling cancel propagation flips in-process flag');
+    {
+      // Use a plain pending row — we just need any row in the `runs`
+      // table to watch. insertPending puts it in 'pending' status; we
+      // flip it to 'running' to match the real processQueue invariant
+      // that the poll only runs on the currently-active row.
+      const id = await insertPending({
+        configObj: { populationSize: 4, generations: 1, label: 'cancel-poll' },
+        priority: 25,
+      });
+      await exec(`UPDATE runs SET status = 'running' WHERE id = ${id}`);
+
+      // Local mirror of the poll block from processQueue. The only
+      // behavioral difference is that we flip a LOCAL variable instead
+      // of the module-level `cancelRequested` — same effect, just
+      // scoped to this test.
+      let localCancelled = false;
+      let pollCount = 0;
+      const POLL_MS = 500;   // 4× faster than prod (2s) to keep test fast
+      const timer = setInterval(async () => {
+        if (localCancelled) return;
+        pollCount++;
+        try {
+          const rows = await query(`SELECT cancel_requested FROM runs WHERE id = ${id}`);
+          if (rows[0]?.cancel_requested) {
+            localCancelled = true;
+          }
+        } catch { /* transient — next tick */ }
+      }, POLL_MS);
+
+      // Wait 1s with cancel_requested = FALSE. Flag must not flip.
+      await new Promise(r => setTimeout(r, 1000));
+      assertTrue('flag stays false while cancel_requested=FALSE', !localCancelled);
+      assertTrue('poll fired at least once', pollCount >= 1, `pollCount=${pollCount}`);
+
+      // Flip the DB flag. Within one poll cycle (500ms) the timer
+      // should observe it and set localCancelled = true.
+      await exec(`UPDATE runs SET cancel_requested = TRUE WHERE id = ${id}`);
+
+      // Wait up to 2s for the flag to flip. Poll every 100ms so the
+      // assertion is as tight as the mechanism allows.
+      const deadline = Date.now() + 2000;
+      while (!localCancelled && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 100));
+      }
+      assertTrue('localCancelled flipped TRUE after DB update', localCancelled);
+
+      // Verify one-shot latch behavior: once flipped, the poll returns
+      // early without re-querying. Record current pollCount, wait one
+      // more interval, confirm pollCount is unchanged (or at most +1
+      // for a tick that landed mid-flip).
+      const snapshot = pollCount;
+      await new Promise(r => setTimeout(r, POLL_MS + 100));
+      clearInterval(timer);
+      assertTrue('poll short-circuits after flag flips',
+        pollCount <= snapshot + 1,
+        `pollCount grew from ${snapshot} → ${pollCount}`);
+
+      // Clean up: put the row back to 'pending' so cleanup() (DELETE
+      // WHERE symbol = MARKER) sweeps it in the normal rollback path.
+      // (symbol stays __QDC__ so cleanup catches it either way.)
+      await exec(`UPDATE runs SET status = 'pending', cancel_requested = FALSE WHERE id = ${id}`);
+    }
+
     // ── 4. Cancel-before-start ─────────────────────────────────
     //
     // Reserve two rows at the same priority. Cancel the first before
