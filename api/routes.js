@@ -484,6 +484,17 @@ router.post('/api/runs/:id/cancel', async (req, res) => {
     cancelRequested = true;
     return res.json({ status: 'cancelling' });
   }
+  // Kick the drain loop. claimNextRun's first action is to sweep any
+  // pending rows with cancel_requested=TRUE to 'cancelled', so a single
+  // processQueue() call promptly transitions this row (and any other
+  // pending rows that were cancel-requested). Without this kick, cancel
+  // on a pending run just flipped the flag — the status stayed 'pending'
+  // indefinitely, until the next POST /api/runs happened to trigger
+  // processQueue. Idempotent: if a drain is already in flight the call
+  // is a no-op (processing guard). We fire-and-forget — the sweep runs
+  // on the server event loop; the caller gets `cancel_requested` right
+  // away and the next /api/queue read reflects the transition.
+  processQueue();
   res.json({ status: 'cancel_requested' });
 });
 
