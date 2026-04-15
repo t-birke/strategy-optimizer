@@ -11,7 +11,7 @@ import { query, exec } from '../db/connection.js';
 import { upsertSpec, listSpecs, getSpec } from '../db/specs.js';
 import {
   claimNextRun, heartbeat, completeRun,
-  requestCancel, listQueue,
+  requestCancel, listQueue, recoverStaleRuns,
 } from '../db/queue.js';
 import { checkSymbol, ingestSymbol, updateSymbol } from '../data/ingest.js';
 import { runOptimization } from '../optimizer/runner.js';
@@ -497,6 +497,36 @@ router.get('/api/queue', async (req, res) => {
         })(),
       }));
     res.json({ active, pending });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Phase 4.2c — ops endpoint for the CLI (`scripts/queue.js recover`).
+ * One-shot sweep of stale `running` rows back to `pending`. Intended for
+ * manual use when you suspect a wedged run (no heartbeat in a while).
+ *
+ * Body: `{ timeoutMs?: number }` — defaults to 60_000. Same semantics as
+ * the boot-time recovery in server.js, but configurable.
+ *
+ * Protecting the active run: we bump the in-process active run's
+ * heartbeat_at to NOW right before the sweep. The sweep only recovers
+ * rows older than `timeoutMs`, so after the bump the active row is
+ * guaranteed-fresh and cannot be recovered, even if the caller passed
+ * `timeoutMs = 1_000`. This closes the race where an aggressive recover
+ * call would yank the row the current process is still executing.
+ *
+ * If you genuinely want to abandon the active run, cancel it first
+ * (POST /api/runs/:id/cancel), don't try to do it via recover.
+ */
+router.post('/api/queue/recover', async (req, res) => {
+  try {
+    const timeoutMs = Number.isFinite(req.body?.timeoutMs) ? req.body.timeoutMs : 60_000;
+    if (timeoutMs <= 0) return res.status(400).json({ error: 'timeoutMs must be > 0' });
+    if (activeRun) await heartbeat(activeRun.runId).catch(() => {});
+    const recovered = await recoverStaleRuns({ timeoutMs });
+    res.json({ recovered, timeoutMs });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

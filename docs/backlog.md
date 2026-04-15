@@ -447,12 +447,56 @@ features → Remote optimizer workers).
     `runner-spec-mode-check` 21/21, `queue-claim-check` 38/38,
     `queue-drain-check` 9/9. All green.
 
-### 4.2c CLI (`scripts/queue.js`) — deferred
-- `add <spec-file> <symbol> <tf> [--priority N]` — thin shell over
-  POST /api/runs.
-- `list [--running]` — wraps `listQueue()`.
-- `cancel <id>` — wraps `requestCancel()`.
-- `recover [--timeout-ms N]` — one-shot `recoverStaleRuns` for ops.
+### 4.2c CLI (`scripts/queue.js`) ✅ done
+
+- **`scripts/queue.js`** — thin HTTP client over the optimizer server's
+  queue endpoints. Four commands:
+  - `add <symbol> <tf> [--spec … --pop N --gens N --mut F --islands N
+    --planets N --min-trades N --max-dd PCT --start YYYY-MM-DD
+    --end YYYY-MM-DD]` — POSTs `/api/runs`. Normalizes `tf` either as
+    minute count (`240`) or label (`4H`). Symbol upper-cased.
+  - `list [--running]` — GETs `/api/queue`, prints active + pending
+    with priority + spec name + label.
+  - `cancel <id>` — POSTs `/api/runs/:id/cancel`.
+  - `recover [--timeout-ms N]` — POSTs `/api/queue/recover`.
+- **Why HTTP (not direct DB)**: single-process mode means the server is
+  the sole DB writer; DuckDB locks the file. Cancels also need to flip
+  the in-process `cancelRequested` flag, which only the server process
+  can do. The HTTP endpoint already does both.
+- **New endpoint `POST /api/queue/recover`** on `api/routes.js`: body
+  `{ timeoutMs? }`, defaults 60s, returns `{ recovered, timeoutMs }`.
+  Defensive bump of the active run's heartbeat before the sweep so an
+  aggressive `--timeout-ms 1000` call can't yank the row the current
+  process is still executing; the caller should `cancel` the run
+  explicitly if they want to abandon it.
+- **Env**: `OPTIMIZER_HOST` (default `localhost`), `OPTIMIZER_PORT`
+  (default `3000`). Zero-dependency — uses native `fetch`.
+- **Known limitations** (documented in the CLI with WARN stderr, not
+  silent drops):
+  - `--priority <N>` is parsed but ignored — `POST /api/runs` doesn't
+    currently expose a priority knob. Extend `routes.js` if needed.
+  - `--label <str>` is ignored — label is derived server-side from the
+    interval.
+- **Verification**: new `scripts/queue-cli-check.js` — spawns a fake
+  HTTP server (per test case), runs `scripts/queue.js` as a subprocess,
+  asserts the exact method+path+body the CLI sends and the stdout/
+  stderr/exit-code it produces. 8 scenarios, **41/41 ✓**:
+  1. `list` on empty queue.
+  2. `list --running` with an active row present (filters pending).
+  3. `add` with spec + flags (verifies `--pop`/`--gens`/`--start` map
+     to `populationSize`/`generations`/`startDate`, tf-minutes → label,
+     symbol uppercased).
+     - 3b: `tf=1H` label accepted as-is.
+     - 3c: unknown tf rejected without hitting server.
+  4. `cancel 42` hits the right URL.
+     - 4b: non-numeric id rejected without hitting server.
+  5. `recover --timeout-ms 30000` forwards the value; `recovered`
+     count printed back.
+     - 5b: default 60_000 when no flag.
+  6. Unknown command → non-zero exit + usage on stdout.
+  7. Server unreachable (bound-port=1 refused) → non-zero exit +
+     "server not reachable" in stderr.
+  8. `--priority` emits a clearly visible WARN on stderr.
 
 ### 4.2d In-process cancel propagation — deferred
 - `optimizer/runner.js` periodically checks `cancel_requested` during the
