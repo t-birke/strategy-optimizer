@@ -21,7 +21,7 @@ import { sendToTradingView, checkTradingViewConnection } from './tradingview.js'
 import { loadCandles } from '../db/candles.js';
 import { runStrategy } from '../engine/strategy.js';
 import * as registry from '../engine/blocks/registry.js';
-import { validateSpec } from '../engine/spec.js';
+import { validateSpec, DEFAULT_FITNESS, DEFAULT_WALK_FORWARD } from '../engine/spec.js';
 
 const router = Router();
 
@@ -727,6 +727,36 @@ router.get('/api/blocks', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+/**
+ * GET /api/defaults — exposes the source-of-truth config defaults from
+ * `engine/spec.js` so the UI "Reset to recommended" button is always in
+ * lockstep with what the runner would fill in if the user omitted the
+ * field. Phase 4.4 (fitness config panel).
+ *
+ * We surface two frozen constants:
+ *   - fitness:     { weights, caps, gates }  — scoring config
+ *   - walkForward: { nWindows, scheme }      — WF slicing config
+ *
+ * The walkForward shape is included even though 4.4 only puts UI on
+ * fitness: future sub-chunks (and any consumer that wants "what are the
+ * recommended defaults?" at runtime) can rely on this one endpoint
+ * instead of hardcoding a mirror.
+ *
+ * Pure read of frozen objects — no I/O, no registry touch, safe to call
+ * on every modal open. Deep-spread so downstream callers can't mutate
+ * the module-level constants by mistake.
+ */
+router.get('/api/defaults', (_req, res) => {
+  res.json({
+    fitness: {
+      weights: { ...DEFAULT_FITNESS.weights },
+      caps:    { ...DEFAULT_FITNESS.caps },
+      gates:   { ...DEFAULT_FITNESS.gates },
+    },
+    walkForward: { ...DEFAULT_WALK_FORWARD },
+  });
 });
 
 /**

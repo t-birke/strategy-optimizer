@@ -1,8 +1,10 @@
 /**
- * spec-api-check — smoke test for Phase 4.3a read-only endpoints.
+ * spec-api-check — smoke test for Phase 4.3a read-only endpoints
+ * (and the 4.3e POST + 4.4 defaults endpoint bolted on top).
  *
- *   GET /api/specs   — enumerates strategies/*.json
- *   GET /api/blocks  — enumerates the in-memory block registry
+ *   GET /api/specs    — enumerates strategies/*.json
+ *   GET /api/blocks   — enumerates the in-memory block registry
+ *   GET /api/defaults — surfaces DEFAULT_FITNESS + DEFAULT_WALK_FORWARD (4.4)
  *
  * Neither endpoint touches the queue or DuckDB, so this test boots a bare
  * Express app with the real router mounted, hits the endpoints via fetch
@@ -294,6 +296,65 @@ async function main() {
         assertTrue(`sort: ${b.id} kind=${b.kind} non-regressing`, k >= lastKey);
         lastKey = k;
       }
+    }
+
+    // ── 2b. GET /api/defaults ──────────────────────────────────
+    // Phase 4.4 surfaces DEFAULT_FITNESS + DEFAULT_WALK_FORWARD so the
+    // UI "Reset to recommended" button is in lockstep with the runner.
+    // Hardcoding the expected values here — if engine/spec.js drifts,
+    // the UI will drift with it, and this test flags the drift.
+    console.log('\n[2b] GET /api/defaults');
+    {
+      const r = await get(app.port, '/api/defaults');
+      assertEq('status 200', r.status, 200);
+
+      // Exact shape the UI reads.
+      assertTrue('body has fitness',     r.body && typeof r.body.fitness === 'object');
+      assertTrue('body has walkForward', r.body && typeof r.body.walkForward === 'object');
+
+      const fit = r.body.fitness;
+      assertTrue('fitness.weights has pf/dd/ret',
+        fit?.weights
+        && 'pf'  in fit.weights
+        && 'dd'  in fit.weights
+        && 'ret' in fit.weights);
+      assertTrue('fitness.caps has pf/ret',
+        fit?.caps && 'pf' in fit.caps && 'ret' in fit.caps);
+      assertTrue('fitness.gates has minTradesPerWindow/worstRegimePfFloor/wfeMin',
+        fit?.gates
+        && 'minTradesPerWindow' in fit.gates
+        && 'worstRegimePfFloor' in fit.gates
+        && 'wfeMin'             in fit.gates);
+
+      // Exact values: lockstep with DEFAULT_FITNESS in engine/spec.js.
+      // If these change, they MUST change intentionally in both places.
+      assertEq('weights.pf',  fit.weights.pf,  0.5);
+      assertEq('weights.dd',  fit.weights.dd,  0.3);
+      assertEq('weights.ret', fit.weights.ret, 0.2);
+      assertEq('caps.pf',     fit.caps.pf,     4.0);
+      assertEq('caps.ret',    fit.caps.ret,    2.0);
+      assertEq('gates.minTradesPerWindow', fit.gates.minTradesPerWindow, 30);
+      assertEq('gates.worstRegimePfFloor', fit.gates.worstRegimePfFloor, 1.0);
+      assertEq('gates.wfeMin',             fit.gates.wfeMin,             0.5);
+
+      // Weights sum to 1.0 — engine/spec.js raises a validator warning
+      // otherwise. This is an invariant we want to enforce on the
+      // shipped defaults so Reset-to-recommended never hands the user
+      // a non-normalized starting point.
+      const sum = fit.weights.pf + fit.weights.dd + fit.weights.ret;
+      assertTrue('weights sum to ~1.0',
+        Math.abs(sum - 1) <= 0.001, `sum=${sum}`);
+
+      const wf = r.body.walkForward;
+      assertEq('walkForward.nWindows', wf?.nWindows, 5);
+      assertEq('walkForward.scheme',   wf?.scheme,   'anchored');
+
+      // Immutability: hitting the endpoint twice must return identical
+      // shapes — the handler deep-spreads so downstream mutation of the
+      // first response can't poison the second.
+      const r2 = await get(app.port, '/api/defaults');
+      assertEq('second call returns same shape',
+        JSON.stringify(r2.body), JSON.stringify(r.body));
     }
 
     // ── 3. POST /api/specs ─────────────────────────────────────

@@ -256,6 +256,84 @@
           <div id="spec-sizing-req" style="font-size:12px;color:#8b949e;margin-left:92px;min-height:14px;margin-top:4px"></div>
           <div id="spec-sizing-params" class="spec-params" style="margin:6px 0 0 92px"></div>
         </div>
+
+        <!-- Fitness: scoring config (Phase 4.4). Weights are sliders
+             that should sum ~1.0; caps clip per-window PF/return; gates
+             veto a genome entirely if violated. All initial values come
+             from GET /api/defaults so the "recommended" chip always
+             matches what engine/spec.js would fill in if omitted. -->
+        <div class="card" id="spec-fitness-card">
+          <h2 style="display:flex;align-items:center;justify-content:space-between">
+            Fitness
+            <button type="button" id="spec-fitness-reset" style="font-size:12px;font-weight:400;padding:4px 10px">
+              Reset to recommended
+            </button>
+          </h2>
+          <p style="font-size:12px;color:#8b949e;margin:0 0 10px 0;line-height:1.5">
+            Weights score a genome; caps clip outlier metrics; gates are
+            hard vetoes. Values shown in grey are the recommended defaults
+            from <code style="background:#0d1117;padding:1px 5px;border-radius:3px">engine/spec.js</code>.
+          </p>
+
+          <!-- Weights: three sliders 0..1 in 0.05 steps. Live sum
+               indicator turns amber if the sum drifts far from 1.0. -->
+          <h3 style="font-size:13px;color:#c9d1d9;margin:14px 0 6px 0">Weights</h3>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px">PF (profit factor)</label>
+            <input type="range" id="spec-fitness-w-pf" min="0" max="1" step="0.05" value="0.5" style="flex:1;min-width:120px">
+            <span id="spec-fitness-w-pf-val" style="font-size:13px;color:#e6edf3;width:36px;text-align:right">0.50</span>
+            <span id="spec-fitness-w-pf-def" style="font-size:11px;color:#6e7681;width:80px;text-align:right"></span>
+          </div>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px">DD (drawdown)</label>
+            <input type="range" id="spec-fitness-w-dd" min="0" max="1" step="0.05" value="0.3" style="flex:1;min-width:120px">
+            <span id="spec-fitness-w-dd-val" style="font-size:13px;color:#e6edf3;width:36px;text-align:right">0.30</span>
+            <span id="spec-fitness-w-dd-def" style="font-size:11px;color:#6e7681;width:80px;text-align:right"></span>
+          </div>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px">ret (return)</label>
+            <input type="range" id="spec-fitness-w-ret" min="0" max="1" step="0.05" value="0.2" style="flex:1;min-width:120px">
+            <span id="spec-fitness-w-ret-val" style="font-size:13px;color:#e6edf3;width:36px;text-align:right">0.20</span>
+            <span id="spec-fitness-w-ret-def" style="font-size:11px;color:#6e7681;width:80px;text-align:right"></span>
+          </div>
+          <div id="spec-fitness-w-sum" style="font-size:12px;color:#6e7681;margin-left:140px;margin-top:4px">
+            Sum: 1.00
+          </div>
+
+          <!-- Caps. Keep simple number inputs — these are rarely tuned
+               but need to be visible so the user can trust what's being
+               used. -->
+          <h3 style="font-size:13px;color:#c9d1d9;margin:14px 0 6px 0">Caps</h3>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px">PF cap</label>
+            <input type="number" id="spec-fitness-cap-pf" min="0" step="0.5" value="4" style="width:90px">
+            <span id="spec-fitness-cap-pf-def" style="font-size:11px;color:#6e7681;margin-left:8px"></span>
+          </div>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px">ret cap</label>
+            <input type="number" id="spec-fitness-cap-ret" min="0" step="0.25" value="2" style="width:90px">
+            <span id="spec-fitness-cap-ret-def" style="font-size:11px;color:#6e7681;margin-left:8px"></span>
+          </div>
+
+          <!-- Gates. Integer min-trades, number floors. Each gate is a
+               hard veto so a genome that violates any one goes to 0. -->
+          <h3 style="font-size:13px;color:#c9d1d9;margin:14px 0 6px 0">Gates</h3>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px">Min trades / window</label>
+            <input type="number" id="spec-fitness-gate-mintrades" min="0" step="1" value="30" style="width:90px">
+            <span id="spec-fitness-gate-mintrades-def" style="font-size:11px;color:#6e7681;margin-left:8px"></span>
+          </div>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px">Worst regime PF floor</label>
+            <input type="number" id="spec-fitness-gate-regimepf" min="0" step="0.1" value="1" style="width:90px">
+            <span id="spec-fitness-gate-regimepf-def" style="font-size:11px;color:#6e7681;margin-left:8px"></span>
+          </div>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px">WFE min</label>
+            <input type="number" id="spec-fitness-gate-wfemin" min="0" max="1" step="0.05" value="0.5" style="width:90px">
+            <span id="spec-fitness-gate-wfemin-def" style="font-size:11px;color:#6e7681;margin-left:8px"></span>
+          </div>
+        </div>
       </div>
 
       <!-- Right column: live JSON preview + copy button -->

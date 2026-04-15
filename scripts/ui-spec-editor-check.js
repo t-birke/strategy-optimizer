@@ -25,10 +25,13 @@
  *      by spec-api-check; repeated as a smoke check so a 4.3c-only run
  *      catches an accidental contract break.
  *
- * Phase 4.3d (per-param narrowing) and 4.3e (save-to-disk) are layered
- * on top: we assert the Save button + status line exist in the DOM and
- * that saveSpec() posts to /api/specs with the overwrite fallback wired.
- * End-to-end POST behavior lives in spec-api-check.
+ * Phase 4.3d (per-param narrowing), 4.3e (save-to-disk), and 4.4
+ * (fitness config panel) are layered on top: we assert the Save button
+ * + status line exist in the DOM, saveSpec() posts to /api/specs with
+ * the overwrite fallback wired, the Fitness card renders every
+ * weight/cap/gate control + Reset button, and the editor fetches the
+ * recommended values from /api/defaults at init. End-to-end POST and
+ * /api/defaults contract tests live in spec-api-check.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -156,6 +159,43 @@ async function main() {
     assertTrue('spec-save button present', contains(slice, 'id="spec-save"'));
     assertTrue('spec-save-status container present',
       contains(slice, 'id="spec-save-status"'));
+
+    // Fitness config panel (Phase 4.4): card + three weight sliders (each
+    // with a value label + recommended-default chip), two cap inputs, three
+    // gate inputs, sum indicator, and Reset button. If any of these are
+    // missing, the user can't see OR edit the fitness config — both of
+    // which are regressions we want to catch before the page ships.
+    assertTrue('spec-fitness-card present',   contains(slice, 'id="spec-fitness-card"'));
+    assertTrue('spec-fitness-reset button present',
+      contains(slice, 'id="spec-fitness-reset"'));
+
+    // Weight sliders: three range inputs, each with -val and -def siblings.
+    for (const w of ['pf', 'dd', 'ret']) {
+      assertTrue(`spec-fitness-w-${w} slider present`,
+        contains(slice, `id="spec-fitness-w-${w}"`));
+      assertTrue(`spec-fitness-w-${w}-val label present`,
+        contains(slice, `id="spec-fitness-w-${w}-val"`));
+      assertTrue(`spec-fitness-w-${w}-def recommended-chip present`,
+        contains(slice, `id="spec-fitness-w-${w}-def"`));
+    }
+    assertTrue('spec-fitness-w-sum indicator present',
+      contains(slice, 'id="spec-fitness-w-sum"'));
+
+    // Caps.
+    for (const c of ['pf', 'ret']) {
+      assertTrue(`spec-fitness-cap-${c} input present`,
+        contains(slice, `id="spec-fitness-cap-${c}"`));
+      assertTrue(`spec-fitness-cap-${c}-def chip present`,
+        contains(slice, `id="spec-fitness-cap-${c}-def"`));
+    }
+
+    // Gates.
+    for (const g of ['mintrades', 'regimepf', 'wfemin']) {
+      assertTrue(`spec-fitness-gate-${g} input present`,
+        contains(slice, `id="spec-fitness-gate-${g}"`));
+      assertTrue(`spec-fitness-gate-${g}-def chip present`,
+        contains(slice, `id="spec-fitness-gate-${g}-def"`));
+    }
   }
 
   // ── 2. JS wiring in app.js ───────────────────────────────────
@@ -303,6 +343,51 @@ async function main() {
       /spec-save-status/.test(js));
     assertTrue('spec-save button click triggers saveSpec',
       /spec-save[\s\S]{0,200}saveSpec\b/.test(js));
+
+    // 2j. Fitness config panel wiring (Phase 4.4). The editor must
+    // fetch recommended defaults from /api/defaults at init, expose
+    // readFitnessFromUi so buildSpecFromUi has a real source for the
+    // fitness shape (no more hardcoded defaults), and wire the Reset
+    // button to re-apply the cached defaults.
+    assertTrue('defines loadFitnessDefaults',
+      /(async\s+function|function)\s+loadFitnessDefaults\b/.test(js));
+    assertTrue('loadFitnessDefaults fetches /api/defaults',
+      /loadFitnessDefaults[\s\S]{0,600}fetch\(\s*['"]\/api\/defaults['"]\)/.test(js));
+    assertTrue('init calls loadFitnessDefaults',
+      /(^|\n)\s*loadFitnessDefaults\(\)/.test(js));
+
+    assertTrue('defines readFitnessFromUi',
+      /function\s+readFitnessFromUi\b/.test(js));
+    assertTrue('buildSpecFromUi uses readFitnessFromUi',
+      /buildSpecFromUi[\s\S]{0,4000}readFitnessFromUi\(\)/.test(js));
+
+    // buildSpecFromUi must NOT hardcode the old fitness literal any more.
+    // If it regresses back to a literal object, the Reset/Edit plumbing
+    // is bypassed silently — catch that here.
+    assertTrue('buildSpecFromUi does NOT hardcode weights literal',
+      !/buildSpecFromUi[\s\S]{0,4000}weights:\s*\{\s*pf:\s*0\.5,\s*dd:\s*0\.3,\s*ret:\s*0\.2/.test(js));
+
+    assertTrue('defines applyFitnessDefaultsToUi',
+      /function\s+applyFitnessDefaultsToUi\b/.test(js));
+    assertTrue('defines updateWeightLabels',
+      /function\s+updateWeightLabels\b/.test(js));
+
+    // Every fitness input id is in the preview-render listener array.
+    for (const id of [
+      'spec-fitness-w-pf', 'spec-fitness-w-dd', 'spec-fitness-w-ret',
+      'spec-fitness-cap-pf', 'spec-fitness-cap-ret',
+      'spec-fitness-gate-mintrades', 'spec-fitness-gate-regimepf', 'spec-fitness-gate-wfemin',
+    ]) {
+      assertTrue(`'${id}' is wired to renderSpecPreview`,
+        new RegExp(`'${id}'`).test(js));
+    }
+
+    // Reset button wires to applyFitnessDefaultsToUi.
+    assertTrue('spec-fitness-reset triggers applyFitnessDefaultsToUi',
+      /spec-fitness-reset[\s\S]{0,300}applyFitnessDefaultsToUi/.test(js));
+    // Weight sliders update the live value labels on input.
+    assertTrue('weight sliders update label on input',
+      /spec-fitness-w-(pf|dd|ret)[\s\S]{0,300}updateWeightLabels/.test(js));
   }
 
   // ── 3. Server contract: GET /api/blocks shape matches editor reads ──

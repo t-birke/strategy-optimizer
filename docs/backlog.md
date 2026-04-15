@@ -773,12 +773,70 @@ instead of hand-editing JSON. Minimum-viable UI for spec-mode runs.
   `body.spec`; change handler renders descriptions via `specsByFilename`.
 - Contract: `GET /api/specs` still returns the shape the picker reads.
 
-### 4.4 UI — fitness config panel
-- Weight sliders for PF / DD / return.
-- Cap inputs.
-- Gate inputs (min trades, worst-regime PF floor, WFE min).
-- "Reset to recommended" button (loads DEFAULT_FITNESS from spec.js).
-- Show recommended defaults alongside current values.
+### 4.4 UI — fitness config panel — ✅ done
+The spec editor's hardcoded fitness config is now a live UI panel.
+Weight sliders, cap inputs, and gate inputs all flow through
+`readFitnessFromUi()` into `buildSpecFromUi()`, and every "recommended"
+chip pulls its value from `GET /api/defaults` — the source of truth is
+`DEFAULT_FITNESS` in `engine/spec.js`, not a hand-copied mirror.
+
+- **New endpoint** (`api/routes.js`): `GET /api/defaults` returns
+  `{ fitness: {weights, caps, gates}, walkForward: {nWindows, scheme} }`
+  via deep-spread so downstream mutation of the frozen module constants
+  is impossible. Pure read, no I/O, safe to call on every modal open.
+  The walkForward shape is included even though 4.4 only puts UI on
+  fitness — future consumers can rely on one endpoint for "recommended
+  defaults" instead of mirroring them.
+- **UI card** (`ui/index.html`): new Fitness card sits between Sizing
+  and the JSON preview on the left column.
+  - **Weights**: three range sliders (PF / DD / ret) 0..1 step 0.05,
+    each with a live value label, a muted "recommended: X" chip, and a
+    shared sum indicator that turns amber if the three weights drift
+    more than ±0.01 from 1.0 (same tolerance `engine/spec.js`
+    enforces).
+  - **Caps**: PF cap + return cap as number inputs.
+  - **Gates**: min trades / window (integer), worst-regime PF floor,
+    WFE min — with recommended chips next to each.
+  - **Reset to recommended** button in the card header re-applies the
+    cached defaults + triggers a preview rebuild.
+- **Wiring** (`ui/app.js`):
+  - `loadFitnessDefaults()` fetches `/api/defaults` at init, caches
+    into `fitnessDefaults` (module-level), and calls
+    `applyFitnessDefaultsToUi()` which populates inputs + chips. On
+    fetch failure it logs and falls back to a hardcoded mirror so the
+    editor never hangs waiting for the server.
+  - `readFitnessFromUi()` reads every input into the spec's `fitness`
+    shape, rounding weights to 2 decimals (sliders emit floats that
+    would otherwise land as `0.30000000000000004` in the JSON).
+  - `updateWeightLabels()` updates the slider value labels + sum
+    indicator on every `input`. Listener wired separately from the
+    preview-rebuild loop.
+  - `buildSpecFromUi()` now calls `readFitnessFromUi()` instead of a
+    hardcoded literal — this is the functional cutover.
+
+**Verification** — `scripts/spec-api-check.js` (467 checks ✓):
+- `/api/defaults` returns the exact shape and values of
+  `DEFAULT_FITNESS` + `DEFAULT_WALK_FORWARD` from `engine/spec.js`
+  (weights sum to 1.0, caps positive, gates in `[0,1]` for wfeMin).
+- Two back-to-back calls return identical shape (deep-spread
+  immutability check).
+
+**Verification** — `scripts/ui-spec-editor-check.js` (306 checks ✓):
+- DOM: Fitness card + every input id + recommended chip + Reset button
+  present inside `#page-specs`.
+- JS: `loadFitnessDefaults` / `readFitnessFromUi` /
+  `applyFitnessDefaultsToUi` / `updateWeightLabels` defined;
+  `buildSpecFromUi` uses `readFitnessFromUi` and does NOT hardcode the
+  old `weights: {pf:0.5, dd:0.3, ret:0.2}` literal (regression guard);
+  every fitness input is wired to `renderSpecPreview`; Reset button
+  triggers `applyFitnessDefaultsToUi`; weight sliders update the live
+  labels on `input`.
+
+Still parked: walk-forward config (`nWindows`, `scheme`) is surfaced
+by `/api/defaults` but the editor keeps the hardcoded `{ nWindows: 5,
+scheme: 'anchored' }` for now — a follow-up chunk can wire a small
+control row onto the Fitness card once WF tuning becomes a real use
+case.
 
 ### 4.5 UI — results view
 - Per-run: metrics dashboard, trade list, equity curve, **WF report**

@@ -2489,16 +2489,157 @@ function buildSpecFromUi() {
     filters,
     exits,
     sizing,
-    // 4.4 owns fitness weights/caps/gates. Emit the current runner
-    // defaults so the preview is a runnable spec.
     constraints: [],
-    fitness: {
-      weights: { pf: 0.5, dd: 0.3, ret: 0.2 },
-      caps:    { pf: 4.0, ret: 2.0 },
-      gates:   { minTradesPerWindow: 30, worstRegimePfFloor: 1.0, wfeMin: 0.5 },
-    },
+    // Phase 4.4: fitness config is now UI-driven. Sliders/inputs emit
+    // the same shape engine/spec.js normalizes; walkForward stays
+    // hardcoded at the runner defaults (not yet exposed in the editor).
+    fitness: readFitnessFromUi(),
     walkForward: { nWindows: 5, scheme: 'anchored' },
   };
+}
+
+/**
+ * Read the current values from the Fitness card inputs into the spec's
+ * `fitness` shape. Numbers are parsed defensively — if an input is blank
+ * or non-numeric we fall back to the last known default (set at init
+ * from GET /api/defaults), so the preview never emits `NaN` which would
+ * poison the server-side validator.
+ *
+ * The sliders emit step=0.05 floats; we round to 2 decimals so the JSON
+ * doesn't drift into noise like `0.30000000000000004`.
+ */
+function readFitnessFromUi() {
+  const numOr = (id, fallback) => {
+    const el = document.getElementById(id);
+    const n = parseFloat(el?.value);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const intOr = (id, fallback) => {
+    const el = document.getElementById(id);
+    const n = parseInt(el?.value, 10);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const round2 = (n) => Math.round(n * 100) / 100;
+  const d = fitnessDefaults; // module-level cache, see loadFitnessDefaults
+  return {
+    weights: {
+      pf:  round2(numOr('spec-fitness-w-pf',  d.weights.pf)),
+      dd:  round2(numOr('spec-fitness-w-dd',  d.weights.dd)),
+      ret: round2(numOr('spec-fitness-w-ret', d.weights.ret)),
+    },
+    caps: {
+      pf:  numOr('spec-fitness-cap-pf',  d.caps.pf),
+      ret: numOr('spec-fitness-cap-ret', d.caps.ret),
+    },
+    gates: {
+      minTradesPerWindow: intOr('spec-fitness-gate-mintrades', d.gates.minTradesPerWindow),
+      worstRegimePfFloor: numOr('spec-fitness-gate-regimepf',  d.gates.worstRegimePfFloor),
+      wfeMin:             numOr('spec-fitness-gate-wfemin',    d.gates.wfeMin),
+    },
+  };
+}
+
+/**
+ * Module-level cache of the defaults returned by GET /api/defaults. Used
+ * both as fallback (readFitnessFromUi) and by the Reset button. Seeded
+ * with the same values engine/spec.js defines so the editor is functional
+ * even if the fetch is slow (or fails outright) — the endpoint is the
+ * authoritative value, this is just a safety net.
+ */
+let fitnessDefaults = {
+  weights: { pf: 0.5, dd: 0.3, ret: 0.2 },
+  caps:    { pf: 4.0, ret: 2.0 },
+  gates:   { minTradesPerWindow: 30, worstRegimePfFloor: 1.0, wfeMin: 0.5 },
+};
+
+/**
+ * Fetch the server-side defaults once at init and populate the Fitness
+ * card with them. The initial DOM values already mirror what the server
+ * returns, so in the happy path nothing visibly changes — the point is
+ * to route "recommended values" through a single source of truth so a
+ * drift in engine/spec.js surfaces in the UI immediately.
+ *
+ * Graceful degradation: on fetch failure, keep the hardcoded fallback
+ * and log. The user can still author and save specs; only the
+ * "recommended" chip will be stale.
+ */
+async function loadFitnessDefaults() {
+  try {
+    const r = await fetch('/api/defaults');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    if (data?.fitness) fitnessDefaults = data.fitness;
+  } catch (err) {
+    console.warn('[specs] loadFitnessDefaults failed, using fallback:', err);
+  }
+  applyFitnessDefaultsToUi(); // initial populate + recommended-value chips
+  renderSpecPreview();        // reflect post-fetch values in the preview
+}
+
+/**
+ * Write a fitness config object into the form inputs. Also refreshes the
+ * live value labels for the weight sliders and the weights-sum indicator.
+ */
+function setFitnessInputs(fit) {
+  const put = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+  put('spec-fitness-w-pf',  fit.weights.pf);
+  put('spec-fitness-w-dd',  fit.weights.dd);
+  put('spec-fitness-w-ret', fit.weights.ret);
+  put('spec-fitness-cap-pf',  fit.caps.pf);
+  put('spec-fitness-cap-ret', fit.caps.ret);
+  put('spec-fitness-gate-mintrades', fit.gates.minTradesPerWindow);
+  put('spec-fitness-gate-regimepf',  fit.gates.worstRegimePfFloor);
+  put('spec-fitness-gate-wfemin',    fit.gates.wfeMin);
+  updateWeightLabels();
+}
+
+/**
+ * Populate the grey "recommended: X" chips next to each input AND seed
+ * the inputs themselves with the recommended values. Called once after
+ * /api/defaults resolves, and each time the user clicks Reset.
+ */
+function applyFitnessDefaultsToUi() {
+  const d = fitnessDefaults;
+  const chip = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = `recommended: ${val}`;
+  };
+  chip('spec-fitness-w-pf-def',          d.weights.pf.toFixed(2));
+  chip('spec-fitness-w-dd-def',          d.weights.dd.toFixed(2));
+  chip('spec-fitness-w-ret-def',         d.weights.ret.toFixed(2));
+  chip('spec-fitness-cap-pf-def',        d.caps.pf);
+  chip('spec-fitness-cap-ret-def',       d.caps.ret);
+  chip('spec-fitness-gate-mintrades-def', d.gates.minTradesPerWindow);
+  chip('spec-fitness-gate-regimepf-def',  d.gates.worstRegimePfFloor);
+  chip('spec-fitness-gate-wfemin-def',    d.gates.wfeMin);
+  setFitnessInputs(d);
+}
+
+/**
+ * Update the live value labels that sit next to each weight slider and
+ * the sum indicator underneath. Slider `value` is a string in the DOM;
+ * parseFloat + toFixed normalizes display to 2 decimals.
+ *
+ * Weights should sum to ~1.0. engine/spec.js raises a validation warning
+ * if the sum drifts more than 0.01 away — we mirror that tolerance here
+ * by colouring the sum amber outside the window. (Soft hint only; the
+ * authoritative gate is still server-side.)
+ */
+function updateWeightLabels() {
+  const read = (id) => parseFloat(document.getElementById(id)?.value) || 0;
+  const pf  = read('spec-fitness-w-pf');
+  const dd  = read('spec-fitness-w-dd');
+  const ret = read('spec-fitness-w-ret');
+  const put = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v.toFixed(2); };
+  put('spec-fitness-w-pf-val',  pf);
+  put('spec-fitness-w-dd-val',  dd);
+  put('spec-fitness-w-ret-val', ret);
+  const sumEl = document.getElementById('spec-fitness-w-sum');
+  if (sumEl) {
+    const sum = pf + dd + ret;
+    sumEl.textContent = `Sum: ${sum.toFixed(2)}`;
+    sumEl.style.color = Math.abs(sum - 1) <= 0.01 ? '#6e7681' : '#d29922';
+  }
 }
 
 // Light validation — surfaces obvious problems (missing name, no entry
@@ -2559,11 +2700,31 @@ function renderSpecPreview() {
  'spec-entries-mode', 'spec-entries-threshold-min', 'spec-entries-threshold-max',
  'spec-filters-mode',
  'spec-exit-hardstop', 'spec-exit-target', 'spec-exit-trail',
- 'spec-sizing'].forEach(id => {
+ 'spec-sizing',
+ // Phase 4.4: fitness inputs also rebuild the preview live.
+ 'spec-fitness-w-pf',  'spec-fitness-w-dd',  'spec-fitness-w-ret',
+ 'spec-fitness-cap-pf', 'spec-fitness-cap-ret',
+ 'spec-fitness-gate-mintrades', 'spec-fitness-gate-regimepf', 'spec-fitness-gate-wfemin',
+].forEach(id => {
   const el = document.getElementById(id);
   if (!el) return;
   el.addEventListener('input',  renderSpecPreview);
   el.addEventListener('change', renderSpecPreview);
+});
+
+// Weight sliders: on every tick, update the inline value label AND the
+// sum indicator. The listener loop above already fires renderSpecPreview,
+// so this second listener is purely for the live decoration.
+for (const id of ['spec-fitness-w-pf', 'spec-fitness-w-dd', 'spec-fitness-w-ret']) {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('input', updateWeightLabels);
+}
+
+// Reset to recommended: re-apply the cached defaults from /api/defaults,
+// re-render the preview, and nudge the label updater so sliders re-paint.
+document.getElementById('spec-fitness-reset').addEventListener('click', () => {
+  applyFitnessDefaultsToUi();
+  renderSpecPreview();
 });
 // Sizing change also updates the requirements hint.
 document.getElementById('spec-sizing').addEventListener('change', updateSizingReqHint);
@@ -2686,6 +2847,7 @@ loadSymbols();
 loadRuns();
 loadQueue();
 loadBlocksForEditor();
+loadFitnessDefaults();
 
 // Refresh periodically
 setInterval(loadSymbols, 30000);
