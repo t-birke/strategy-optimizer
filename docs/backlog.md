@@ -843,6 +843,26 @@ case.
   (per-window PFs and WFE), regime breakdown table.
 - Compare-runs view: side-by-side WF reports for multiple specs.
 
+**✅ 4.5a — surface spec-mode JSON fields on run-detail page — done.**
+- `GET /api/runs/:id` now parses `wf_report_json`, `fitness_breakdown_json`,
+  and `regime_breakdown_json` alongside the legacy JSON columns — returning
+  live objects instead of strings so the UI doesn't need local `JSON.parse`.
+- Run-detail page (`ui/index.html`) got three spec-mode-only cards between
+  Strategy Parameters and the Recalculate panel: Fitness Breakdown, Walk-
+  Forward Report, and Regime Breakdown. Each card starts `display:none`
+  and every h3 carries a `title=` tooltip (same convention as 4.4).
+- `ui/app.js` renderers (`renderFitnessBreakdown`, `renderWalkForwardReport`,
+  `renderRegimeBreakdown`) are invoked from `openRunDetail` after the fetch.
+  Each hides its card on null input so legacy runs render unchanged.
+  Formatters (`fmtPf`/`fmtPct`/`fmtWfe`) handle `Infinity` (PF with no
+  losing trades) and `NaN` (WFE when mean IS PF = 0). Low-confidence
+  regime rows use the same `trades < 5` heuristic as fitness.js.
+- Gate: `scripts/ui-run-detail-check.js` covers DOM markers, JS wiring,
+  and the server contract end-to-end via an in-memory DuckDB INSERT
+  (points at a temp DB via `OPTIMIZER_DB_PATH` so it coexists with the
+  long-running dev server).
+- 4.5b (compare-runs side-by-side) deferred.
+
 ### 4.6 Pine export
 - "Generate Pine indicator" button per winning run.
 - Runs codegen over active (entry + filter + regime) blocks with the

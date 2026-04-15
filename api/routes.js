@@ -208,8 +208,15 @@ router.get('/api/runs/:id', async (req, res) => {
     if (runs.length === 0) return res.status(404).json({ error: 'Run not found' });
 
     const run = runs[0];
-    // Parse JSON fields
-    for (const field of ['config', 'best_gene', 'best_metrics', 'top_results', 'generation_log']) {
+    // Parse JSON fields. We include the three spec-mode JSON columns
+    // (wf_report_json, fitness_breakdown_json, regime_breakdown_json)
+    // added in Phase 4.1 — they used to come back as strings and forced
+    // every consumer to JSON.parse locally. Phase 4.5a normalizes the
+    // response so the run-detail UI can treat them as live objects.
+    for (const field of [
+      'config', 'best_gene', 'best_metrics', 'top_results', 'generation_log',
+      'wf_report_json', 'fitness_breakdown_json', 'regime_breakdown_json',
+    ]) {
       if (run[field] && typeof run[field] === 'string') {
         try { run[field] = JSON.parse(run[field]); } catch {}
       }

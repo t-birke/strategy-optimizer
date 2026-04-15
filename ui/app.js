@@ -1392,6 +1392,10 @@ window.openRunDetail = async (id) => {
   document.getElementById('detail-trades-card').style.display = 'none';
   document.getElementById('detail-charts-card').style.display = 'none';
   document.getElementById('detail-periodic-card').style.display = 'none';
+  // Phase 4.5a — hide spec-mode-only cards until we know the run has data.
+  document.getElementById('detail-fitness-card').style.display = 'none';
+  document.getElementById('detail-wf-card').style.display = 'none';
+  document.getElementById('detail-regime-card').style.display = 'none';
   document.getElementById('btn-recalc').disabled = false;
 
   try {
@@ -1405,6 +1409,13 @@ window.openRunDetail = async (id) => {
 
     document.getElementById('detail-title').textContent = `${run.symbol} ${tfLabel(run.timeframe)}`;
     document.getElementById('detail-run-id').textContent = `#${id}`;
+
+    // Phase 4.5a: render the three spec-mode panels. Each renderer is
+    // a no-op (hides its card) when the underlying JSON is absent, so
+    // legacy GA runs simply skip these sections.
+    renderFitnessBreakdown(run.fitness_breakdown_json);
+    renderWalkForwardReport(run.wf_report_json);
+    renderRegimeBreakdown(run.regime_breakdown_json, run.fitness_breakdown_json);
 
     // Render parameter cards
     if (gene) {
@@ -1439,6 +1450,248 @@ window.closeRunDetail = () => {
   document.querySelector('[data-page="optimizer"]').classList.add('active');
   document.getElementById('nav-run-detail').style.display = 'none';
 };
+
+// ─── Phase 4.5a: spec-mode detail-page renderers ────────────
+//
+// Three helpers that turn the persisted WF / regime / fitness JSON
+// into per-card DOM. Each is a no-op (hides its card) when the
+// underlying field is null or shape-invalid, so legacy GA runs keep
+// the pre-4.5 detail page and spec-mode runs gain three new cards.
+//
+// All formatters handle `Infinity` (PF with zero losing trades) and
+// `NaN` (WFE when divisor is zero) since the underlying numeric
+// sources can emit both — openRunDetail shouldn't crash on a well-
+// formed but mathematically degenerate row.
+
+/**
+ * Format a profit-factor value. PF comes in as a non-negative number
+ * or Infinity (no losing trades). We display ∞ for Infinity so the
+ * user knows the strategy had no losses rather than seeing a
+ * nonsense number like "1.79e+308".
+ */
+function fmtPf(pf) {
+  if (pf == null || Number.isNaN(pf)) return '—';
+  if (!Number.isFinite(pf)) return '∞';
+  return pf.toFixed(2);
+}
+
+/** Format a signed percentage (WF netPct is a plain number like 12.5 = 12.5%). */
+function fmtPct(v, digits = 2) {
+  if (v == null || Number.isNaN(v)) return '—';
+  if (!Number.isFinite(v)) return v > 0 ? '+∞%' : '−∞%';
+  const sign = v > 0 ? '+' : '';
+  return `${sign}${v.toFixed(digits)}%`;
+}
+
+/** Format a WFE value (OOS PF / IS PF). Can be NaN if IS PF is 0. */
+function fmtWfe(wfe) {
+  if (wfe == null || Number.isNaN(wfe)) return 'n/a';
+  if (!Number.isFinite(wfe)) return '∞';
+  return wfe.toFixed(2);
+}
+
+/**
+ * Render the Fitness Breakdown card. Shows the composite score, the
+ * three normalized metric terms with their weights, which gates (if
+ * any) the gene failed, and — when the gene was eliminated — the
+ * human-readable reason.
+ *
+ * Layout: a compact chip grid for score + eliminated flag + gates,
+ * followed by a three-row mini-table for the normalized term ·
+ * weight = contribution math so the user can see where the score
+ * actually came from.
+ */
+function renderFitnessBreakdown(fit) {
+  const card = document.getElementById('detail-fitness-card');
+  const body = document.getElementById('detail-fitness-body');
+  if (!fit || typeof fit !== 'object') { card.style.display = 'none'; return; }
+
+  const score = typeof fit.score === 'number' ? fit.score : 0;
+  const eliminated = fit.eliminated === true;
+  const gatesFailed = Array.isArray(fit.gatesFailed) ? fit.gatesFailed : [];
+  const b = fit.breakdown || {};
+  const w = b.weightsN || { pf: 0, dd: 0, ret: 0 };
+
+  // Score / status / gates chips.
+  const scoreColor   = eliminated ? '#f85149' : score >= 0.5 ? '#3fb950' : '#d29922';
+  const statusLabel  = eliminated ? 'ELIMINATED' : 'PASSED';
+  const statusColor  = eliminated ? '#f85149' : '#3fb950';
+  const gatesHtml = gatesFailed.length === 0
+    ? '<span style="color:#3fb950">none</span>'
+    : gatesFailed.map(g => `<span style="background:#f8514926;color:#f85149;border-radius:4px;padding:2px 6px;font-size:11px;margin-right:4px">${g}</span>`).join('');
+
+  const chip = (label, value, color = '#e6edf3') => `
+    <div style="background:#21262d;border:1px solid #30363d;border-radius:6px;padding:10px 12px;min-width:120px">
+      <div style="font-size:11px;color:#8b949e;margin-bottom:4px">${label}</div>
+      <div style="font-size:16px;font-weight:700;color:${color};font-family:monospace">${value}</div>
+    </div>`;
+
+  // Normalized term rows: show raw norm, weight, and contribution
+  // (norm · weight) so the user can verify the composite sum = score
+  // (for non-eliminated genes).
+  const termRow = (name, norm, weight, title) => {
+    const contribution = (norm ?? 0) * (weight ?? 0);
+    return `<tr title="${title}">
+      <td style="padding:4px 8px;color:#c9d1d9">${name}</td>
+      <td style="padding:4px 8px;text-align:right;font-family:monospace">${(norm ?? 0).toFixed(3)}</td>
+      <td style="padding:4px 8px;text-align:right;font-family:monospace;color:#8b949e">× ${(weight ?? 0).toFixed(2)}</td>
+      <td style="padding:4px 8px;text-align:right;font-family:monospace;color:#e6edf3">= ${contribution.toFixed(3)}</td>
+    </tr>`;
+  };
+
+  let extras = '';
+  if (typeof b.worstRegimePf === 'number') {
+    extras += `<div style="font-size:12px;color:#8b949e;margin-top:8px">Worst regime PF: <span style="color:#e6edf3;font-family:monospace">${fmtPf(b.worstRegimePf)}</span>${b.regimeSource ? ` <span style="color:#6e7681">(${b.regimeSource})</span>` : ''}</div>`;
+  }
+  if (typeof b.wfe === 'number') {
+    extras += `<div style="font-size:12px;color:#8b949e;margin-top:4px">WFE: <span style="color:#e6edf3;font-family:monospace">${fmtWfe(b.wfe)}</span></div>`;
+  }
+  if (eliminated && typeof fit.reason === 'string' && fit.reason.length > 0) {
+    extras += `<div style="font-size:12px;color:#f85149;margin-top:10px;padding:8px 12px;background:#f8514916;border-left:3px solid #f85149;border-radius:4px">${fit.reason}</div>`;
+  }
+
+  body.innerHTML = `
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+      ${chip('Score',  score.toFixed(3), scoreColor)}
+      ${chip('Status', statusLabel,      statusColor)}
+      <div style="background:#21262d;border:1px solid #30363d;border-radius:6px;padding:10px 12px;min-width:120px">
+        <div style="font-size:11px;color:#8b949e;margin-bottom:4px">Gates failed</div>
+        <div style="font-size:13px">${gatesHtml}</div>
+      </div>
+    </div>
+    <table style="font-size:12px;border-collapse:collapse;min-width:320px">
+      <thead><tr style="color:#8b949e;border-bottom:1px solid #30363d">
+        <th style="text-align:left;padding:4px 8px">Term</th>
+        <th style="text-align:right;padding:4px 8px">Normalized</th>
+        <th style="text-align:right;padding:4px 8px">Weight</th>
+        <th style="text-align:right;padding:4px 8px">Contribution</th>
+      </tr></thead>
+      <tbody>
+        ${termRow('PF',  b.normPf,  w.pf,  'Normalized profit factor · PF weight')}
+        ${termRow('DD',  b.normDd,  w.dd,  'Normalized drawdown term · DD weight')}
+        ${termRow('ret', b.normRet, w.ret, 'Normalized return · ret weight')}
+      </tbody>
+    </table>
+    ${extras}
+  `;
+  card.style.display = '';
+}
+
+/**
+ * Render the Walk-Forward Report card. Top summary row with aggregate
+ * WFE + mean IS/OOS PF + valid-window count; main body is the
+ * per-window table.
+ *
+ * The WFE chip is coloured: green ≥ 0.5 (OOS keeps at least 50% of
+ * IS performance), amber 0.3–0.5, red below 0.3. This matches the
+ * semantic meaning of the default `wfeMin=0.5` gate.
+ */
+function renderWalkForwardReport(wf) {
+  const card = document.getElementById('detail-wf-card');
+  if (!wf || typeof wf !== 'object' || !Array.isArray(wf.windows)) {
+    card.style.display = 'none'; return;
+  }
+
+  const wfe = wf.wfe;
+  const wfeColor =
+    !Number.isFinite(wfe) ? '#8b949e' :
+    wfe >= 0.5 ? '#3fb950' :
+    wfe >= 0.3 ? '#d29922' :
+    '#f85149';
+
+  const chip = (label, value, color = '#e6edf3', title = '') => `
+    <div style="background:#21262d;border:1px solid #30363d;border-radius:6px;padding:10px 12px;min-width:110px" ${title ? `title="${title}"` : ''}>
+      <div style="font-size:11px;color:#8b949e;margin-bottom:4px">${label}</div>
+      <div style="font-size:16px;font-weight:700;color:${color};font-family:monospace">${value}</div>
+    </div>`;
+
+  document.getElementById('detail-wf-summary').innerHTML = `
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      ${chip('Scheme',       wf.scheme ?? '—', '#e6edf3',
+        'anchored = expanding in-sample window; rolling = fixed-width in-sample window')}
+      ${chip('Windows',      `${wf.validWindows ?? 0} / ${wf.nWindows ?? wf.windows.length}`, '#e6edf3',
+        'valid windows / total windows (valid = both IS and OOS have trades)')}
+      ${chip('WFE',          fmtWfe(wfe), wfeColor,
+        'Walk-Forward Efficiency = mean(OOS PF) / mean(IS PF). Higher = more robust OOS.')}
+      ${chip('Mean IS PF',   fmtPf(wf.meanIsPf),  '#e6edf3')}
+      ${chip('Mean OOS PF',  fmtPf(wf.meanOosPf), '#e6edf3')}
+      ${chip('Mean IS ret',  fmtPct(wf.meanIsNetPct),  '#e6edf3')}
+      ${chip('Mean OOS ret', fmtPct(wf.meanOosNetPct), '#e6edf3')}
+    </div>`;
+
+  // Per-window rows. Coloured cells for OOS PF (red < 1.0) make
+  // underperforming windows jump out without the user reading every
+  // value.
+  const tbody = document.getElementById('detail-wf-tbody');
+  tbody.innerHTML = wf.windows.map(w => {
+    const oosColor = !Number.isFinite(w.oosPf) ? '#e6edf3'
+      : w.oosPf >= 1.2 ? '#3fb950'
+      : w.oosPf >= 1.0 ? '#e6edf3'
+      : '#f85149';
+    const oosNetColor = (w.oosNetPct ?? 0) >= 0 ? '#3fb950' : '#f85149';
+    return `<tr style="border-bottom:1px solid #21262d">
+      <td style="padding:6px 8px;color:#c9d1d9">#${w.index}</td>
+      <td style="padding:6px 8px;text-align:right;font-family:monospace">${w.isTrades}</td>
+      <td style="padding:6px 8px;text-align:right;font-family:monospace">${fmtPf(w.isPf)}</td>
+      <td style="padding:6px 8px;text-align:right;font-family:monospace;color:${(w.isNetPct ?? 0) >= 0 ? '#3fb950' : '#f85149'}">${fmtPct(w.isNetPct)}</td>
+      <td style="padding:6px 8px;text-align:right;font-family:monospace">${w.oosTrades}</td>
+      <td style="padding:6px 8px;text-align:right;font-family:monospace;color:${oosColor}">${fmtPf(w.oosPf)}</td>
+      <td style="padding:6px 8px;text-align:right;font-family:monospace;color:${oosNetColor}">${fmtPct(w.oosNetPct)}</td>
+    </tr>`;
+  }).join('');
+
+  card.style.display = '';
+}
+
+/**
+ * Render the Regime Breakdown card. One row per regime label with
+ * trades / wins / win% / PF / net. Regimes with fewer than 5 trades
+ * are muted because `fitness.js` considers them too noisy to count
+ * toward the worst-regime gate — the UI should flag that context.
+ */
+function renderRegimeBreakdown(regimes, fit) {
+  const card = document.getElementById('detail-regime-card');
+  if (!regimes || typeof regimes !== 'object' || Array.isArray(regimes)) {
+    card.style.display = 'none'; return;
+  }
+  const entries = Object.entries(regimes);
+  if (entries.length === 0) { card.style.display = 'none'; return; }
+
+  // Source label — "full-data" means regime stats came from the raw
+  // backtest; "wf-oos-pooled" means they were aggregated across OOS
+  // windows (the real robustness check).
+  const source = fit?.breakdown?.regimeSource;
+  document.getElementById('detail-regime-source').textContent = source
+    ? `Source: ${source} — ${source === 'wf-oos-pooled' ? 'aggregated across out-of-sample windows (more robust)' : 'single full-data backtest'}`
+    : '';
+
+  // Sort: most-traded regime first. Low-trade regimes end up at the
+  // bottom where they belong — they're visible but don't dominate.
+  entries.sort(([, a], [, b]) => (b.trades ?? 0) - (a.trades ?? 0));
+
+  const tbody = document.getElementById('detail-regime-tbody');
+  tbody.innerHTML = entries.map(([label, r]) => {
+    const trades = r.trades ?? 0;
+    const lowConfidence = trades < 5;
+    const muted = lowConfidence ? 'color:#6e7681' : '';
+    const winPct = trades > 0 ? (100 * (r.wins ?? 0) / trades) : 0;
+    const pfColor = !Number.isFinite(r.pf) ? '#e6edf3'
+      : r.pf >= 1.2 ? '#3fb950'
+      : r.pf >= 1.0 ? '#e6edf3'
+      : '#f85149';
+    const netColor = (r.net ?? 0) >= 0 ? '#3fb950' : '#f85149';
+    return `<tr style="border-bottom:1px solid #21262d;${muted}" ${lowConfidence ? 'title="Fewer than 5 trades — low-confidence sample. The worst-regime gate ignores regimes below this threshold."' : ''}>
+      <td style="padding:6px 8px">${label}${lowConfidence ? ' <span style="color:#6e7681;font-size:10px">(low-n)</span>' : ''}</td>
+      <td style="padding:6px 8px;text-align:right;font-family:monospace">${trades}</td>
+      <td style="padding:6px 8px;text-align:right;font-family:monospace">${r.wins ?? 0}</td>
+      <td style="padding:6px 8px;text-align:right;font-family:monospace">${winPct.toFixed(1)}%</td>
+      <td style="padding:6px 8px;text-align:right;font-family:monospace;color:${lowConfidence ? '#6e7681' : pfColor}">${fmtPf(r.pf)}</td>
+      <td style="padding:6px 8px;text-align:right;font-family:monospace;color:${lowConfidence ? '#6e7681' : netColor}">${(r.net ?? 0).toFixed(2)}</td>
+    </tr>`;
+  }).join('');
+
+  card.style.display = '';
+}
 
 // ─── Sizing toggle (compounding vs flat) ───────────────────
 let detailSizing = 'compounding';

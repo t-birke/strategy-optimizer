@@ -391,6 +391,79 @@
       <div id="detail-params" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px"></div>
     </div>
 
+    <!-- Phase 4.5a: three spec-mode-only cards surface the persisted
+         WF / regime / fitness data that used to be computed-but-hidden.
+         All three start display:none — app.js flips them on only if
+         the run has the backing JSON (i.e. spec-mode run). Legacy GA
+         runs skip them entirely so the page looks unchanged. -->
+
+    <!-- Fitness Breakdown: why the winning gene scored what it did.
+         Surfaces the normalized PF/DD/ret terms, weights used, the
+         final composite score, and — most importantly — which gates
+         the gene passed or failed (the "why did this win?" answer). -->
+    <div class="card" id="detail-fitness-card" style="display:none;margin-bottom:16px">
+      <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em"
+          title="How the winning gene scored. Shows the three normalized metric terms (PF / DD / ret, each in [0,1]) weighted into a composite score, plus which hard-veto gates the gene passed or failed.">
+        Fitness Breakdown
+      </h3>
+      <div id="detail-fitness-body"></div>
+    </div>
+
+    <!-- Walk-Forward Report: table of per-window IS/OOS metrics plus
+         the aggregate WFE. This is the "will it generalize?" answer —
+         a high-WFE strategy earned its in-sample result honestly and
+         holds up out-of-sample. Low WFE = overfit. -->
+    <div class="card" id="detail-wf-card" style="display:none;margin-bottom:16px">
+      <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em"
+          title="Walk-forward analysis. Each window fits the strategy on an in-sample slice, then evaluates it on the next OOS slice. High WFE (OOS PF / IS PF) means the strategy generalizes; low WFE means it overfit to IS data.">
+        Walk-Forward Report
+      </h3>
+      <div id="detail-wf-summary" style="margin-bottom:12px"></div>
+      <div style="overflow-x:auto">
+        <table id="detail-wf-table" style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead>
+            <tr style="color:#8b949e;border-bottom:1px solid #30363d">
+              <th style="text-align:left;padding:6px 8px">Window</th>
+              <th style="text-align:right;padding:6px 8px" title="In-sample trade count">IS trades</th>
+              <th style="text-align:right;padding:6px 8px" title="In-sample profit factor">IS PF</th>
+              <th style="text-align:right;padding:6px 8px" title="In-sample net return %">IS net %</th>
+              <th style="text-align:right;padding:6px 8px" title="Out-of-sample trade count">OOS trades</th>
+              <th style="text-align:right;padding:6px 8px" title="Out-of-sample profit factor">OOS PF</th>
+              <th style="text-align:right;padding:6px 8px" title="Out-of-sample net return %">OOS net %</th>
+            </tr>
+          </thead>
+          <tbody id="detail-wf-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Regime Breakdown: per-regime trade counts and PF. The regime
+         gate rejects strategies that rely on one regime; this table
+         is the evidence — if a regime has PF < the worst-regime-PF
+         gate (default 1.0), the gene should be flagged. -->
+    <div class="card" id="detail-regime-card" style="display:none;margin-bottom:16px">
+      <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em"
+          title="Per-regime performance breakdown. A consistent strategy makes money across regimes; a fragile one relies on one regime being dominant. Regimes with <5 trades are flagged as low-confidence samples.">
+        Regime Breakdown
+      </h3>
+      <div id="detail-regime-source" style="font-size:12px;color:#6e7681;margin-bottom:8px"></div>
+      <div style="overflow-x:auto">
+        <table id="detail-regime-table" style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead>
+            <tr style="color:#8b949e;border-bottom:1px solid #30363d">
+              <th style="text-align:left;padding:6px 8px">Regime</th>
+              <th style="text-align:right;padding:6px 8px">Trades</th>
+              <th style="text-align:right;padding:6px 8px">Wins</th>
+              <th style="text-align:right;padding:6px 8px" title="Win rate = wins / trades">Win %</th>
+              <th style="text-align:right;padding:6px 8px" title="Profit factor = gross wins / gross losses">PF</th>
+              <th style="text-align:right;padding:6px 8px" title="Net P&L in quote currency units">Net</th>
+            </tr>
+          </thead>
+          <tbody id="detail-regime-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- Recalculate panel -->
     <div class="card" style="margin-bottom:16px">
       <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
