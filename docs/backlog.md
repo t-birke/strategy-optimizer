@@ -535,10 +535,42 @@ source.
   reads `cancelRequested` via `shouldCancel` every generation.
 
 ### 4.3 UI — spec authoring
-- Block picker per slot (regime, entries, filters, exits, sizing).
-- Per-block param narrowing form (min/max/step or pin).
-- Live spec preview (the JSON) + validation errors.
-- "Save spec" → writes `strategies/YYYYMMDD-<id>-<name>.json`.
+
+Broken into sub-chunks (each its own commit):
+- **4.3a** — Backend: `GET /api/specs` + `GET /api/blocks`.
+- **4.3b** — UI: spec picker in existing New Run modal.
+- **4.3c** — UI: new spec authoring page with block picker per slot.
+- **4.3d** — UI: per-block param narrowing form (min/max/step or pin).
+- **4.3e** — Save: `POST /api/specs` writes to `strategies/` after validation.
+
+### 4.3a Backend endpoints for the authoring UI — ✅ done
+Two read-only endpoints that feed the upcoming authoring UI. Neither
+touches the queue or DuckDB; both are safe to call any time.
+
+- **`GET /api/specs`** — enumerates `strategies/*.json`. Returns
+  `{ specs: [{ filename, name, description, sizeBytes, mtime }], malformed: [{ filename, error }] }`.
+  Files that fail to parse or lack a top-level `name` get reported in
+  `malformed[]` so the picker can surface a warning without hiding the
+  file. **Does not run `validateSpec()`** — that's expensive (loads the
+  block library to check references) and the picker only needs shape-
+  level trust. Full validation still happens on `POST /api/runs`.
+- **`GET /api/blocks`** — dumps the in-memory block registry via
+  `registry.ensureLoaded()`. Each entry: `{ id, version, kind, direction, exitSlot, sizingRequirements, params }`.
+  `params[]` comes from `block.declaredParams()` so the UI knows each
+  param's `type` + `min`/`max`/`step` bounds for the narrowing form.
+  `direction` null on regime/sizing; `exitSlot` non-null only on exit
+  blocks; `sizingRequirements` (e.g. `['stopDistance']`) only on sizing
+  blocks that declare it. Sorted by (kind, id, version) so clients can
+  diff responses.
+
+**Verification** — `scripts/spec-api-check.js` (387 checks ✓):
+- Boots a bare Express app with the real router.
+- `/api/specs` includes the legacy baseline spec with all documented fields.
+- `/api/blocks` invariants: valid kind/direction/exitSlot per block kind,
+  every declared param has `id/type/min/max/step` with `min<max, step>0`.
+- Anchors: `stochCross` has exactly `[longLevel, shortLevel, stochLen, stochSmth]`;
+  `atrHardStop` has `exitSlot=hardStop`; `atrRisk` has `sizingRequirements=['stopDistance']`.
+- Sort order is non-regressing across the block list.
 
 ### 4.4 UI — fitness config panel
 - Weight sliders for PF / DD / return.

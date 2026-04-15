@@ -3,7 +3,7 @@
  */
 
 import { Router } from 'express';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import os from 'node:os';
 import { getSymbolStats, getLastTimestamp, deleteSymbol } from '../db/candles.js';
@@ -544,6 +544,172 @@ router.post('/api/queue/recover', async (req, res) => {
     if (activeRun) await heartbeat(activeRun.runId).catch(() => {});
     const recovered = await recoverStaleRuns({ timeoutMs });
     res.json({ recovered, timeoutMs });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Spec authoring (Phase 4.3a) ──────────────────────────
+//
+// Two read-only endpoints that feed the upcoming spec-authoring UI:
+//
+//   GET /api/specs   — enumerate strategy spec files on disk (strategies/*.json)
+//   GET /api/blocks  — enumerate the in-memory block registry + their declared params
+//
+// Neither endpoint talks to the DB. Specs are file-based at authoring time; the
+// `specs` table is a content-addressed archive of specs that have actually been
+// used in a run (for run provenance), not the picker source. The UI picker
+// should offer what's on disk so newly-authored-but-never-run specs are visible.
+//
+// Block enumeration goes through `registry.ensureLoaded()` which lazy-imports
+// the library bundle on first call — that's free on a warm server, slightly
+// more expensive (one import tree) on a cold one.
+
+/**
+ * GET /api/specs
+ *
+ * Enumerate all JSON files under `strategies/`. For each file we parse the
+ * JSON (best-effort) and surface metadata the UI needs for a picker:
+ * filename, name, description, byte size, mtime.
+ *
+ * Files that fail to parse, or that don't have the required `name` field,
+ * are surfaced separately in `malformed[]` so the UI can show a warning
+ * without losing visibility of the broken files. We do NOT run the full
+ * `validateSpec()` here — that's expensive (loads the block library to check
+ * references) and the picker only needs shape-level trust. Full validation
+ * happens on POST /api/runs exactly like today.
+ *
+ * Response:
+ *   {
+ *     specs: [{ filename, name, description, sizeBytes, mtime }, ...],
+ *     malformed: [{ filename, error }, ...]
+ *   }
+ */
+router.get('/api/specs', async (req, res) => {
+  try {
+    const dir = resolve(process.cwd(), 'strategies');
+    let entries;
+    try {
+      entries = await readdir(dir);
+    } catch (err) {
+      // strategies/ missing is fine on a fresh checkout — just empty list.
+      if (err.code === 'ENOENT') return res.json({ specs: [], malformed: [] });
+      throw err;
+    }
+
+    const specs = [];
+    const malformed = [];
+    for (const filename of entries) {
+      if (!filename.endsWith('.json')) continue;
+      const path = resolve(dir, filename);
+      let st, raw, parsed;
+      try {
+        st = await stat(path);
+        if (!st.isFile()) continue;
+        raw = await readFile(path, 'utf8');
+        parsed = JSON.parse(raw);
+      } catch (err) {
+        malformed.push({ filename, error: err.message });
+        continue;
+      }
+      if (!parsed || typeof parsed !== 'object' || typeof parsed.name !== 'string') {
+        malformed.push({ filename, error: 'missing or invalid "name" field' });
+        continue;
+      }
+      // Truncate description for list view — full text is available by
+      // re-fetching the file. 280 chars is generous but bounds payload size.
+      const desc = typeof parsed.description === 'string'
+        ? (parsed.description.length > 280
+            ? parsed.description.slice(0, 280) + '…'
+            : parsed.description)
+        : null;
+      specs.push({
+        filename,
+        name: parsed.name,
+        description: desc,
+        sizeBytes: st.size,
+        mtime: st.mtime.toISOString(),
+      });
+    }
+    // Newest first — matches the on-disk authoring flow ("show me what I just saved").
+    specs.sort((a, b) => b.mtime.localeCompare(a.mtime));
+    res.json({ specs, malformed });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/blocks
+ *
+ * Dump the in-memory block registry so the UI can render a block picker
+ * grouped by kind. For each block we surface enough metadata to build a
+ * narrowing form (declaredParams gives min/max/step per param).
+ *
+ * The registry is the source of truth — no shadow JSON. If a new block is
+ * added to engine/blocks/library/, it appears here automatically after the
+ * next server restart.
+ *
+ * Response:
+ *   {
+ *     blocks: [
+ *       {
+ *         id, version, kind,
+ *         direction: 'long'|'short'|'both'|null,  // null for regime/sizing
+ *         exitSlot:  'hardStop'|'target'|'trail'|null,  // non-null only for exit
+ *         sizingRequirements: ['stopDistance',...] | null,  // sizing-only
+ *         params: [{ id, type, min, max, step }, ...]
+ *       },
+ *       ...
+ *     ]
+ *   }
+ *
+ * Stable sort by (kind, id, version) so clients can diff responses.
+ */
+router.get('/api/blocks', async (req, res) => {
+  try {
+    await registry.ensureLoaded();
+    const KIND_ORDER = { regime: 0, entry: 1, filter: 2, exit: 3, sizing: 4 };
+    const blocks = registry.list().map(b => {
+      let params = [];
+      try {
+        // declaredParams() takes no args (contract invariant), but defensively
+        // treat a throw as "no declared params" rather than crashing the whole
+        // endpoint. A broken block shouldn't poison the whole picker.
+        const arr = typeof b.declaredParams === 'function' ? b.declaredParams() : [];
+        if (Array.isArray(arr)) {
+          params = arr.map(p => ({
+            id: p.id, type: p.type, min: p.min, max: p.max, step: p.step,
+          }));
+        }
+      } catch { /* params stays [] */ }
+
+      let sizingRequirements = null;
+      if (b.kind === 'sizing' && typeof b.sizingRequirements === 'function') {
+        try {
+          const r = b.sizingRequirements();
+          if (Array.isArray(r)) sizingRequirements = r;
+        } catch { /* stays null */ }
+      }
+
+      return {
+        id: b.id,
+        version: b.version,
+        kind: b.kind,
+        direction: b.direction ?? null,
+        exitSlot:  b.exitSlot  ?? null,
+        sizingRequirements,
+        params,
+      };
+    });
+    blocks.sort((a, b) => {
+      const ka = KIND_ORDER[a.kind] ?? 99;
+      const kb = KIND_ORDER[b.kind] ?? 99;
+      if (ka !== kb) return ka - kb;
+      if (a.id !== b.id) return a.id.localeCompare(b.id);
+      return a.version - b.version;
+    });
+    res.json({ blocks });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
