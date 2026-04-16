@@ -1179,10 +1179,12 @@ logging endpoint (TV supports multiple webhook URLs per alert).
 **Deployment topology:** 1 Wundertrading Signal Bot per strategy,
 connected to exactly 1 exchange sub-account, with at most 1 open
 trade at any time. Consequences:
-- **Portfolio field is moot** — every TP closes the full position
-  (`portfolio: 1`). The multi-TP ladder becomes "whichever level
-  price reaches first, close everything" — matches our Pine v1
-  simplification.
+- **Full scale-out via exchange** — each TP level closes a fraction
+  of the position (`portfolio: tpNPct / 100`). The exchange holds
+  all TPs + SL simultaneously as conditional orders. This is
+  faithful to the backtest's `atrScaleOutTarget` behavior (an
+  improvement over the Pine v1 simplification which closed the full
+  position on first TP hit).
 - **Sizing is trivial** — `amountPerTrade` as a fraction applies to
   a dedicated sub-account. No cross-strategy margin math.
 - **P&L attribution is automatic** — one sub-account per strategy
@@ -1209,9 +1211,9 @@ Guide):
   "amountPerTrade": 0.1,
   "leverage": 5,
   "takeProfits": [
-    {"price": 148.50, "portfolio": 1},
-    {"price": 155.00, "portfolio": 1},
-    {"price": 162.00, "portfolio": 1}
+    {"price": 148.50, "portfolio": 0.33},
+    {"price": 155.00, "portfolio": 0.33},
+    {"price": 162.00, "portfolio": 0.34}
   ],
   "stopLoss": {"price": 138.00},
   "placeConditionalOrdersOnExchange": true,
@@ -1244,9 +1246,11 @@ actual orders on the exchange (not just server-side monitoring).
     (`nz(atr_<len>[1])` — prior bar's ATR, matching the backtest's
     fill-at-next-bar-open convention).
   - Computes TP prices: for each active tranche (tpNPct > 0),
-    `close ± ATR × tpNMult`. Tranche mults are frozen from the gene
-    as numeric literals. All TPs use `portfolio: 1` (full-close on
-    first hit — 1 bot / 1 sub-account / max 1 trade topology).
+    `close ± ATR × tpNMult`. Tranche mults and pcts are frozen from
+    the gene as numeric literals. Portfolio fractions = `tpNPct / 100`
+    (exchange holds all TPs simultaneously; each closes its fraction
+    of the position when hit — faithful scale-out matching the
+    backtest's `atrScaleOutTarget` behavior).
   - Computes SL price: `close ∓ ATR × atrSL` from the hardStop block.
   - Assembles JSON: `code`, `orderType: "market"`,
     `amountPerTradeType: "percents"`, `amountPerTrade: i_posSize`,
@@ -1314,7 +1318,7 @@ way this is a small follow-up, not blocking.
   - SL price uses correct formula: long = `close - ATR × atrSL`,
     short = `close + ATR × atrSL`.
   - Only active tranches (tpNPct > 0) emitted in the TP array.
-  - All TPs use `portfolio: 1` (full-close-on-first-hit topology).
+  - Portfolio fractions = `tpNPct / 100` per tranche, sum ≤ 1.0.
 - [2] **Exit alert gating**: verify `alert(f_exit_json(...))` is guarded
   by `bar_exit_reason` check — fires for Structural/Time/Reversal, NOT
   for TP/SL/ESL.
