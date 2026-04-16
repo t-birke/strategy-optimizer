@@ -1216,6 +1216,10 @@ Guide):
     {"price": 162.00, "portfolio": 0.34}
   ],
   "stopLoss": {"price": 138.00},
+  "moveToBreakeven": {
+    "activationPrice": 148.50,
+    "executePrice": 142.31
+  },
   "placeConditionalOrdersOnExchange": true,
   "reduceOnly": true
 }
@@ -1223,10 +1227,14 @@ Guide):
 
 Key fields: `code` = bot trigger comment; `takeProfits` = array of up
 to 6 levels with absolute prices + portfolio fraction (0,1] to close;
-`stopLoss` = single level with absolute price; `reduceOnly` = safety
-flag preventing accidental position opens. Wundertrading supports
-`placeConditionalOrdersOnExchange: true` which places TPs/SLs as
-actual orders on the exchange (not just server-side monitoring).
+`stopLoss` = single level with absolute price; `moveToBreakeven` =
+when `activationPrice` is reached (= TP1 level), SL shifts to
+`executePrice` (= entry price, i.e. breakeven) — the exchange handles
+this atomically so the remaining position is risk-free after the first
+TP fills; `reduceOnly` = safety flag preventing accidental position
+opens. Wundertrading supports `placeConditionalOrdersOnExchange: true`
+which places TPs/SLs/moveToBreakeven as actual orders on the exchange
+(not just server-side monitoring).
 
 **IN scope:**
 - **New Pine inputs** (Webhook group, alongside existing `i_tickerOverride`):
@@ -1252,9 +1260,17 @@ actual orders on the exchange (not just server-side monitoring).
     of the position when hit — faithful scale-out matching the
     backtest's `atrScaleOutTarget` behavior).
   - Computes SL price: `close ∓ ATR × atrSL` from the hardStop block.
+  - Computes `moveToBreakeven`: when the spec has both a target block
+    (TPs) and a hardStop block (SL), emits `activationPrice` = TP1
+    price and `executePrice` = `close` (entry price). After TP1 fills,
+    the exchange shifts the SL to breakeven — remaining position is
+    risk-free. This was previously listed as a "v1 Pine simplification
+    NOT implemented" (BE+ SL tightening); Wundertrading makes it a
+    single JSON field, handled atomically on the exchange.
   - Assembles JSON: `code`, `orderType: "market"`,
     `amountPerTradeType: "percents"`, `amountPerTrade: i_posSize`,
     `leverage: i_leverage`, `takeProfits: [...]`, `stopLoss: {price: ...}`,
+    `moveToBreakeven: {activationPrice, executePrice}`,
     `placeConditionalOrdersOnExchange: true`, `reduceOnly: true`.
 - **Refactored `f_exit_json(dir, reason)`** — minimal close payload:
   `{"code":"<i_codeExit>","orderType":"market","reduceOnly":true}`.
@@ -1296,8 +1312,8 @@ way this is a small follow-up, not blocking.
 - Wundertrading DCA settings in the alert JSON (complex, user can
   configure DCA in the bot's form settings if needed)
 - Limit order support (market orders only in v1)
-- Move-to-breakeven automation via Wundertrading's `moveToBreakeven`
-  field (exchange-side logic, our backtest doesn't model it yet)
+- Configurable activation level for moveToBreakeven (currently always
+  TP1; a future spec param could set it to TP2 or a custom ATR mult)
 - `amountPerTradeType` as an input (hardcoded to `"percents"` — user
   can override in TV's alert message editor if needed)
 - Trailing stop in Wundertrading format (their trailing stop is
@@ -1312,7 +1328,10 @@ way this is a small follow-up, not blocking.
     defaults.
   - `f_entry_json` contains Wundertrading fields: `code`, `orderType`,
     `amountPerTradeType`, `amountPerTrade`, `leverage`, `takeProfits`,
-    `stopLoss`, `placeConditionalOrdersOnExchange`, `reduceOnly`.
+    `stopLoss`, `moveToBreakeven`, `placeConditionalOrdersOnExchange`,
+    `reduceOnly`.
+  - `moveToBreakeven.activationPrice` = TP1 price, `.executePrice` =
+    entry price (`close`). Omitted when no target or no hardStop block.
   - TP prices use correct formula direction-aware:
     long = `close + ATR × mult`, short = `close - ATR × mult`.
   - SL price uses correct formula: long = `close - ATR × atrSL`,
