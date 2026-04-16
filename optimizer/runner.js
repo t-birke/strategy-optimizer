@@ -647,6 +647,7 @@ export async function runOptimization(config) {
                 totalGens: generations,
                 best: globalBest.fitness,
                 metrics: globalBest.metrics,
+                gene: globalBest.gene ? { ...globalBest.gene } : null,
                 config: geneShort(globalBest.gene),
                 evalCount: workerEvals.reduce((a, b) => a + b, 0),
                 cacheSize: workerCaches.reduce((a, b) => a + b, 0),

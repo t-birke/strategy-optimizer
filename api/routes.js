@@ -1714,7 +1714,21 @@ export async function processQueue() {
             }
             broadcast({ type: 'generation', runId, ...progress });
             if (progress.gen % 10 === 0) {
-              exec(`UPDATE runs SET generations_completed = ${progress.gen}, total_evaluations = ${progress.evalCount} WHERE id = ${runId}`).catch(() => {});
+              // Persist progress + current best gene so a crash doesn't lose
+              // everything. The metrics/gene are written as JSON; completeRun
+              // overwrites them with the final values on success.
+              const esc = s => s.replace(/'/g, "''");
+              const geneObj = progress.gene;
+              const m = progress.metrics;
+              const geneCols = geneObj && m
+                ? `, best_gene = '${esc(JSON.stringify(geneObj))}', ` +
+                  `best_metrics = '${esc(JSON.stringify(m))}'`
+                : '';
+              exec(
+                `UPDATE runs SET generations_completed = ${progress.gen}, ` +
+                `total_evaluations = ${progress.evalCount}${geneCols} ` +
+                `WHERE id = ${runId}`
+              ).catch(() => {});
             }
           },
           shouldCancel: () => cancelRequested,

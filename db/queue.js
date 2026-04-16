@@ -129,18 +129,41 @@ export async function recoverStaleRuns({ timeoutMs }) {
   // to avoid surprises with fractional ms. Round up so we never resurrect a
   // row prematurely.
   const timeoutSec = Math.ceil(timeoutMs / 1000);
-  const rows = await query(
+  const staleCondition =
+    `status = 'running' ` +
+    `AND (heartbeat_at IS NULL OR heartbeat_at < current_timestamp - INTERVAL '${timeoutSec}' SECOND)`;
+
+  // Runs that already have a best_gene were mid-flight or finished but
+  // failed the completeRun write. Mark them completed (with partial data)
+  // instead of sending them back to pending — re-running would lose the
+  // results we DO have.
+  const rescued = await query(
+    `UPDATE runs SET ` +
+      `status = 'completed', ` +
+      `completed_at = COALESCE(completed_at, current_timestamp) ` +
+    `WHERE ${staleCondition} AND best_gene IS NOT NULL ` +
+    `RETURNING id`
+  );
+  if (rescued.length > 0) {
+    console.log(`[queue] Rescued ${rescued.length} stale run(s) with results → completed: ${rescued.map(r => r.id).join(', ')}`);
+  }
+
+  // Runs without any results can safely be retried.
+  const retried = await query(
     `UPDATE runs SET ` +
       `status = 'pending', ` +
       `claimed_by = NULL, ` +
       `claimed_at = NULL, ` +
       `heartbeat_at = NULL, ` +
       `started_at = NULL ` +
-    `WHERE status = 'running' ` +
-      `AND (heartbeat_at IS NULL OR heartbeat_at < current_timestamp - INTERVAL '${timeoutSec}' SECOND) ` +
+    `WHERE ${staleCondition} AND best_gene IS NULL ` +
     `RETURNING id`
   );
-  return rows.length;
+  if (retried.length > 0) {
+    console.log(`[queue] Retried ${retried.length} stale run(s) without results → pending: ${retried.map(r => r.id).join(', ')}`);
+  }
+
+  return rescued.length + retried.length;
 }
 
 /**
