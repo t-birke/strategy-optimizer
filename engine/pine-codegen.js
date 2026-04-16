@@ -384,13 +384,14 @@ function emitExitStateMachine(push, hydrated) {
  * @param {Object} args.hydrated   — paramSpace.hydrate(gene)
  * @param {Object} [args.meta]     — optional metadata embedded into header
  *                                   { ticker, timeframe, warmupBars, source }
- * @param {string} [args.shortTitle]
+ * @param {string} [args.title]      — override the full indicator title
+ * @param {string} [args.shortTitle]  — override the Pine shorttitle (≤10 chars)
  * @returns {{ source: string, title: string, shortTitle: string }}
  */
-export function generateEntryAlertsPine({ spec, hydrated, meta = {}, shortTitle } = {}) {
+export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titleOverride, shortTitle } = {}) {
   if (!spec || !hydrated) throw new Error('pine-codegen: spec and hydrated are required');
 
-  const title = `${spec.name} (entries)`;
+  const title = titleOverride || `${spec.name} (entries)`;
   const stitle = shortTitle ?? defaultShortTitle(spec.name);
 
   const lines = [];

@@ -688,6 +688,10 @@ router.post('/api/runs/:id/pine-push', async (req, res) => {
     // Title includes the run ID so each push creates a uniquely-named study.
     const tfLabel = tfString(run.timeframe);
     const pineTitle = `#${run.id} ${spec.name} — ${run.symbol} ${tfLabel}`;
+    // Pine shorttitle must be ≤ 10 chars. Format: ID-SYM-TF
+    // e.g. "42-BTC-4H", "123-SOL-1D"
+    const sym = run.symbol.replace(/USDT$/i, '');
+    const pineShort = `${run.id}-${sym}-${tfLabel}`.slice(0, 10);
 
     const { source, title, shortTitle } = generateEntryAlertsPine({
       spec, hydrated,
@@ -696,7 +700,8 @@ router.post('/api/runs/:id/pine-push', async (req, res) => {
         timeframe: tfLabel,
         source:    `api/routes.js  (run #${run.id})`,
       },
-      shortTitle: pineTitle,
+      title: pineTitle,
+      shortTitle: pineShort,
     });
 
     // Push to TradingView Desktop via CDP.
