@@ -897,9 +897,8 @@ window.toggleRunDetails = async (id) => {
           ${formatWinnerConfig(gene, isSpecMode)}
         </span>`;
       if (isSpecMode) {
-        html += `<button class="primary btn-tv" id="btn-tv-${id}" disabled
-          title="Send to TV is only available for legacy GA runs. Spec-mode genes use block-qualified IDs that don't map to the JM Simple 3TP Pine template."
-          style="font-size:11px;padding:3px 10px;white-space:nowrap;opacity:0.5;cursor:not-allowed">Send to TV (legacy only)</button>`;
+        html += `<button onclick="pushToTV(${id})" class="primary btn-tv" id="btn-tv-${id}" style="font-size:11px;padding:3px 10px;white-space:nowrap"
+          title="Generate Pine indicator from the winning gene and push to TradingView Desktop">Send to TV</button>`;
       } else {
         html += `<button onclick="sendToTV(${id})" class="primary btn-tv" id="btn-tv-${id}" style="font-size:11px;padding:3px 10px;white-space:nowrap">Send to TV</button>`;
       }
@@ -1446,6 +1445,55 @@ window.sendToTV = async (runId) => {
     } else {
       status.textContent = 'Inputs set, but could not read metrics';
       status.style.color = '#d29922';
+    }
+  } catch (err) {
+    btn.textContent = 'Send to TV';
+    btn.disabled = false;
+    status.textContent = err.message;
+    status.style.color = '#f85149';
+  }
+};
+
+// ─── Spec-mode Pine push ─────────────────────────────────
+// Generates a Pine indicator from the spec-mode winning gene
+// and pushes it to TradingView Desktop via CDP.
+
+window.pushToTV = async (runId) => {
+  const btn = document.getElementById(`btn-tv-${runId}`);
+  const status = document.getElementById(`tv-status-${runId}`);
+  const resultDiv = document.getElementById(`tv-result-${runId}`);
+
+  btn.disabled = true;
+  btn.textContent = 'Generating...';
+  status.textContent = '';
+  status.style.color = '#8b949e';
+  resultDiv.style.display = 'none';
+
+  try {
+    btn.textContent = 'Pushing to TV...';
+    const res = await fetch(`/api/runs/${runId}/pine-push`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Failed to push to TV');
+
+    btn.textContent = 'Send to TV';
+    btn.disabled = false;
+
+    if (data.compileErrors && data.compileErrors.length > 0) {
+      status.innerHTML = `<span style="color:#f85149">${data.compileErrors.length} compile error(s)</span>`;
+      resultDiv.style.display = 'block';
+      resultDiv.innerHTML = `
+        <div style="font-size:12px;margin-bottom:6px"><strong>${data.title}</strong> — ${data.lines} lines</div>
+        <div style="font-size:12px;color:#f85149">${data.compileErrors.map(e => `Line ${e.line}: ${e.msg}`).join('<br>')}</div>
+        <div style="font-size:11px;color:#8b949e;margin-top:6px">File: ${data.filename} | Button: ${data.buttonClicked}</div>`;
+    } else {
+      status.innerHTML = `<span style="color:#3fb950">Pushed to TV</span>`;
+      resultDiv.style.display = 'block';
+      resultDiv.innerHTML = `
+        <div style="font-size:12px"><strong>${data.title}</strong> — ${data.lines} lines, compiled clean</div>
+        <div style="font-size:11px;color:#8b949e;margin-top:4px">File: ${data.filename} | Button: ${data.buttonClicked}</div>`;
     }
   } catch (err) {
     btn.textContent = 'Send to TV';

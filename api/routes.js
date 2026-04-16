@@ -22,7 +22,7 @@ import { checkSymbol, ingestSymbol, updateSymbol } from '../data/ingest.js';
 import { runOptimization } from '../optimizer/runner.js';
 import { geneShort } from '../optimizer/params.js';
 import { broadcast } from './websocket.js';
-import { sendToTradingView, checkTradingViewConnection } from './tradingview.js';
+import { sendToTradingView, checkTradingViewConnection, pushPineToTV } from './tradingview.js';
 import { loadCandles } from '../db/candles.js';
 import { runStrategy } from '../engine/strategy.js';
 import { runSpec } from '../engine/runtime.js';
@@ -625,6 +625,114 @@ router.post('/api/runs/:id/pine-export', async (req, res) => {
     });
   } catch (err) {
     console.error('pine-export:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/runs/:id/pine-push — Generate a Pine indicator from a
+ * spec-mode run's winning gene and push it into TradingView Desktop's
+ * Pine Editor via CDP. The indicator is compiled and added to the chart
+ * as a new study.
+ *
+ * Title format: "#<runId> <specName> — <symbol> <tf>"
+ * e.g. "#42 JM Simple 3TP — BTCUSDT 4H"
+ *
+ * Requires TradingView Desktop running with --remote-debugging-port=9222
+ * and the Pine Editor panel open.
+ *
+ * Status codes: same as pine-export, plus:
+ *   502 TradingView Desktop not reachable or Pine Editor not open
+ */
+router.post('/api/runs/:id/pine-push', async (req, res) => {
+  try {
+    const runs = await query(`SELECT * FROM runs WHERE id = ${req.params.id}`);
+    if (runs.length === 0) return res.status(404).json({ error: 'Run not found' });
+    const run = runs[0];
+
+    for (const field of ['config', 'best_gene']) {
+      if (run[field] && typeof run[field] === 'string') {
+        try { run[field] = JSON.parse(run[field]); } catch {}
+      }
+    }
+
+    if (!run.spec_hash) {
+      return res.status(400).json({
+        error: 'Legacy runs cannot push Pine. Codegen requires a spec — ' +
+               'run a spec-mode optimization first.',
+      });
+    }
+    if (!run.best_gene) {
+      return res.status(400).json({ error: 'Run has no best gene yet' });
+    }
+
+    await registry.ensureLoaded();
+    const persisted = await getSpec(run.spec_hash);
+    if (!persisted) {
+      return res.status(404).json({
+        error: `Spec ${run.spec_hash} not found (run ${run.id} points at a missing spec)`,
+      });
+    }
+    const spec = validateSpec(persisted.json);
+    const paramSpace = buildParamSpace(spec);
+
+    let hydrated;
+    try {
+      hydrated = paramSpace.hydrate(run.best_gene);
+    } catch (hydrationErr) {
+      return res.status(409).json({
+        error: `Gene no longer matches spec ${run.spec_hash} — spec was likely edited after the run completed. ${hydrationErr.message}`,
+      });
+    }
+
+    // Title includes the run ID so each push creates a uniquely-named study.
+    const tfLabel = tfString(run.timeframe);
+    const pineTitle = `#${run.id} ${spec.name} — ${run.symbol} ${tfLabel}`;
+
+    const { source, title, shortTitle } = generateEntryAlertsPine({
+      spec, hydrated,
+      meta: {
+        ticker:    run.symbol,
+        timeframe: tfLabel,
+        source:    `api/routes.js  (run #${run.id})`,
+      },
+      shortTitle: pineTitle,
+    });
+
+    // Push to TradingView Desktop via CDP.
+    let pushResult;
+    try {
+      pushResult = await pushPineToTV(source);
+    } catch (tvErr) {
+      return res.status(502).json({ error: tvErr.message });
+    }
+
+    // Also write the .pine file to disk (same as pine-export).
+    const hash12 = geneHash(run.best_gene);
+    const outDir = process.env.OPTIMIZER_PINE_OUT_DIR
+      ? resolve(process.env.OPTIMIZER_PINE_OUT_DIR)
+      : resolve(process.cwd(), 'pine/generated');
+    const filename = `${spec.name}-${hash12}.pine`;
+    const outPath = resolve(outDir, filename);
+    try {
+      await stat(outPath);
+    } catch {
+      await mkdir(outDir, { recursive: true });
+      await writeFile(outPath, source, 'utf8');
+    }
+
+    return res.json({
+      title,
+      shortTitle,
+      filename,
+      path: outPath,
+      lines: source.split('\n').length,
+      pushed: pushResult.pushed,
+      buttonClicked: pushResult.buttonClicked,
+      compileErrors: pushResult.errors,
+    });
+  } catch (err) {
+    console.error('pine-push:', err);
     res.status(500).json({ error: err.message });
   }
 });
