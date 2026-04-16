@@ -69,6 +69,21 @@ function generateFull() {
   return { result, spec, hydrated, gene };
 }
 
+/** Generate Pine in strategy mode with dates. */
+function generateStrategy() {
+  const spec = loadMigrationGateSpec();
+  const ps = buildParamSpace(spec);
+  const gene = ps.randomIndividual();
+  const hydrated = ps.hydrate(gene);
+  const result = generateEntryAlertsPine({
+    spec, hydrated,
+    meta: { ticker: 'BTCUSDT', timeframe: '4H' },
+    mode: 'strategy',
+    dates: { startDate: '2021-04-11', endDate: '2025-12-31' },
+  });
+  return { result, spec, hydrated, gene };
+}
+
 /** Generate Pine with a modified exits config. */
 function generateWithExits(overrides) {
   const spec = loadMigrationGateSpec();
@@ -91,6 +106,12 @@ console.log('\n[1] Codegen output — full spec (TPs + SL + moveToBreakeven)');
 {
   const { result, hydrated } = generateFull();
   const src = result.source;
+
+  // ── Default mode is indicator ──
+  assertTrue('indicator() declaration (default mode)',
+    src.includes('indicator(') && !src.includes('strategy('));
+  assertTrue('No strategy.entry in indicator mode',
+    !src.includes('strategy.entry('));
 
   // ── New inputs in the Webhook group ──
   assertTrue('i_posSize input declared',
@@ -368,26 +389,55 @@ console.log('\n[4] Backward compatibility — viz + alertcondition preserved');
 }
 
 // ═══════════════════════════════════════════════════════════════
-// [5] Strategy execution — strategy() + entry/exit/close calls
+// [5] Strategy mode — strategy() + entry/exit/close + dates + sizing
 // ═══════════════════════════════════════════════════════════════
-console.log('\n[5] Strategy execution — strategy tester support');
+console.log('\n[5] Strategy mode — strategy tester support');
 {
-  const { result, hydrated } = generateFull();
+  const { result, hydrated } = generateStrategy();
   const src = result.source;
 
   // strategy() declaration instead of indicator()
   assertTrue('strategy() declaration (not indicator)',
     src.includes('strategy(') && !src.includes('indicator('));
+  assertTrue('initial_capital=100000',
+    src.includes('initial_capital=100000'));
+  assertTrue('commission_value=0.06',
+    src.includes('commission_value=0.06'));
+  assertTrue('slippage=2',
+    src.includes('slippage=2'));
   assertTrue('pyramiding=0',
     src.includes('pyramiding=0'));
-  assertTrue('overlay=true',
-    src.includes('overlay=true'));
+  assertTrue('default_qty_type=strategy.fixed',
+    src.includes('default_qty_type=strategy.fixed'));
 
-  // strategy.entry calls
-  assertTrue('strategy.entry Long',
-    src.includes('strategy.entry("Long", strategy.long)'));
-  assertTrue('strategy.entry Short',
-    src.includes('strategy.entry("Short", strategy.short)'));
+  // Date inputs
+  assertTrue('i_startDate input declared',
+    src.includes('i_startDate = input.time('));
+  assertTrue('i_endDate input declared',
+    src.includes('i_endDate'));
+  assertTrue('in_date_range gate',
+    src.includes('bool in_date_range'));
+  assertTrue('startDate default matches dates arg',
+    src.includes('timestamp("2021-04-11")'));
+  assertTrue('endDate default matches dates arg',
+    src.includes('timestamp("2025-12-31")'));
+
+  // ATR-risk position sizing (Van Tharp formula)
+  const riskPct = hydrated.sizing?.params?.riskPct;
+  assertTrue('strat_risk uses strategy.equity * riskPct',
+    src.includes(`strategy.equity * ${riskPct} / 100`));
+  assertTrue('strat_stop uses atrSL',
+    src.includes(`strat_atr_hs * ${hydrated.exits.hardStop.params.atrSL}`));
+  assertTrue('strat_qty computed from risk / stop',
+    src.includes('strat_risk / strat_stop'));
+
+  // strategy.entry calls gated by in_date_range
+  assertTrue('strategy.entry Long gated by date range',
+    src.includes('if goLong and in_date_range'));
+  assertTrue('strategy.entry Short gated by date range',
+    src.includes('if goShort and in_date_range'));
+  assertTrue('strategy.entry uses qty=strat_qty',
+    src.includes('strategy.entry("Long", strategy.long, qty=strat_qty)'));
 
   // strategy.exit TP calls for active tranches
   const tg = hydrated.exits.target;
@@ -423,23 +473,18 @@ console.log('\n[5] Strategy execution — strategy tester support');
     src.includes('var float strat_atr_tp'));
   assertTrue('strat_atr_hs var declared',
     src.includes('var float strat_atr_hs'));
-}
 
-// ═══════════════════════════════════════════════════════════════
-// [5b] Strategy graceful degradation — no exits
-// ═══════════════════════════════════════════════════════════════
-console.log('\n[5b] Strategy — no exits → entry-only strategy');
-{
-  const { result } = generateWithExits({
-    hardStop: null, target: null, trail: null,
-  });
-  const src = result.source;
-  assertTrue('strategy.entry still present',
-    src.includes('strategy.entry("Long", strategy.long)'));
-  assertTrue('No strategy.exit calls',
-    !src.includes('strategy.exit('));
-  assertTrue('strategy.close_all still present (dead path when no exits)',
-    src.includes('strategy.close_all(comment=bar_exit_reason)'));
+  // Strategy mode must NOT contain alert / webhook machinery
+  assertTrue('No Wundertrading webhook inputs in strategy mode',
+    !src.includes('GRP_WH') && !src.includes('i_codeLong'));
+  assertTrue('No f_entry_json in strategy mode',
+    !src.includes('f_entry_json'));
+  assertTrue('No f_exit_json in strategy mode',
+    !src.includes('f_exit_json'));
+  assertTrue('No alert() calls in strategy mode',
+    !src.includes('alert(f_entry') && !src.includes('alert(f_exit'));
+  assertTrue('No alertcondition in strategy mode',
+    !src.includes('alertcondition('));
 }
 
 // ═══════════════════════════════════════════════════════════════

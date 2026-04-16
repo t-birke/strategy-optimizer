@@ -693,6 +693,12 @@ router.post('/api/runs/:id/pine-push', async (req, res) => {
     const sym = run.symbol.replace(/USDT$/i, '');
     const pineShort = `${run.id}-${sym}-${tfLabel}`.slice(0, 10);
 
+    // Parse config for endDate (start_date is a top-level column).
+    let config = run.config;
+    if (typeof config === 'string') {
+      try { config = JSON.parse(config); } catch {}
+    }
+
     const { source, title, shortTitle } = generateEntryAlertsPine({
       spec, hydrated,
       meta: {
@@ -702,6 +708,11 @@ router.post('/api/runs/:id/pine-push', async (req, res) => {
       },
       title: pineTitle,
       shortTitle: pineShort,
+      mode: 'strategy',
+      dates: {
+        startDate: run.start_date,
+        endDate:   config?.endDate || null,
+      },
     });
 
     // Push to TradingView Desktop via CDP.

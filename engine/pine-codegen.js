@@ -384,13 +384,16 @@ function emitExitStateMachine(push, hydrated) {
  * @param {Object} args.hydrated   — paramSpace.hydrate(gene)
  * @param {Object} [args.meta]     — optional metadata embedded into header
  *                                   { ticker, timeframe, warmupBars, source }
- * @param {string} [args.title]      — override the full indicator title
- * @param {string} [args.shortTitle]  — override the Pine shorttitle (≤10 chars)
+ * @param {string}  [args.title]      — override the full indicator/strategy title
+ * @param {string}  [args.shortTitle]  — override the Pine shorttitle (≤10 chars)
+ * @param {string}  [args.mode]        — 'indicator' (default) or 'strategy'
+ * @param {Object}  [args.dates]       — { startDate, endDate } for strategy mode
  * @returns {{ source: string, title: string, shortTitle: string }}
  */
-export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titleOverride, shortTitle } = {}) {
+export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titleOverride, shortTitle, mode, dates } = {}) {
   if (!spec || !hydrated) throw new Error('pine-codegen: spec and hydrated are required');
 
+  const isStrategy = mode === 'strategy';
   const title = titleOverride || `${spec.name} (entries)`;
   const stitle = shortTitle ?? defaultShortTitle(spec.name);
 
@@ -408,21 +411,44 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titl
   push(`// Generated: ${new Date().toISOString()}`);
   push('');
   push('//@version=5');
-  push(`strategy("${title}", "${stitle}", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.04, pyramiding=0)`);
+  if (isStrategy) {
+    // Strategy mode: matches GA backtest settings (100k capital, 0.06%
+    // commission, slippage=2, fixed qty computed from ATR-risk sizing).
+    push(`strategy("${title}", "${stitle}", overlay=true, initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=0, commission_type=strategy.commission.percent, commission_value=0.06, slippage=2, pyramiding=0)`);
+  } else {
+    push(`indicator("${title}", "${stitle}", overlay=true, max_labels_count=500)`);
+  }
   push('');
 
-  // ─── Ticker override input (for webhook routing) ───────────
-  push('GRP_WH = "Webhook"');
-  push('i_tickerOverride = input.string("", "Ticker Override", tooltip="Leave empty to use chart ticker. Set e.g. \'SOLUSDT.P\' for exchange-specific routing.", group=GRP_WH)');
-  push('string ticker = i_tickerOverride != "" ? i_tickerOverride : syminfo.ticker');
-  push('i_posSize = input.float(0.1, "Position Size (fraction)", minval=0.001, maxval=1.0, step=0.01, tooltip="Wundertrading amountPerTrade: 0.1 = 10%% of sub-account equity.", group=GRP_WH)');
-  push('i_leverage = input.int(1, "Leverage", minval=1, maxval=125, step=1, tooltip="Exchange leverage multiplier.", group=GRP_WH)');
-  push('i_codeLong = input.string("", "Code: Enter Long", tooltip="Wundertrading Signal Bot token for long entries. Paste from bot settings: Enter Long Comment.", group=GRP_WH)');
-  push('i_codeExitLong = input.string("", "Code: Exit Long", tooltip="Wundertrading Signal Bot token for closing longs. Paste from bot settings: Exit Long Comment.", group=GRP_WH)');
-  push('i_codeShort = input.string("", "Code: Enter Short", tooltip="Wundertrading Signal Bot token for short entries. Paste from bot settings: Enter Short Comment.", group=GRP_WH)');
-  push('i_codeExitShort = input.string("", "Code: Exit Short", tooltip="Wundertrading Signal Bot token for closing shorts. Paste from bot settings: Exit Short Comment.", group=GRP_WH)');
-  push('i_codeExitAll = input.string("", "Code: Exit All", tooltip="Wundertrading Signal Bot token for closing all positions. Paste from bot settings: Exit All Comment.", group=GRP_WH)');
-  push('');
+  // ─── Webhook inputs (indicator mode only — strategy is local backtesting) ──
+  if (!isStrategy) {
+    push('GRP_WH = "Webhook"');
+    push('i_tickerOverride = input.string("", "Ticker Override", tooltip="Leave empty to use chart ticker. Set e.g. \'SOLUSDT.P\' for exchange-specific routing.", group=GRP_WH)');
+    push('string ticker = i_tickerOverride != "" ? i_tickerOverride : syminfo.ticker');
+    push('i_posSize = input.float(0.1, "Position Size (fraction)", minval=0.001, maxval=1.0, step=0.01, tooltip="Wundertrading amountPerTrade: 0.1 = 10%% of sub-account equity.", group=GRP_WH)');
+    push('i_leverage = input.int(1, "Leverage", minval=1, maxval=125, step=1, tooltip="Exchange leverage multiplier.", group=GRP_WH)');
+    push('i_codeLong = input.string("", "Code: Enter Long", tooltip="Wundertrading Signal Bot token for long entries. Paste from bot settings: Enter Long Comment.", group=GRP_WH)');
+    push('i_codeExitLong = input.string("", "Code: Exit Long", tooltip="Wundertrading Signal Bot token for closing longs. Paste from bot settings: Exit Long Comment.", group=GRP_WH)');
+    push('i_codeShort = input.string("", "Code: Enter Short", tooltip="Wundertrading Signal Bot token for short entries. Paste from bot settings: Enter Short Comment.", group=GRP_WH)');
+    push('i_codeExitShort = input.string("", "Code: Exit Short", tooltip="Wundertrading Signal Bot token for closing shorts. Paste from bot settings: Exit Short Comment.", group=GRP_WH)');
+    push('i_codeExitAll = input.string("", "Code: Exit All", tooltip="Wundertrading Signal Bot token for closing all positions. Paste from bot settings: Exit All Comment.", group=GRP_WH)');
+    push('');
+  }
+
+  // ─── Date range inputs (strategy mode only) ─────────────────
+  if (isStrategy) {
+    const startTs = dates?.startDate
+      ? `timestamp("${dates.startDate}")`
+      : 'timestamp("2021-01-01")';
+    const endTs = dates?.endDate
+      ? `timestamp("${dates.endDate}")`
+      : 'timestamp("2099-12-31")';
+    push('GRP_BT = "Backtest"');
+    push(`i_startDate = input.time(${startTs}, "Start Date", group=GRP_BT)`);
+    push(`i_endDate   = input.time(${endTs}, "End Date", group=GRP_BT)`);
+    push('bool in_date_range = time >= i_startDate and time <= i_endDate');
+    push('');
+  }
 
   // ─── Regime (optional, passive for now) ────────────────────
   let regimeName = null;
@@ -544,10 +570,7 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titl
   push('if bar_exit and bar_exit_dir < 0');
   push('    label.new(bar_index, low,  bar_exit_reason, xloc=xloc.bar_index, yloc=yloc.belowbar, style=label.style_label_up,   color=color.aqua,   textcolor=color.black, size=size.small)');
   push('');
-  // ── Wundertrading alert payloads ──────────────────────────────
-  // Pre-compute ATR values on every bar as global floats. Avoids the
-  // Pine v5 gotcha where historical references ([1]) inside a function
-  // that's only called conditionally may give stale values.
+  // ── Exit block analysis (shared between alert + strategy sections) ──
   const wt_hs = hydrated.exits?.hardStop;
   const wt_tg = hydrated.exits?.target;
   const wt_hasTp = wt_tg?.blockId === 'atrScaleOutTarget';
@@ -565,88 +588,86 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titl
     wt_tranches.sort((a, b) => a.mult - b.mult);
   }
 
-  push('// ============ WUNDERTRADING ALERT PAYLOADS ============');
-  if (wt_hasTp) {
-    push(`float wt_atr_tp = nz(atr_${idSfx(wt_tg.params.atrLen)}[1])`);
-  }
-  if (wt_hasSl && (!wt_hasTp || wt_hs.params.atrLen !== wt_tg.params.atrLen)) {
-    push(`float wt_atr_sl = nz(atr_${idSfx(wt_hs.params.atrLen)}[1])`);
-  }
-  push('');
-
-  // f_ts() preserved for dual-webhook / logging use.
-  push('f_ts() =>');
-  push(`    str.tostring(year) + '-' + str.tostring(month, "00") + '-' + str.tostring(dayofmonth, "00") + 'T' + str.tostring(hour, "00") + ':' + str.tostring(minute, "00") + 'Z'`);
-  push('');
-
-  // f_entry_json — Wundertrading Signal Bot entry payload.
-  // TP prices = close ± ATR × mult; SL = close ∓ ATR × slMult.
-  // moveToBreakeven shifts SL to entry price when TP1 is reached.
-  push('f_entry_json(string dir) =>');
-  push('    bool is_l = dir == "long"');
-
-  for (const { n, mult } of wt_tranches) {
-    push(`    float tp${n} = is_l ? close + wt_atr_tp * ${mult} : close - wt_atr_tp * ${mult}`);
-  }
-  if (wt_hasSl) {
-    const atrVar = (wt_hasTp && wt_hs.params.atrLen === wt_tg.params.atrLen) ? 'wt_atr_tp' : 'wt_atr_sl';
-    push(`    float sl = is_l ? close - ${atrVar} * ${wt_hs.params.atrSL} : close + ${atrVar} * ${wt_hs.params.atrSL}`);
-  }
-
-  // JSON assembled from local string parts for readability.
-  push(`    string s_code = '{"code":"' + (is_l ? i_codeLong : i_codeShort) + '"'`);
-  push(`    string s_order = ',"orderType":"market","amountPerTradeType":"percents","amountPerTrade":' + str.tostring(i_posSize) + ',"leverage":' + str.tostring(i_leverage)`);
-
-  if (wt_tranches.length > 0) {
-    let tpLine = `    string s_tp = ',"takeProfits":['`;
-    for (let i = 0; i < wt_tranches.length; i++) {
-      const { n, pct } = wt_tranches[i];
-      if (i > 0) tpLine += ` + ','`;
-      tpLine += ` + '{"price":' + str.tostring(tp${n}, "#.####") + ',"portfolio":${formatFrac(pct / 100)}}'`;
+  // ── Wundertrading alert payloads (indicator mode only) ──────────
+  // Strategy mode is for local backtesting — no alerts, no webhook JSON.
+  if (!isStrategy) {
+    // Pre-compute ATR values on every bar as global floats. Avoids the
+    // Pine v5 gotcha where historical references ([1]) inside a function
+    // that's only called conditionally may give stale values.
+    push('// ============ WUNDERTRADING ALERT PAYLOADS ============');
+    if (wt_hasTp) {
+      push(`float wt_atr_tp = nz(atr_${idSfx(wt_tg.params.atrLen)}[1])`);
     }
-    tpLine += ` + ']'`;
-    push(tpLine);
+    if (wt_hasSl && (!wt_hasTp || wt_hs.params.atrLen !== wt_tg.params.atrLen)) {
+      push(`float wt_atr_sl = nz(atr_${idSfx(wt_hs.params.atrLen)}[1])`);
+    }
+    push('');
+
+    // f_ts() preserved for dual-webhook / logging use.
+    push('f_ts() =>');
+    push(`    str.tostring(year) + '-' + str.tostring(month, "00") + '-' + str.tostring(dayofmonth, "00") + 'T' + str.tostring(hour, "00") + ':' + str.tostring(minute, "00") + 'Z'`);
+    push('');
+
+    // f_entry_json — Wundertrading Signal Bot entry payload.
+    push('f_entry_json(string dir) =>');
+    push('    bool is_l = dir == "long"');
+
+    for (const { n, mult } of wt_tranches) {
+      push(`    float tp${n} = is_l ? close + wt_atr_tp * ${mult} : close - wt_atr_tp * ${mult}`);
+    }
+    if (wt_hasSl) {
+      const atrVar = (wt_hasTp && wt_hs.params.atrLen === wt_tg.params.atrLen) ? 'wt_atr_tp' : 'wt_atr_sl';
+      push(`    float sl = is_l ? close - ${atrVar} * ${wt_hs.params.atrSL} : close + ${atrVar} * ${wt_hs.params.atrSL}`);
+    }
+
+    push(`    string s_code = '{"code":"' + (is_l ? i_codeLong : i_codeShort) + '"'`);
+    push(`    string s_order = ',"orderType":"market","amountPerTradeType":"percents","amountPerTrade":' + str.tostring(i_posSize) + ',"leverage":' + str.tostring(i_leverage)`);
+
+    if (wt_tranches.length > 0) {
+      let tpLine = `    string s_tp = ',"takeProfits":['`;
+      for (let i = 0; i < wt_tranches.length; i++) {
+        const { n, pct } = wt_tranches[i];
+        if (i > 0) tpLine += ` + ','`;
+        tpLine += ` + '{"price":' + str.tostring(tp${n}, "#.####") + ',"portfolio":${formatFrac(pct / 100)}}'`;
+      }
+      tpLine += ` + ']'`;
+      push(tpLine);
+    }
+
+    if (wt_hasSl) {
+      push(`    string s_sl = ',"stopLoss":{"price":' + str.tostring(sl, "#.####") + '}'`);
+    }
+
+    if (wt_hasBe && wt_tranches.length > 0) {
+      const tp1Var = `tp${wt_tranches[0].n}`;
+      push(`    string s_be = ',"moveToBreakeven":{"activationPrice":' + str.tostring(${tp1Var}, "#.####") + ',"executePrice":' + str.tostring(close, "#.####") + '}'`);
+    }
+
+    const parts = ['s_code', 's_order'];
+    if (wt_tranches.length > 0)             parts.push('s_tp');
+    if (wt_hasSl)                           parts.push('s_sl');
+    if (wt_hasBe && wt_tranches.length > 0) parts.push('s_be');
+    push(`    ${parts.join(' + ')} + ',"placeConditionalOrdersOnExchange":true,"reduceOnly":true}'`);
+    push('');
+
+    // f_exit_json — direction-aware close payload.
+    push('f_exit_json(string dir, string reason) =>');
+    push('    bool is_l = dir == "long"');
+    push(`    '{"code":"' + (is_l ? i_codeExitLong : i_codeExitShort) + '","orderType":"market","reduceOnly":true}'`);
+    push('');
+
+    push('if goLong');
+    push('    alert(f_entry_json("long"),  alert.freq_once_per_bar_close)');
+    push('if goShort');
+    push('    alert(f_entry_json("short"), alert.freq_once_per_bar_close)');
+    push('if bar_exit and (bar_exit_reason == "Structural" or bar_exit_reason == "Time")');
+    push('    alert(f_exit_json(bar_exit_dir > 0 ? "long" : "short", bar_exit_reason), alert.freq_once_per_bar_close)');
+    push('');
+    push('alertcondition(goLong,   "Long Entry",   "Long entry opens new position")');
+    push('alertcondition(goShort,  "Short Entry",  "Short entry opens new position")');
+    push('alertcondition(bar_exit, "Position Exit","Position closed (any reason)")');
+    push('');
   }
-
-  if (wt_hasSl) {
-    push(`    string s_sl = ',"stopLoss":{"price":' + str.tostring(sl, "#.####") + '}'`);
-  }
-
-  if (wt_hasBe && wt_tranches.length > 0) {
-    const tp1Var = `tp${wt_tranches[0].n}`;
-    push(`    string s_be = ',"moveToBreakeven":{"activationPrice":' + str.tostring(${tp1Var}, "#.####") + ',"executePrice":' + str.tostring(close, "#.####") + '}'`);
-  }
-
-  // Return expression — concatenate parts + fixed tail.
-  const parts = ['s_code', 's_order'];
-  if (wt_tranches.length > 0)             parts.push('s_tp');
-  if (wt_hasSl)                           parts.push('s_sl');
-  if (wt_hasBe && wt_tranches.length > 0) parts.push('s_be');
-  push(`    ${parts.join(' + ')} + ',"placeConditionalOrdersOnExchange":true,"reduceOnly":true}'`);
-  push('');
-
-  // f_exit_json — minimal close payload for structural / time exits.
-  // TPs/SLs are exchange conditional orders; reversals use swing mode.
-  // Direction-aware: uses exit-long or exit-short code so Wundertrading
-  // routes the close to the correct bot action.
-  push('f_exit_json(string dir, string reason) =>');
-  push('    bool is_l = dir == "long"');
-  push(`    '{"code":"' + (is_l ? i_codeExitLong : i_codeExitShort) + '","orderType":"market","reduceOnly":true}'`);
-  push('');
-
-  push('if goLong');
-  push('    alert(f_entry_json("long"),  alert.freq_once_per_bar_close)');
-  push('if goShort');
-  push('    alert(f_entry_json("short"), alert.freq_once_per_bar_close)');
-  // Exit alerts: only structural/time. TP/SL = exchange conditional
-  // orders, reversals = handled by the entry alert via swing mode.
-  push('if bar_exit and (bar_exit_reason == "Structural" or bar_exit_reason == "Time")');
-  push('    alert(f_exit_json(bar_exit_dir > 0 ? "long" : "short", bar_exit_reason), alert.freq_once_per_bar_close)');
-  push('');
-  push('alertcondition(goLong,   "Long Entry",   "Long entry opens new position")');
-  push('alertcondition(goShort,  "Short Entry",  "Short entry opens new position")');
-  push('alertcondition(bar_exit, "Position Exit","Position closed (any reason)")');
-  push('');
 
   if (regimeName) {
     // Passive surfacing: plot regime label in the upper-left info box.
@@ -655,75 +676,89 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titl
     push(`    table.cell(regimeTbl, 0, 0, "regime: " + str.tostring(${regimeName}), text_color=color.white, text_size=size.small)`);
   }
 
-  // ─── Strategy execution ──────────────────────────────────────
-  // strategy.entry/exit/close calls for TradingView's strategy tester.
-  // These run in parallel with the exit state machine (which drives
-  // visualization + Wundertrading alerts). Small discrepancies between
-  // the two are acceptable: the state machine uses close-based SL with
-  // 1-bar defer and closes the full position on first TP (v1
-  // simplification), while the strategy tester uses intra-bar stops
-  // and proper multi-TP scale-out via strategy.exit(qty_percent).
-  push('');
-  push('// ============ STRATEGY EXECUTION ============');
+  // ─── Strategy execution (strategy mode only) ───────────────────
+  if (isStrategy) {
+    // strategy.entry/exit/close calls for TradingView's strategy tester.
+    // These run in parallel with the exit state machine (which drives
+    // visualization + Wundertrading alerts). Small discrepancies between
+    // the two are acceptable: the state machine uses close-based SL with
+    // 1-bar defer and closes the full position on first TP (v1
+    // simplification), while the strategy tester uses intra-bar stops
+    // and proper multi-TP scale-out via strategy.exit(qty_percent).
+    push('');
+    push('// ============ STRATEGY EXECUTION ============');
 
-  // Track entry prices independently of the exit state machine, which
-  // resets pos_entry/pos_entry_atr on first TP hit. The strategy needs
-  // these prices to stay valid for the remaining partial position.
-  push('var float strat_entry  = na');
-  if (wt_hasTp) push('var float strat_atr_tp = na');
-  if (wt_hasSl) push('var float strat_atr_hs = na');
+    // Track entry prices independently of the exit state machine, which
+    // resets pos_entry/pos_entry_atr on first TP hit. The strategy needs
+    // these prices to stay valid for the remaining partial position.
+    push('var float strat_entry  = na');
+    if (wt_hasTp) push('var float strat_atr_tp = na');
+    if (wt_hasSl) push('var float strat_atr_hs = na');
 
-  push('if goLong or goShort');
-  push('    strat_entry := close');
-  if (wt_hasTp) push(`    strat_atr_tp := nz(atr_${idSfx(wt_tg.params.atrLen)}[1])`);
-  if (wt_hasSl) push(`    strat_atr_hs := nz(atr_${idSfx(wt_hs.params.atrLen)}[1])`);
+    push('if goLong or goShort');
+    push('    strat_entry := close');
+    if (wt_hasTp) push(`    strat_atr_tp := nz(atr_${idSfx(wt_tg.params.atrLen)}[1])`);
+    if (wt_hasSl) push(`    strat_atr_hs := nz(atr_${idSfx(wt_hs.params.atrLen)}[1])`);
 
-  push('if goLong');
-  push('    strategy.entry("Long", strategy.long)');
-  push('if goShort');
-  push('    strategy.entry("Short", strategy.short)');
-  push('');
-
-  // TP exits — each tranche gets its own strategy.exit with adjusted
-  // qty_percent. TradingView's qty_percent is of the CURRENT position
-  // (not the original), so we adjust: tranche_pct / remaining * 100.
-  if (wt_tranches.length > 0 || wt_hasSl) {
-    // Compute adjusted qty_percent at codegen time (tranches are frozen literals).
-    let remaining = 100;
-    const adjTranches = wt_tranches.map((t, i) => {
-      const adj = i === wt_tranches.length - 1
-        ? 100  // last tranche always closes remaining
-        : Math.round(t.pct / remaining * 10000) / 100;
-      remaining -= t.pct;
-      return { ...t, adjPct: adj };
-    });
-
-    // Long exits
-    push('if strategy.position_size > 0');
-    for (const { n, mult, adjPct } of adjTranches) {
-      push(`    strategy.exit("TP${n}", "Long", qty_percent=${adjPct}, limit=strat_entry + strat_atr_tp * ${mult})`);
+    // Position sizing: Van Tharp ATR-risk formula (matches GA engine).
+    // qty = (equity × riskPct / 100) / (ATR × atrSL)
+    // Uses the hardStop block's ATR and atrSL for stop distance.
+    const riskPct = hydrated.sizing?.params?.riskPct;
+    if (riskPct != null && wt_hasSl) {
+      push('');
+      push(`float strat_risk = strategy.equity * ${riskPct} / 100`);
+      push(`float strat_stop = strat_atr_hs * ${wt_hs.params.atrSL}`);
+      push('float strat_qty  = strat_stop > 0 ? strat_risk / strat_stop : 0');
     }
-    if (wt_hasSl) {
-      push(`    strategy.exit("SL", "Long", stop=strat_entry - strat_atr_hs * ${wt_hs.params.atrSL})`);
+    const qtyArg = (riskPct != null && wt_hasSl) ? ', qty=strat_qty' : '';
+
+    push('if goLong and in_date_range');
+    push(`    strategy.entry("Long", strategy.long${qtyArg})`);
+    push('if goShort and in_date_range');
+    push(`    strategy.entry("Short", strategy.short${qtyArg})`);
+    push('');
+
+    // TP exits — each tranche gets its own strategy.exit with adjusted
+    // qty_percent. TradingView's qty_percent is of the CURRENT position
+    // (not the original), so we adjust: tranche_pct / remaining * 100.
+    if (wt_tranches.length > 0 || wt_hasSl) {
+      // Compute adjusted qty_percent at codegen time (tranches are frozen literals).
+      let remaining = 100;
+      const adjTranches = wt_tranches.map((t, i) => {
+        const adj = i === wt_tranches.length - 1
+          ? 100  // last tranche always closes remaining
+          : Math.round(t.pct / remaining * 10000) / 100;
+        remaining -= t.pct;
+        return { ...t, adjPct: adj };
+      });
+
+      // Long exits
+      push('if strategy.position_size > 0');
+      for (const { n, mult, adjPct } of adjTranches) {
+        push(`    strategy.exit("TP${n}", "Long", qty_percent=${adjPct}, limit=strat_entry + strat_atr_tp * ${mult})`);
+      }
+      if (wt_hasSl) {
+        push(`    strategy.exit("SL", "Long", stop=strat_entry - strat_atr_hs * ${wt_hs.params.atrSL})`);
+      }
+
+      // Short exits
+      push('if strategy.position_size < 0');
+      for (const { n, mult, adjPct } of adjTranches) {
+        push(`    strategy.exit("TP${n}", "Short", qty_percent=${adjPct}, limit=strat_entry - strat_atr_tp * ${mult})`);
+      }
+      if (wt_hasSl) {
+        push(`    strategy.exit("SL", "Short", stop=strat_entry + strat_atr_hs * ${wt_hs.params.atrSL})`);
+      }
+      push('');
     }
 
-    // Short exits
-    push('if strategy.position_size < 0');
-    for (const { n, mult, adjPct } of adjTranches) {
-      push(`    strategy.exit("TP${n}", "Short", qty_percent=${adjPct}, limit=strat_entry - strat_atr_tp * ${mult})`);
-    }
-    if (wt_hasSl) {
-      push(`    strategy.exit("SL", "Short", stop=strat_entry + strat_atr_hs * ${wt_hs.params.atrSL})`);
-    }
+    // Structural / Time exits — close the entire remaining position.
+    // Reversals don't need strategy.close: strategy.entry in the opposite
+    // direction auto-closes the current position (pyramiding=0).
+    push('if bar_exit and (bar_exit_reason == "Structural" or bar_exit_reason == "Time")');
+    push('    strategy.close_all(comment=bar_exit_reason)');
     push('');
   }
-
-  // Structural / Time exits — close the entire remaining position.
-  // Reversals don't need strategy.close: strategy.entry in the opposite
-  // direction auto-closes the current position (pyramiding=0).
-  push('if bar_exit and (bar_exit_reason == "Structural" or bar_exit_reason == "Time")');
-  push('    strategy.close_all(comment=bar_exit_reason)');
-  push('');
 
   return {
     source: lines.join('\n') + '\n',
