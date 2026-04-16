@@ -1432,17 +1432,18 @@ Motivated by run #58 analysis: IS PF=11, OOS WFE=12.8%, only ~45 real
 entry decisions with 22 free parameters. The GA was curve-fitting because
 it had zero out-of-sample pressure during evolution.
 
-##### ✅ 4.9a — GA train/test split (`gaOosRatio`) — done.
+##### ✅ 4.9a — GA train/test split (`gaOosRatio`) — disabled by default.
 
-During GA evolution, the full bar range is used for indicator computation
-and position management, but fitness metrics (trades, PF, DD, return,
-regime breakdown) only accumulate from trades whose exit bar falls in
-the last `gaOosRatio` fraction of the data (default 30%). The GA scores
-genes on data it never optimized against.
+Mechanism still available (`spec.fitness.gaOosRatio > 0`) but **default
+changed to 0** (disabled). The split only shrinks the training set —
+the GA overfits to whichever narrow time window the OOS portion covers,
+producing strategies that look great on 30% of data but collapse on the
+full period. The walk-forward report + regime gate are more principled
+overfitting guards and remain active.
 
-- `spec.fitness.gaOosRatio` (default 0.3, set 0 to disable)
+- `spec.fitness.gaOosRatio` (default **0**, set >0 to enable)
 - `fitnessStartBar` computed in runner, passed to island-worker → runtime
-- Post-GA: winning gene re-evaluated on full data for stored `bestMetrics`
+- Post-GA: ALL top results re-evaluated on full data (not just the winner)
 - WF unaffected (has its own IS/OOS slicing)
 
 ##### ✅ 4.9a — minTradesPerWindow counts positions, not sub-trades — done.

@@ -88,8 +88,11 @@ export const DEFAULT_FITNESS = Object.freeze({
   // GA train/test split: fraction of bars reserved for out-of-sample scoring.
   // During GA evolution, indicators compute on ALL bars but fitness metrics
   // only accumulate from trades whose exit bar falls in the last `gaOosRatio`
-  // of the data. Set 0 to disable (score on full data as before).
-  gaOosRatio: 0.3,
+  // of the data. Set 0 to disable (score on full data).
+  // DEFAULT 0 (disabled) — the split just shrinks the training set and
+  // causes the GA to overfit to a narrow time window. The walk-forward
+  // report + regime gate are the principled overfitting guards.
+  gaOosRatio: 0,
   // Trade frequency scaling: soft multiplier that rewards strategies with
   // more positions. freq = min(1, positions / frequencyTarget). The
   // composite score is multiplied by freq, so a strategy with 50 positions
