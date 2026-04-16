@@ -1201,11 +1201,20 @@ them as conditional orders on the exchange.
 **Why now:** this is the only remaining code change needed for a working
 end-to-end flow: optimizer → Pine → TV alert → Wundertrading → exchange.
 
+**Wundertrading auth model (confirmed from live bot setup):**
+- Webhook URL is **public & shared**: `https://wtalerts.com/bot/trading_view`
+- Routing is via the `code` field — each action gets a unique bot-specific
+  token string, e.g. `ENTER-LONG_BingX_BTC-USDT_BING-BTC-BOT-v1_4H_<hex>`.
+- **5 tokens** per bot: enter-long, exit-long, enter-short, exit-short,
+  exit-all. Each must be pasted into the corresponding Pine input.
+- Alert frequency: `alert.freq_once_per_bar_close` (signals confirmed at
+  bar close, matching the backtest model).
+
 **Wundertrading JSON spec** (from their Signal Bot Comprehensive JSON
 Guide):
 ```json
 {
-  "code": "ENTER-LONG",
+  "code": "ENTER-LONG_BingX_BTC-USDT_BOT-v1_4H_73d1023004fc171b0035091b",
   "orderType": "market",
   "amountPerTradeType": "percents",
   "amountPerTrade": 0.1,
@@ -1225,13 +1234,13 @@ Guide):
 }
 ```
 
-Key fields: `code` = bot trigger comment; `takeProfits` = array of up
-to 6 levels with absolute prices + portfolio fraction (0,1] to close;
-`stopLoss` = single level with absolute price; `moveToBreakeven` =
-when `activationPrice` is reached (= TP1 level), SL shifts to
-`executePrice` (= entry price, i.e. breakeven) — the exchange handles
-this atomically so the remaining position is risk-free after the first
-TP fills; `reduceOnly` = safety flag preventing accidental position
+Key fields: `code` = bot-specific token (acts as auth + routing);
+`takeProfits` = array of up to 6 levels with absolute prices + portfolio
+fraction (0,1] to close; `stopLoss` = single level with absolute price;
+`moveToBreakeven` = when `activationPrice` is reached (= TP1 level), SL
+shifts to `executePrice` (= entry price, i.e. breakeven) — the exchange
+handles this atomically so the remaining position is risk-free after the
+first TP fills; `reduceOnly` = safety flag preventing accidental position
 opens. Wundertrading supports `placeConditionalOrdersOnExchange: true`
 which places TPs/SLs/moveToBreakeven as actual orders on the exchange
 (not just server-side monitoring).
@@ -1242,11 +1251,13 @@ which places TPs/SLs/moveToBreakeven as actual orders on the exchange
     Wundertrading `amountPerTrade` with `amountPerTradeType: "percents"`
     (0.1 = 10%).
   - `i_leverage` (int, default 1) — leverage multiplier [1, 125].
-  - `i_codeLong` (string, default `"ENTER-LONG"`) — Wundertrading bot
-    comment code for long entries.
-  - `i_codeShort` (string, default `"ENTER-SHORT"`) — code for short entries.
-  - `i_codeExit` (string, default `"EXIT-ALL"`) — code for structural /
-    time exits. TPs/SLs don't use this — they're exchange-side.
+  - `i_codeLong` (string, empty default) — Wundertrading bot token for
+    long entries. User pastes from bot settings: Enter Long Comment.
+  - `i_codeExitLong` (string, empty default) — token for closing longs.
+  - `i_codeShort` (string, empty default) — token for short entries.
+  - `i_codeExitShort` (string, empty default) — token for closing shorts.
+  - `i_codeExitAll` (string, empty default) — token for closing all.
+    All 5 tokens are bot-specific strings from Wundertrading settings.
 - **Refactored `f_entry_json(dir)`** — multi-line Pine function that
   builds the Wundertrading JSON:
   - Computes `is_long` from `dir` parameter.
@@ -1272,9 +1283,10 @@ which places TPs/SLs/moveToBreakeven as actual orders on the exchange
     `leverage: i_leverage`, `takeProfits: [...]`, `stopLoss: {price: ...}`,
     `moveToBreakeven: {activationPrice, executePrice}`,
     `placeConditionalOrdersOnExchange: true`, `reduceOnly: true`.
-- **Refactored `f_exit_json(dir, reason)`** — minimal close payload:
-  `{"code":"<i_codeExit>","orderType":"market","reduceOnly":true}`.
-  Only fired for exits that exchange conditional orders can't handle.
+- **Refactored `f_exit_json(dir, reason)`** — minimal close payload,
+  direction-aware: uses `i_codeExitLong` or `i_codeExitShort` based on
+  the position being closed. Only fired for exits that exchange
+  conditional orders can't handle.
 - **Exit alert gating:** `alert(f_exit_json(...))` fires ONLY when
   `bar_exit_reason` is `"Structural"`, `"Time"`, or `"Reversal"` —
   NOT for `"TP1"`/`"TP2"`/`"TP3"`/`"SL"`/`"ESL"` (those are handled
@@ -1320,12 +1332,12 @@ way this is a small follow-up, not blocking.
   percentage-based, not ATR-based — format mismatch with our
   `structuralExit` block)
 
-**Gate (`scripts/pine-wundertrading-check.js`) — 74/74 ✓:**
+**Gate (`scripts/pine-wundertrading-check.js`) — 76/76 ✓:**
 - [1] **Codegen output**: generate Pine from the migration-gate spec +
   a random gene (same fixture pattern as `ui-pine-export-check.js`). Verify:
   - New inputs present in Webhook group: `i_posSize`, `i_leverage`,
-    `i_codeLong`, `i_codeShort`, `i_codeExit` with correct types and
-    defaults.
+    `i_codeLong`, `i_codeExitLong`, `i_codeShort`, `i_codeExitShort`,
+    `i_codeExitAll` — all with empty defaults (user pastes bot tokens).
   - `f_entry_json` contains Wundertrading fields: `code`, `orderType`,
     `amountPerTradeType`, `amountPerTrade`, `leverage`, `takeProfits`,
     `stopLoss`, `moveToBreakeven`, `placeConditionalOrdersOnExchange`,
