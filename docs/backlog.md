@@ -1176,6 +1176,18 @@ as a secret; Wundertrading's per-bot capital limits cap blast radius.
 The 4.7a webhook receiver remains available as an optional parallel
 logging endpoint (TV supports multiple webhook URLs per alert).
 
+**Deployment topology:** 1 Wundertrading Signal Bot per strategy,
+connected to exactly 1 exchange sub-account, with at most 1 open
+trade at any time. Consequences:
+- **Portfolio field is moot** — every TP closes the full position
+  (`portfolio: 1`). The multi-TP ladder becomes "whichever level
+  price reaches first, close everything" — matches our Pine v1
+  simplification.
+- **Sizing is trivial** — `amountPerTrade` as a fraction applies to
+  a dedicated sub-account. No cross-strategy margin math.
+- **P&L attribution is automatic** — one sub-account per strategy
+  means exchange-level P&L *is* strategy-level P&L.
+
 ##### 4.7b (revised) — Wundertrading-compatible Pine alert payloads
 
 **Goal:** update `engine/pine-codegen.js` so generated indicators emit
@@ -1197,9 +1209,9 @@ Guide):
   "amountPerTrade": 0.1,
   "leverage": 5,
   "takeProfits": [
-    {"price": 148.50, "portfolio": 0.33},
-    {"price": 155.00, "portfolio": 0.33},
-    {"price": 162.00, "portfolio": 0.34}
+    {"price": 148.50, "portfolio": 1},
+    {"price": 155.00, "portfolio": 1},
+    {"price": 162.00, "portfolio": 1}
   ],
   "stopLoss": {"price": 138.00},
   "placeConditionalOrdersOnExchange": true,
@@ -1232,8 +1244,9 @@ actual orders on the exchange (not just server-side monitoring).
     (`nz(atr_<len>[1])` — prior bar's ATR, matching the backtest's
     fill-at-next-bar-open convention).
   - Computes TP prices: for each active tranche (tpNPct > 0),
-    `close ± ATR × tpNMult`. Tranche mults and pcts are frozen from the
-    gene as numeric literals. Portfolio fractions = `tpNPct / 100`.
+    `close ± ATR × tpNMult`. Tranche mults are frozen from the gene
+    as numeric literals. All TPs use `portfolio: 1` (full-close on
+    first hit — 1 bot / 1 sub-account / max 1 trade topology).
   - Computes SL price: `close ∓ ATR × atrSL` from the hardStop block.
   - Assembles JSON: `code`, `orderType: "market"`,
     `amountPerTradeType: "percents"`, `amountPerTrade: i_posSize`,
@@ -1301,7 +1314,7 @@ way this is a small follow-up, not blocking.
   - SL price uses correct formula: long = `close - ATR × atrSL`,
     short = `close + ATR × atrSL`.
   - Only active tranches (tpNPct > 0) emitted in the TP array.
-  - Portfolio fractions sum to ≤ 1.0 (normalized from gene's pct values).
+  - All TPs use `portfolio: 1` (full-close-on-first-hit topology).
 - [2] **Exit alert gating**: verify `alert(f_exit_json(...))` is guarded
   by `bar_exit_reason` check — fires for Structural/Time/Reversal, NOT
   for TP/SL/ESL.
@@ -1313,11 +1326,6 @@ way this is a small follow-up, not blocking.
   still render on the chart regardless of alert format.
 
 **Risks:**
-- **Wundertrading `portfolio` field semantics**: we assume it's the
-  fraction of the ORIGINAL position to close at each TP level. If it's
-  the fraction of the REMAINING position, the math differs (our TP3 at
-  34% of original would need to be 100% of remaining after TP1+TP2
-  close 66%). Verify with a test trade before going live.
 - **ATR[1] lag**: the ATR value for TP/SL computation is the prior
   bar's ATR (`nz(atr_<len>[1])`), same offset the backtest runtime
   uses for fill-at-next-bar-open. If the alert fires at bar close,
