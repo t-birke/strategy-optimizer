@@ -561,13 +561,20 @@ function renderPlanetGrid(msg, svg, numPlanets, numIslandsPerPlanet) {
   const planetMeta = msg.planets || [];
   const planetData = Array.from({ length: numPlanets }, (_, p) => {
     const planetIslands = msg.islands.filter(isl => (isl.planetIdx ?? Math.floor(isl.idx / numIslandsPerPlanet)) === p);
-    let bestProfit = null, bestTrades = null, bestPf = null, maxGen = 0;
+    let bestProfit = null, bestTrades = null, bestPf = null, bestScore = null, bestFreqFactor = null;
+    let maxGen = 0;
     let maxHyperActive = 0, hyperSource = null;
     for (const isl of planetIslands) {
-      if (isl.profit != null && (bestProfit == null || isl.profit > bestProfit)) {
+      // Pick planet leader by fitness score when available, fall back to profit
+      const islScore = isl.score;
+      const isBetter = islScore != null
+        ? (bestScore == null || islScore > bestScore)
+        : (isl.profit != null && (bestProfit == null || isl.profit > bestProfit));
+      if (isBetter) {
         bestProfit = isl.profit;
         bestTrades = isl.trades;
         bestPf = isl.pf;
+        bestScore = islScore;
       }
       if (isl.gen != null && isl.gen > maxGen) maxGen = isl.gen;
       if ((isl.hyperActive ?? 0) > maxHyperActive) {
@@ -575,9 +582,14 @@ function renderPlanetGrid(msg, svg, numPlanets, numIslandsPerPlanet) {
         hyperSource = isl.hyperSource;
       }
     }
+    // Planet-level score/freqFactor from runner (more authoritative than
+    // island-level when present, since runner picks the planet best by
+    // full GA fitness including cache).
     const meta = planetMeta[p] || {};
+    if (meta.score != null) bestScore = meta.score;
+    if (meta.freqFactor != null) bestFreqFactor = meta.freqFactor;
     return {
-      p, islands: planetIslands, bestProfit, bestTrades, bestPf, maxGen,
+      p, islands: planetIslands, bestProfit, bestTrades, bestPf, bestScore, bestFreqFactor, maxGen,
       maxHyperActive, hyperSource,
       mutationRate: meta.mutationRate ?? null,
       perGeneMut: meta.perGeneMut ?? null,
@@ -586,11 +598,13 @@ function renderPlanetGrid(msg, svg, numPlanets, numIslandsPerPlanet) {
     };
   });
 
-  // Find global best planet
-  let globalBestP = 0, globalBestProfit = -Infinity;
+  // Find global best planet — prefer fitness score, fall back to raw profit.
+  let globalBestP = 0, globalBestVal = -Infinity;
+  const hasFitnessScores = planetData.some(pd => pd.bestScore != null);
   for (const pd of planetData) {
-    if (pd.bestProfit != null && pd.bestProfit > globalBestProfit) {
-      globalBestProfit = pd.bestProfit;
+    const val = hasFitnessScores ? (pd.bestScore ?? -Infinity) : (pd.bestProfit ?? -Infinity);
+    if (val > globalBestVal) {
+      globalBestVal = val;
       globalBestP = pd.p;
     }
   }
@@ -668,10 +682,20 @@ function renderPlanetGrid(msg, svg, numPlanets, numIslandsPerPlanet) {
       html += `<text x="${badgeX + badgeW/2}" y="${badgeY + 10}" text-anchor="middle" fill="#d2a8ff" font-size="9" font-weight="700" font-family="monospace">⚡ ${label} ${pd.maxHyperActive}/5</text>`;
     }
 
-    // Trades + PF
-    const statsStr = pd.bestTrades != null
-      ? `${pd.bestTrades} trades${pd.bestPf != null ? '  ·  PF ' + pd.bestPf.toFixed(2) : ''}`
-      : 'Warming up…';
+    // Trades + PF + Fitness score
+    let statsStr;
+    if (pd.bestTrades != null) {
+      statsStr = `${pd.bestTrades} trades`;
+      if (pd.bestPf != null) statsStr += `  ·  PF ${pd.bestPf.toFixed(2)}`;
+      if (pd.bestScore != null) {
+        const ff = pd.bestFreqFactor != null && pd.bestFreqFactor < 1
+          ? ` (×${pd.bestFreqFactor.toFixed(2)})`
+          : '';
+        statsStr += `  ·  F ${pd.bestScore.toFixed(2)}${ff}`;
+      }
+    } else {
+      statsStr = 'Warming up…';
+    }
     html += `<text x="${x + cellW/2}" y="${y+99}" text-anchor="middle" fill="#6e7681" font-size="10">${statsStr}</text>`;
 
     // Island dots — arranged in 1 or 2 rows to keep them readable
