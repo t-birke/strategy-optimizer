@@ -864,11 +864,12 @@ export async function runOptimization(config) {
   await Promise.all(workers.map(w => w.terminate()));
 
   // 7. Merge results across all workers
-
-  let finalBest = { fitness: -Infinity };
-  for (const r of finalResults) {
-    if (r.best.fitness > finalBest.fitness) finalBest = r.best;
-  }
+  //
+  // Build topResults from the CACHE (all evaluations ever), not just the
+  // current GA population. The population can lose a good gene to
+  // crossover/mutation, so the cache is the authoritative ranking.
+  // finalBest is then picked from topResults[0] to guarantee consistency
+  // between the stored winner and the ranking table.
 
   const seen = new Set();
   const topResults = finalResults
@@ -887,23 +888,39 @@ export async function runOptimization(config) {
       return { gene, fitness: r.fitness, metrics: r.metrics };
     });
 
+  // Pick finalBest from topResults (cache-sourced) when available, falling
+  // back to the population best for legacy mode or empty-cache edge cases.
+  let finalBest = { fitness: -Infinity };
+  if (topResults.length > 0) {
+    finalBest = topResults[0];
+  } else {
+    for (const r of finalResults) {
+      if (r.best.fitness > finalBest.fitness) finalBest = r.best;
+    }
+  }
+
   const totalEvaluations = finalResults.reduce((sum, r) => sum + r.evalCount, 0);
   const totalCacheSize = finalResults.reduce((sum, r) => sum + r.cacheSize, 0);
 
-  // When a GA OOS split was active (fitnessStartBar > 0), the winner's
-  // metrics reflect only the OOS portion. Re-evaluate on the FULL data so
-  // the stored bestMetrics are the complete backtest the user sees on the
-  // detail page. The GA fitness score (bestScore) remains from the OOS run.
-  if (specMode && fitnessStartBar > 0 && finalBest.gene) {
-    try {
-      const fullBundle = { base: candles, tradingStartBar, periodYears: periodYears ?? 0 };
-      const fullMetrics = runSpec({ spec, paramSpace, bundle: fullBundle, gene: finalBest.gene });
-      // Re-stamp fitness breakdown (computed on full data for display)
-      fullMetrics._fitness = finalBest.metrics?._fitness ?? null;
-      finalBest.metrics = fullMetrics;
-    } catch (err) {
-      console.warn(`[runner] Full-data re-eval failed, keeping OOS metrics: ${err.message}`);
+  // When a GA OOS split was active (fitnessStartBar > 0), the cached
+  // metrics reflect only the OOS portion. Re-evaluate ALL top results on
+  // the FULL data so the stored bestMetrics AND the ranking table show the
+  // complete backtest. GA fitness scores (used for ranking) are kept from
+  // the OOS run — only the display metrics change.
+  if (specMode && fitnessStartBar > 0) {
+    const fullBundle = { base: candles, tradingStartBar, periodYears: periodYears ?? 0 };
+    for (const entry of topResults) {
+      if (!entry.gene) continue;
+      try {
+        const fullMetrics = runSpec({ spec, paramSpace, bundle: fullBundle, gene: entry.gene });
+        // Preserve the OOS fitness breakdown for display/diagnostics.
+        fullMetrics._fitness = entry.metrics?._fitness ?? null;
+        entry.metrics = fullMetrics;
+      } catch (err) {
+        console.warn(`[runner] Full-data re-eval failed for a top gene, keeping OOS metrics: ${err.message}`);
+      }
     }
+    // finalBest points into topResults[0], so it's already updated.
   }
 
   // ─── Phase 4.1b: post-GA walk-forward on the winner ─────────
