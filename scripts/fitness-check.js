@@ -161,7 +161,7 @@ console.log('\n[7] computeFitness — minTradesPerWindow gate');
   assertTrue('eliminated', r.eliminated);
   assertEq('gatesFailed = [trades]', r.gatesFailed, ['trades']);
   assertTrue('score = ELIMINATED_SCORE', r.score === ELIMINATED_SCORE);
-  assertTrue('reason mentions trades', r.reason?.includes('trades='));
+  assertTrue('reason mentions positions', r.reason?.includes('positions='));
   console.log('    reason:', r.reason);
 }
 

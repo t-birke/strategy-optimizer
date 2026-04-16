@@ -102,6 +102,12 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
   const len    = base.close.length;
   const startBar = bundle.tradingStartBar ?? 0;
 
+  // GA train/test split: if fitnessStartBar is set, fitness metrics only
+  // accumulate from trades whose exit bar >= fitnessStartBar. The bar loop
+  // still runs from startBar (indicators + positions need full history),
+  // but the reported metrics reflect only the OOS portion.
+  const fitnessStartBar = opts.fitnessStartBar ?? 0;
+
   let equity      = initialCapital;
   let peakEquity  = initialCapital;
   let maxDD       = 0;
@@ -112,8 +118,9 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
   let pendingEntry = null;     // { isLong } — fills next bar
   let pendingClose = null;     // { signal } — fills next bar's open with slippage
 
-  // Metrics accumulators
+  // Metrics accumulators (only OOS trades when fitnessStartBar > 0)
   let totalTrades = 0;
+  let totalPositions = 0;
   let wins = 0;
   let grossProfit = 0;
   let grossLoss = 0;
@@ -168,13 +175,19 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
       ? sub.units * (exitPrice - entryPrice) - entryComm - exitComm
       : sub.units * (entryPrice - exitPrice) - entryComm - exitComm;
 
+    // Equity ALWAYS updates (positions opened in IS still affect the account
+    // balance during OOS), but fitness metrics only count OOS exits.
     equity += pnl;
     if (equity < 0) equity = 0;
     sub.closed = true;
-    totalTrades++;
-    if (pnl > 0) { wins++; grossProfit += pnl; }
-    else         { grossLoss += Math.abs(pnl); }
-    tradeReturns.push(pnl / initialCapital);
+
+    const inFitnessRegion = exitBar >= fitnessStartBar;
+    if (inFitnessRegion) {
+      totalTrades++;
+      if (pnl > 0) { wins++; grossProfit += pnl; }
+      else         { grossLoss += Math.abs(pnl); }
+      tradeReturns.push(pnl / initialCapital);
+    }
 
     // Update sizing-stats accumulator ----
     sizingStats.tradeCount++;
@@ -200,8 +213,8 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
 
     // Per-regime tally — use the regime AT ENTRY so we measure
     // "how does the strategy perform in regime X" rather than splitting
-    // a trade across regime changes.
-    if (position.entryRegime !== undefined) {
+    // a trade across regime changes. Only count OOS trades.
+    if (inFitnessRegion && position.entryRegime !== undefined) {
       const r = recordRegime(position.entryRegime ?? '_unknown');
       r.trades++;
       if (pnl > 0) { r.wins++; r.grossProfit += pnl; }
@@ -319,6 +332,10 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
       entryRisk,
     });
 
+    // Count position opens in the fitness region (used for the
+    // minTradesPerWindow gate which counts positions, not sub-exits).
+    if (atBar >= fitnessStartBar) totalPositions++;
+
     // Optional: target block splits the position into tranches.
     const target = slots.exits?.target;
     if (target?.block?.onPositionOpen) {
@@ -344,8 +361,21 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
     return slots.regime.block.onBar(bundle, i, slots.regime.state, slots.regime.params) ?? null;
   }
 
+  // OOS equity snapshot — captured once at the first fitness-region bar.
+  // Used to compute netProfitPct relative to the OOS starting equity
+  // (not initialCapital) when a train/test split is active.
+  let oosEquityStart = fitnessStartBar <= startBar ? initialCapital : null;
+
   // ─── 5. Main bar loop ──────────────────────────────────
   for (let i = startBar; i < len; i++) {
+    // Snapshot OOS starting equity the first time we enter the fitness region.
+    if (oosEquityStart === null && i >= fitnessStartBar) {
+      oosEquityStart = equity;
+      // Reset DD tracking so it measures OOS drawdown only.
+      peakEquity = equity;
+      maxDD = 0;
+      maxDDPct = 0;
+    }
     const o = base.open[i];
     const c = base.close[i];
 
@@ -490,8 +520,13 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
   // ─── 7. Compute final metrics ──────────────────────────
   const winRate = totalTrades > 0 ? wins / totalTrades : 0;
   const pf = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? Infinity : 0;
-  const netProfit    = equity - initialCapital;
-  const netProfitPct = netProfit / initialCapital;
+
+  // When a GA train/test split is active (fitnessStartBar > 0), compute
+  // netProfit relative to the equity at OOS start, not initialCapital.
+  // This gives a meaningful "return during OOS" metric.
+  const oosBase = oosEquityStart ?? initialCapital;
+  const netProfit    = equity - oosBase;
+  const netProfitPct = oosBase > 0 ? netProfit / oosBase : 0;
 
   let sharpe = 0;
   if (tradeReturns.length > 1) {
@@ -517,6 +552,7 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
 
   return {
     trades: totalTrades,
+    totalPositions,
     wins,
     winRate,
     pf,

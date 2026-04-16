@@ -85,6 +85,11 @@ export const DEFAULT_FITNESS = Object.freeze({
   weights: { pf: 0.5, dd: 0.3, ret: 0.2 },
   caps:    { pf: 4.0, ret: 2.0 },
   gates:   { minTradesPerWindow: 30, worstRegimePfFloor: 1.0, wfeMin: 0.5 },
+  // GA train/test split: fraction of bars reserved for out-of-sample scoring.
+  // During GA evolution, indicators compute on ALL bars but fitness metrics
+  // only accumulate from trades whose exit bar falls in the last `gaOosRatio`
+  // of the data. Set 0 to disable (score on full data as before).
+  gaOosRatio: 0.3,
 });
 
 export const DEFAULT_WALK_FORWARD = Object.freeze({
@@ -573,9 +578,10 @@ function normalizeSpec(spec) {
   clone.constraints ??= [];
 
   clone.fitness = {
-    weights: { ...DEFAULT_FITNESS.weights, ...(clone.fitness?.weights) },
-    caps:    { ...DEFAULT_FITNESS.caps,    ...(clone.fitness?.caps) },
-    gates:   { ...DEFAULT_FITNESS.gates,   ...(clone.fitness?.gates) },
+    weights:    { ...DEFAULT_FITNESS.weights, ...(clone.fitness?.weights) },
+    caps:       { ...DEFAULT_FITNESS.caps,    ...(clone.fitness?.caps) },
+    gates:      { ...DEFAULT_FITNESS.gates,   ...(clone.fitness?.gates) },
+    gaOosRatio: clone.fitness?.gaOosRatio ?? DEFAULT_FITNESS.gaOosRatio,
   };
   clone.walkForward = { ...DEFAULT_WALK_FORWARD, ...(clone.walkForward ?? {}) };
 

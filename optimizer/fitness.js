@@ -136,8 +136,13 @@ export function computeFitness({ metrics, fitnessConfig, wfReport = null }) {
   const gatesFailed = [];
 
   // 1. minTradesPerWindow — tradingless/near-tradingless genes out.
-  const trades = numberOr(metrics.trades, 0);
-  if (trades < (gates.minTradesPerWindow ?? 0)) {
+  //    The gate compares against totalPositions (full position opens)
+  //    rather than sub-trade count (which inflates with multi-TP exits).
+  //    This way "minTradesPerWindow: 30" means 30 actual entry decisions,
+  //    regardless of how many TP tranches each position has.
+  //    Falls back to metrics.trades for legacy runs lacking totalPositions.
+  const positions = numberOr(metrics.totalPositions, metrics.trades);
+  if (positions < (gates.minTradesPerWindow ?? 0)) {
     gatesFailed.push('trades');
   }
 
@@ -200,7 +205,7 @@ export function computeFitness({ metrics, fitnessConfig, wfReport = null }) {
       eliminated: true,
       gatesFailed,
       breakdown,
-      reason: formatReason(gatesFailed, { trades, worstRegimePf, wfe, gates }),
+      reason: formatReason(gatesFailed, { trades: positions, worstRegimePf, wfe, gates }),
     };
   }
 
@@ -369,7 +374,7 @@ function numberOr(v, fallback) {
 function formatReason(failed, ctx) {
   const parts = [];
   if (failed.includes('trades')) {
-    parts.push(`trades=${ctx.trades} < minTradesPerWindow=${ctx.gates.minTradesPerWindow}`);
+    parts.push(`positions=${ctx.trades} < minTradesPerWindow=${ctx.gates.minTradesPerWindow}`);
   }
   if (failed.includes('worstRegime')) {
     parts.push(

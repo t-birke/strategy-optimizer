@@ -38,6 +38,7 @@ import {
   mergeCaches,
 } from './fitness-cache.js';
 import { walkForward } from './walk-forward.js';
+import { runSpec } from '../engine/runtime.js';
 
 const MIN_TRADES = 10;
 const WORKER_URL = new URL('./island-worker.js', import.meta.url);
@@ -187,6 +188,19 @@ export async function runOptimization(config) {
   for (let i = 0; i < len; i++) {
     if (candles.ts[i] >= startTs) { tradingStartBar = i; break; }
   }
+
+  // GA train/test split: fitnessStartBar marks where the OOS (scoring)
+  // region begins.  Indicators compute on ALL bars; the bar loop runs
+  // from tradingStartBar; but fitness metrics only accumulate for trades
+  // whose exit bar >= fitnessStartBar.  Set gaOosRatio = 0 (or omit) to
+  // disable the split and score on the full data.
+  const gaOosRatio = specMode && spec?.fitness?.gaOosRatio > 0
+    ? spec.fitness.gaOosRatio
+    : 0;
+  const tradingBars = len - tradingStartBar;
+  const fitnessStartBar = gaOosRatio > 0
+    ? tradingStartBar + Math.floor(tradingBars * (1 - gaOosRatio))
+    : 0;
 
   if (len < 100) {
     throw new Error(`Insufficient data: ${len} bars for ${symbol} ${timeframe}min from ${startDate}`);
@@ -355,6 +369,7 @@ export async function runOptimization(config) {
         candleLength: len,
         candleCols: cols,
         tradingStartBar,
+        fitnessStartBar,
         populationSize,
         islands: myIslands,
         minTrades,
@@ -871,6 +886,22 @@ export async function runOptimization(config) {
 
   const totalEvaluations = finalResults.reduce((sum, r) => sum + r.evalCount, 0);
   const totalCacheSize = finalResults.reduce((sum, r) => sum + r.cacheSize, 0);
+
+  // When a GA OOS split was active (fitnessStartBar > 0), the winner's
+  // metrics reflect only the OOS portion. Re-evaluate on the FULL data so
+  // the stored bestMetrics are the complete backtest the user sees on the
+  // detail page. The GA fitness score (bestScore) remains from the OOS run.
+  if (specMode && fitnessStartBar > 0 && finalBest.gene) {
+    try {
+      const fullBundle = { base: candles, tradingStartBar, periodYears: periodYears ?? 0 };
+      const fullMetrics = runSpec({ spec, paramSpace, bundle: fullBundle, gene: finalBest.gene });
+      // Re-stamp fitness breakdown (computed on full data for display)
+      fullMetrics._fitness = finalBest.metrics?._fitness ?? null;
+      finalBest.metrics = fullMetrics;
+    } catch (err) {
+      console.warn(`[runner] Full-data re-eval failed, keeping OOS metrics: ${err.message}`);
+    }
+  }
 
   // ─── Phase 4.1b: post-GA walk-forward on the winner ─────────
   // Quantify how the shipped gene generalizes across time by freezing

@@ -35,6 +35,7 @@ import * as legacyParams from './params.js';
 
 const {
   candleBuffer, candleLength, candleCols, tradingStartBar,
+  fitnessStartBar = 0,
   populationSize,
   islands: islandConfigs,   // [{ islandIdx, mutationRate, perGeneMut }, ...]
   minTrades,
@@ -127,6 +128,10 @@ const specBundle = specMode
   ? { base: candles, tradingStartBar, periodYears: periodYears ?? 0 }
   : null;
 
+// GA train/test split: fitnessStartBar is passed via opts to runSpec.
+// When > 0, fitness metrics accumulate only for trades exiting after this bar.
+const specRunOpts = fitnessStartBar > 0 ? { fitnessStartBar } : {};
+
 /**
  * Build an isolated island runtime: its own GaIsland, fitness cache,
  * eval counter, and mutation operator.
@@ -177,7 +182,7 @@ function createIsland(cfg) {
     if (specMode) {
       let m;
       try {
-        m = runSpec({ spec, paramSpace, bundle: specBundle, gene });
+        m = runSpec({ spec, paramSpace, bundle: specBundle, gene, opts: specRunOpts });
       } catch (err) {
         // A spec-eval crash (bad gene values that slip past constraints,
         // missing block prepare, etc.) is treated as the worst possible

@@ -1426,6 +1426,52 @@ needed, but is not on the critical path.
 
 ---
 
+## 4.9 Anti-overfitting improvements
+
+Motivated by run #58 analysis: IS PF=11, OOS WFE=12.8%, only ~45 real
+entry decisions with 22 free parameters. The GA was curve-fitting because
+it had zero out-of-sample pressure during evolution.
+
+##### ✅ 4.9a — GA train/test split (`gaOosRatio`) — done.
+
+During GA evolution, the full bar range is used for indicator computation
+and position management, but fitness metrics (trades, PF, DD, return,
+regime breakdown) only accumulate from trades whose exit bar falls in
+the last `gaOosRatio` fraction of the data (default 30%). The GA scores
+genes on data it never optimized against.
+
+- `spec.fitness.gaOosRatio` (default 0.3, set 0 to disable)
+- `fitnessStartBar` computed in runner, passed to island-worker → runtime
+- Post-GA: winning gene re-evaluated on full data for stored `bestMetrics`
+- WF unaffected (has its own IS/OOS slicing)
+
+##### ✅ 4.9a — minTradesPerWindow counts positions, not sub-trades — done.
+
+Gate now uses `metrics.totalPositions` (position opens) instead of
+`metrics.trades` (sub-exits). With 3 TPs, `minTradesPerWindow: 30` now
+requires 30 actual entry decisions, not 10. Falls back to `metrics.trades`
+for legacy runs.
+
+##### 4.9b — Trade frequency scaling in composite (backlog)
+
+Add a soft multiplier to the composite fitness score that rewards more
+trades: `min(1.0, positions / targetPositions)`. A strategy with 50
+positions gets half credit; 100+ gets full. Creates continuous pressure
+toward more trades instead of a hard cliff at the gate.
+
+Potential config: `fitness.frequencyTarget` (default 100 positions).
+
+##### 4.9c — Complexity penalty (backlog)
+
+AIC/BIC-style penalty for high parameter count. The GA treats a
+5-parameter and 50-parameter spec identically — more free params means
+more room to overfit. A per-active-param tax on fitness would favor
+simpler strategies.
+
+Potential formula: `score *= 1 - complexityPenalty * activeParams / totalParams`
+
+---
+
 ## 5. Phase 5 — AI-powered strategy idea generator (parked)
 
 Separate effort. High-level vision:
