@@ -1452,14 +1452,23 @@ Gate now uses `metrics.totalPositions` (position opens) instead of
 requires 30 actual entry decisions, not 10. Falls back to `metrics.trades`
 for legacy runs.
 
-##### 4.9b — Trade frequency scaling in composite (backlog)
+##### 4.9b — Trade frequency scaling in composite ✅
 
-Add a soft multiplier to the composite fitness score that rewards more
-trades: `min(1.0, positions / targetPositions)`. A strategy with 50
-positions gets half credit; 100+ gets full. Creates continuous pressure
-toward more trades instead of a hard cliff at the gate.
+Soft multiplier on the composite fitness score:
+`score *= min(1, positions / frequencyTarget)`. A strategy with 50
+positions and `frequencyTarget: 100` gets half credit; 100+ gets full.
+Creates continuous pressure toward higher-frequency strategies.
 
-Potential config: `fitness.frequencyTarget` (default 100 positions).
+Config: `fitness.frequencyTarget` (default 100).
+
+**Files changed:**
+- `optimizer/fitness.js` — `freqFactor` applied after weighted composite;
+  breakdown emits `freqFactor`, `freqTarget`, `positions` when active.
+- `engine/spec.js` — added `frequencyTarget: 100` to `DEFAULT_FITNESS`,
+  merged in `normalizeSpec`.
+- `scripts/fitness-check.js` — added section [18] with 11 assertions
+  covering half-credit, full-credit, over-target cap, disabled mode,
+  and ranking comparison.
 
 ##### 4.9c — Complexity penalty (backlog)
 

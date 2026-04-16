@@ -90,6 +90,11 @@ export const DEFAULT_FITNESS = Object.freeze({
   // only accumulate from trades whose exit bar falls in the last `gaOosRatio`
   // of the data. Set 0 to disable (score on full data as before).
   gaOosRatio: 0.3,
+  // Trade frequency scaling: soft multiplier that rewards strategies with
+  // more positions. freq = min(1, positions / frequencyTarget). The
+  // composite score is multiplied by freq, so a strategy with 50 positions
+  // and target 100 gets half credit. Set 0 to disable.
+  frequencyTarget: 100,
 });
 
 export const DEFAULT_WALK_FORWARD = Object.freeze({
@@ -578,10 +583,11 @@ function normalizeSpec(spec) {
   clone.constraints ??= [];
 
   clone.fitness = {
-    weights:    { ...DEFAULT_FITNESS.weights, ...(clone.fitness?.weights) },
-    caps:       { ...DEFAULT_FITNESS.caps,    ...(clone.fitness?.caps) },
-    gates:      { ...DEFAULT_FITNESS.gates,   ...(clone.fitness?.gates) },
-    gaOosRatio: clone.fitness?.gaOosRatio ?? DEFAULT_FITNESS.gaOosRatio,
+    weights:          { ...DEFAULT_FITNESS.weights, ...(clone.fitness?.weights) },
+    caps:             { ...DEFAULT_FITNESS.caps,    ...(clone.fitness?.caps) },
+    gates:            { ...DEFAULT_FITNESS.gates,   ...(clone.fitness?.gates) },
+    gaOosRatio:       clone.fitness?.gaOosRatio       ?? DEFAULT_FITNESS.gaOosRatio,
+    frequencyTarget:  clone.fitness?.frequencyTarget  ?? DEFAULT_FITNESS.frequencyTarget,
   };
   clone.walkForward = { ...DEFAULT_WALK_FORWARD, ...(clone.walkForward ?? {}) };
 

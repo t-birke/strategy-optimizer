@@ -447,6 +447,80 @@ console.log('\n[17] computeFitness — WF windows without oosRegimeBreakdown fal
   assertClose('uses full-data bear PF', r.breakdown.worstRegimePf, 1.3, 1e-9);
 }
 
+// ─── 18. Trade frequency scaling ────────────────────────────
+console.log('\n[18] computeFitness — trade frequency scaling (4.9b)');
+{
+  // Base metrics: good strategy but only 50 positions (half the target).
+  // Raw composite = 0.5*0.335 + 0.3*0.82 + 0.2*1.0 = 0.6135
+  // freqFactor = min(1, 50/100) = 0.5
+  // final score = 0.6135 * 0.5 = 0.30675
+  const metrics50 = {
+    trades: 50, totalPositions: 50,
+    pf: 1.34, netProfitPct: 2.40, maxDDPct: 0.18,
+    regimeBreakdown: {
+      bull: { trades: 25, pf: 1.5, net: 5000, wins: 15 },
+      bear: { trades: 25, pf: 1.2, net: 2000, wins: 12 },
+    },
+  };
+  const r50 = computeFitness({ metrics: metrics50, fitnessConfig: DEFAULT_FITNESS });
+  assertTrue('50 pos: not eliminated', !r50.eliminated);
+  assertClose('50 pos: freqFactor = 0.5', r50.breakdown.freqFactor, 0.5, 1e-6);
+  assertClose('50 pos: score = 0.6135 * 0.5', r50.score, 0.6135 * 0.5, 1e-4);
+  assertEq('50 pos: breakdown has freqTarget', r50.breakdown.freqTarget, 100);
+  assertEq('50 pos: breakdown has positions', r50.breakdown.positions, 50);
+
+  // Same metrics but 100 positions → freqFactor = 1, no penalty.
+  const metrics100 = { ...metrics50, trades: 100, totalPositions: 100 };
+  metrics100.regimeBreakdown = {
+    bull: { trades: 50, pf: 1.5, net: 5000, wins: 30 },
+    bear: { trades: 50, pf: 1.2, net: 2000, wins: 25 },
+  };
+  const r100 = computeFitness({ metrics: metrics100, fitnessConfig: DEFAULT_FITNESS });
+  assertClose('100 pos: freqFactor = 1.0', r100.breakdown.freqFactor, 1.0, 1e-6);
+  assertClose('100 pos: score = 0.6135', r100.score, 0.6135, 1e-4);
+
+  // 200 positions → capped at 1, no bonus for exceeding target.
+  const metrics200 = { ...metrics50, trades: 200, totalPositions: 200 };
+  metrics200.regimeBreakdown = {
+    bull: { trades: 100, pf: 1.5, net: 5000, wins: 60 },
+    bear: { trades: 100, pf: 1.2, net: 2000, wins: 50 },
+  };
+  const r200 = computeFitness({ metrics: metrics200, fitnessConfig: DEFAULT_FITNESS });
+  assertClose('200 pos: freqFactor still 1.0 (no bonus)', r200.breakdown.freqFactor, 1.0, 1e-6);
+
+  // frequencyTarget = 0 → disabled, freqFactor = 1 regardless.
+  const noFreqConfig = {
+    ...DEFAULT_FITNESS,
+    frequencyTarget: 0,
+  };
+  const rDisabled = computeFitness({ metrics: metrics50, fitnessConfig: noFreqConfig });
+  assertClose('disabled: score = raw composite', rDisabled.score, 0.6135, 1e-4);
+  assertTrue('disabled: no freqFactor in breakdown', rDisabled.breakdown.freqFactor === undefined);
+
+  // Ranking check: two identical strategies, one with 80 positions and
+  // one with 40 → the 80-position one scores higher.
+  const baseMetrics = {
+    pf: 1.34, netProfitPct: 2.40, maxDDPct: 0.18,
+    regimeBreakdown: {
+      bull: { trades: 40, pf: 1.5, net: 5000, wins: 20 },
+      bear: { trades: 40, pf: 1.2, net: 2000, wins: 20 },
+    },
+  };
+  const r80 = computeFitness({
+    metrics: { ...baseMetrics, trades: 80, totalPositions: 80 },
+    fitnessConfig: DEFAULT_FITNESS,
+  });
+  const r40 = computeFitness({
+    metrics: { ...baseMetrics, trades: 40, totalPositions: 40 },
+    fitnessConfig: DEFAULT_FITNESS,
+  });
+  assertTrue(
+    'more positions → higher score (80 > 40)',
+    r80.score > r40.score,
+    `80pos=${r80.score.toFixed(4)}, 40pos=${r40.score.toFixed(4)}`,
+  );
+}
+
 // ─── Summary ────────────────────────────────────────────────
 console.log('\n' + '─'.repeat(60));
 console.log(`RESULT: ${passCount} passed, ${failCount} failed`);

@@ -185,16 +185,28 @@ export function computeFitness({ metrics, fitnessConfig, wfReport = null }) {
   const normRet = normalizeRet(metrics.netProfitPct, caps.ret);
 
   const weightsN = normalizeWeights(weights);
-  const composite =
+  const rawComposite =
     weightsN.pf  * normPf  +
     weightsN.dd  * normDd  +
     weightsN.ret * normRet;
+
+  // ─── Trade frequency scaling ──────────────────────────────
+  // Soft multiplier: strategies with fewer positions than the target
+  // get proportionally reduced fitness. Encourages the GA to find
+  // strategies that trade often enough to be statistically meaningful.
+  // freq = min(1, positions / frequencyTarget).  Disabled when target ≤ 0.
+  const freqTarget = numberOr(fitnessConfig.frequencyTarget, 0);
+  const freqFactor = freqTarget > 0
+    ? Math.min(1, positions / freqTarget)
+    : 1;
+  const composite = rawComposite * freqFactor;
 
   const breakdown = {
     normPf,
     normDd,
     normRet,
     weightsN,
+    ...(freqTarget > 0 ? { freqFactor, freqTarget, positions } : {}),
     ...(worstRegimePf !== null ? { worstRegimePf, regimeSource } : {}),
     ...(wfe           !== null ? { wfe }           : {}),
   };
