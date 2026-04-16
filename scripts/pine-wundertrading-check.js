@@ -101,16 +101,21 @@ console.log('\n[1] Codegen output — full spec (TPs + SL + moveToBreakeven)');
     src.includes('i_leverage = input.int('));
   assertTrue('i_leverage default 1',
     /i_leverage\s*=\s*input\.int\(1,/.test(src));
-  assertTrue('i_codeLong input declared',
-    /i_codeLong\s*=\s*input\.string\("ENTER-LONG"/.test(src));
-  assertTrue('i_codeShort input declared',
-    /i_codeShort\s*=\s*input\.string\("ENTER-SHORT"/.test(src));
-  assertTrue('i_codeExit input declared',
-    /i_codeExit\s*=\s*input\.string\("EXIT-ALL"/.test(src));
+  assertTrue('i_codeLong input declared (empty default)',
+    /i_codeLong\s*=\s*input\.string\("",/.test(src));
+  assertTrue('i_codeExitLong input declared (empty default)',
+    /i_codeExitLong\s*=\s*input\.string\("",/.test(src));
+  assertTrue('i_codeShort input declared (empty default)',
+    /i_codeShort\s*=\s*input\.string\("",/.test(src));
+  assertTrue('i_codeExitShort input declared (empty default)',
+    /i_codeExitShort\s*=\s*input\.string\("",/.test(src));
+  assertTrue('i_codeExitAll input declared (empty default)',
+    /i_codeExitAll\s*=\s*input\.string\("",/.test(src));
   assertTrue('All inputs in GRP_WH group',
     [/i_posSize.*group=GRP_WH/, /i_leverage.*group=GRP_WH/,
-     /i_codeLong.*group=GRP_WH/, /i_codeShort.*group=GRP_WH/,
-     /i_codeExit.*group=GRP_WH/].every(r => r.test(src)));
+     /i_codeLong.*group=GRP_WH/, /i_codeExitLong.*group=GRP_WH/,
+     /i_codeShort.*group=GRP_WH/, /i_codeExitShort.*group=GRP_WH/,
+     /i_codeExitAll.*group=GRP_WH/].every(r => r.test(src)));
 
   // ── Pre-computed ATR global vars ──
   assertTrue('wt_atr_tp declared',
@@ -200,15 +205,15 @@ console.log('\n[1] Codegen output — full spec (TPs + SL + moveToBreakeven)');
   assertTrue('executePrice references close (entry price)',
     /executePrice.*str\.tostring\(close/.test(src));
 
-  // ── f_exit_json — minimal close payload ──
+  // ── f_exit_json — minimal close payload, direction-aware ──
   assertTrue('f_exit_json defined',
     src.includes('f_exit_json(string dir, string reason) =>'));
-  assertTrue('exit payload uses i_codeExit',
-    /f_exit_json[\s\S]*?i_codeExit/.test(src));
+  assertTrue('exit payload uses direction-aware codes (i_codeExitLong / i_codeExitShort)',
+    /f_exit_json[\s\S]*?i_codeExitLong[\s\S]*?i_codeExitShort/.test(src));
   assertTrue('exit payload is minimal (market + reduceOnly, no TPs)',
     (() => {
       const exitFn = src.split('f_exit_json(string dir, string reason) =>')[1]
-                        ?.split('\n')[1] || '';
+                        ?.split('\n')[2] || '';
       return exitFn.includes('"orderType":"market"') &&
              exitFn.includes('"reduceOnly":true') &&
              !exitFn.includes('takeProfits');

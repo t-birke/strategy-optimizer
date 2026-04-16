@@ -416,9 +416,11 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, shortTitle 
   push('string ticker = i_tickerOverride != "" ? i_tickerOverride : syminfo.ticker');
   push('i_posSize = input.float(0.1, "Position Size (fraction)", minval=0.001, maxval=1.0, step=0.01, tooltip="Wundertrading amountPerTrade: 0.1 = 10%% of sub-account equity.", group=GRP_WH)');
   push('i_leverage = input.int(1, "Leverage", minval=1, maxval=125, step=1, tooltip="Exchange leverage multiplier.", group=GRP_WH)');
-  push('i_codeLong = input.string("ENTER-LONG", "Code: Long Entry", tooltip="Wundertrading Signal Bot comment code for long entries.", group=GRP_WH)');
-  push('i_codeShort = input.string("ENTER-SHORT", "Code: Short Entry", tooltip="Wundertrading Signal Bot comment code for short entries.", group=GRP_WH)');
-  push('i_codeExit = input.string("EXIT-ALL", "Code: Exit", tooltip="Wundertrading Signal Bot comment code for structural/time exits. TPs and SLs are handled by exchange conditional orders.", group=GRP_WH)');
+  push('i_codeLong = input.string("", "Code: Enter Long", tooltip="Wundertrading Signal Bot token for long entries. Paste from bot settings: Enter Long Comment.", group=GRP_WH)');
+  push('i_codeExitLong = input.string("", "Code: Exit Long", tooltip="Wundertrading Signal Bot token for closing longs. Paste from bot settings: Exit Long Comment.", group=GRP_WH)');
+  push('i_codeShort = input.string("", "Code: Enter Short", tooltip="Wundertrading Signal Bot token for short entries. Paste from bot settings: Enter Short Comment.", group=GRP_WH)');
+  push('i_codeExitShort = input.string("", "Code: Exit Short", tooltip="Wundertrading Signal Bot token for closing shorts. Paste from bot settings: Exit Short Comment.", group=GRP_WH)');
+  push('i_codeExitAll = input.string("", "Code: Exit All", tooltip="Wundertrading Signal Bot token for closing all positions. Paste from bot settings: Exit All Comment.", group=GRP_WH)');
   push('');
 
   // ─── Regime (optional, passive for now) ────────────────────
@@ -624,18 +626,21 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, shortTitle 
 
   // f_exit_json — minimal close payload for structural / time exits.
   // TPs/SLs are exchange conditional orders; reversals use swing mode.
+  // Direction-aware: uses exit-long or exit-short code so Wundertrading
+  // routes the close to the correct bot action.
   push('f_exit_json(string dir, string reason) =>');
-  push(`    '{"code":"' + i_codeExit + '","orderType":"market","reduceOnly":true}'`);
+  push('    bool is_l = dir == "long"');
+  push(`    '{"code":"' + (is_l ? i_codeExitLong : i_codeExitShort) + '","orderType":"market","reduceOnly":true}'`);
   push('');
 
   push('if goLong');
-  push('    alert(f_entry_json("long"),  alert.freq_once_per_bar)');
+  push('    alert(f_entry_json("long"),  alert.freq_once_per_bar_close)');
   push('if goShort');
-  push('    alert(f_entry_json("short"), alert.freq_once_per_bar)');
+  push('    alert(f_entry_json("short"), alert.freq_once_per_bar_close)');
   // Exit alerts: only structural/time. TP/SL = exchange conditional
   // orders, reversals = handled by the entry alert via swing mode.
   push('if bar_exit and (bar_exit_reason == "Structural" or bar_exit_reason == "Time")');
-  push('    alert(f_exit_json(bar_exit_dir > 0 ? "long" : "short", bar_exit_reason), alert.freq_once_per_bar)');
+  push('    alert(f_exit_json(bar_exit_dir > 0 ? "long" : "short", bar_exit_reason), alert.freq_once_per_bar_close)');
   push('');
   push('alertcondition(goLong,   "Long Entry",   "Long entry opens new position")');
   push('alertcondition(goShort,  "Short Entry",  "Short entry opens new position")');
