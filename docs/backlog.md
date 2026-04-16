@@ -1147,137 +1147,239 @@ won't notice.
   - Schema is migration-safe (CREATE TABLE IF NOT EXISTS + the same
     WAL-replay-safe pattern from the existing schema migrations).
 
-##### 4.7b — Paper-mode dispatcher + position ledger
-- **Goal:** webhook events drive a paper-mode position state machine
-  with realistic P&L.
-- **Why now:** the moment events flow we need to do *something* — paper
-  is the safe default.
-- **IN scope:**
-  - Schema: `positions` (id, deployment_id, symbol, direction, state,
-    entry_time, entry_price, entry_size, exit_time, exit_price,
-    exit_reason, realized_pnl_usd, fees_usd, drift_notes JSON).
-    `deployment_events` JSONL mirror.
-  - `adapters/exchange.js` with `paper` impl. For 4.7b "price source"
-    is the payload's `price` field (4.7e adds an independent feed).
-  - `api/dispatcher.js`: claim-next-event (mirrors `claimNextRun`
-    pattern), apply to adapter, update `positions`, append JSONL.
-    Idempotent per `webhook_events.id`.
-  - Circuit breakers evaluated at dispatch time (keep ingest cheap).
-- **DEFERRED:** independent price feed, multi-symbol concurrent
-  positions per deployment (one-per-deployment for now), Pine-push
-  integration, UI.
-- **Gate (`scripts/deployment-dispatcher-check.js`):**
-  full long trip (open → TP1 → close) lands correct entry/exit/PnL.
-  Duplicate open while open → logged to `drift_notes`, not acted on.
-  `max_loss_per_day_usd` breach → auto-pause. Same spec + same event
-  sequence → same realized P&L as `runtime.js` for that bar (≤ $0.01).
-- **Risks:** P&L drift vs runtime backtest (share execution-costs
-  math, don't reimpl); out-of-order events (sort by `bar_time`, not
-  `received_at`); clock skew on dedup (use TV's `bar_time`, not server
-  clock).
-- **Exit:** simulate a week of alerts offline → realized P&L matches
-  `runSpec()` of the same spec on the same window.
+#### Wundertrading pivot (decided 2026-04-16)
 
-##### 4.7c — Deploy-from-run UI + Pine auto-push with collision safety
-- **Goal:** one-click "Deploy this run" from run-detail that codegens,
-  pushes to TV, creates `deployments.status=draft`, walks user through
-  arming.
-- **IN scope:**
-  - UI: "Deploy" button on run-detail (spec-mode only, mirror 4.6
-    gating). Modal: Pine filename preview, webhook URL with freshly
-    minted secret (copyable), alert-message template to paste into TV,
-    mode selector (`paper` only — `live` grayed-out with tooltip).
-    Save → draft. Explicit Arm button → armed.
-  - Server endpoint `POST /api/deployments/:id/push-pine` reusing
-    `scripts/pine-deploy.js` logic. Never overwrite without
-    `?allow_overwrite=1` (MEMORY.md guardrail).
-  - Deployments list page: status chip, last event time, open positions
-    count, P&L 24h.
-- **DEFERRED:** unarm/retire flows (manual DB), editing a deployed spec
-  (must retire + redeploy), live-position charts.
-- **Gate (`scripts/ui-deployment-check.js`):**
-  three-section pattern. DOM (button, modal fields, deployments page),
-  JS (webhook URL construction, secret copy-to-clipboard, mode selector
-  disables `live`), server (create draft → row; arm w/o Pine pushed →
-  409; push w/o `allow_overwrite` on collision → 409 echoing existing
-  script name).
-- **Risks:** accidental overwrite of an armed deployment's Pine (arming
-  locks `pine_filename`); secret rotation voids in-flight TV alerts
-  (surface this hard in UI, never silent).
-- **Exit:** Deploy Run #N → Pine in TV → paste alert message → first
-  real alert lands in `webhook_events` and dispatches to a `positions`
-  row.
+User revealed they use **Wundertrading** for exchange execution via
+Signal Bots that accept webhooks. This replaces the planned dispatcher,
+position ledger, reconciler, and exchange adapter (4.7b–e original
+scope). The revised flow:
 
-##### 4.7d — Reconciler + process split (`webhookd`)
-- **Goal:** continuously compare our ledger to adapter truth; move the
-  webhook receiver out-of-process so UI restarts don't drop alerts.
-- **Why now:** once 4.7c is in daily use the UI gets restarted often;
-  TV alerts arriving during a restart vanish today.
-- **IN scope:**
-  - **`bin/webhookd.js`** — minimal Express app exposing only
-    `POST /webhook/:id/:secret`, **appending to JSONL only** (writer of
-    record). Main UI process polls + ingests on a tick. Picked over
-    DuckDB-direct because DuckDB is single-writer; JSONL is bulletproof
-    and decouples cleanly.
-  - **Reconciler** — periodic (60s): for each `armed` deployment,
-    `adapter.getPosition(symbol)` vs `positions` row; log diffs to
-    `drift_notes` and trip `paused` if severity > threshold.
-  - `docs/deployment-ops.md` — systemd / pm2 docs.
-- **DEFERRED:** live-stub adapter, multi-node deployments, alerting
-  (email/slack on drift).
-- **Gate (`scripts/deployment-reconcile-check.js`):**
-  webhookd receives event while ingester down → JSONL grows. Restart
-  ingester → DB catches up, dispatcher fires. Mutate `positions` row
-  directly to fake drift → reconciler logs + pauses.
-- **Risks:** double-write race (JSONL approach avoids it); reconciler
-  false-positive on transient backlog (gate: 100 queued events drain
-  → no false pause); JSONL torn writes (use `fs.write` with `O_APPEND`,
-  skip malformed trailing lines on restart).
-- **Exit:** kill main UI mid-TV-alert → restart 60s later → alert that
-  arrived during downtime is in DB and dispatched correctly.
+1. Optimizer finds best gene → Pine codegen emits a frozen indicator
+2. TV alert fires on entry signal → sends Wundertrading-compatible JSON
+   to the Signal Bot's webhook URL
+3. Wundertrading opens position + places TP/SL as **conditional orders
+   on the exchange** (ATR-based levels computed at alert time from the
+   gene's frozen exit params)
+4. Exchange handles TP/SL exits natively; structural/time exits fire a
+   separate EXIT-ALL alert via Pine → Wundertrading
 
-##### 4.7e — Independent price feed + live-stub adapter + hardening
-- **Goal:** trust-but-verify TV's price; ship the live-stub adapter so
-  the interface is exercised end-to-end.
-- **IN scope:**
-  - Price feed: dispatcher looks up the last close from
-    `db/candles.js` for `(symbol, timeframe, bar_time)` as canonical
-    fill price. Log TV's price alongside; flag drift if delta exceeds
-    `max_price_deviation_bps`.
-  - `live-stub` adapter: identical behavior to `paper` but writes an
-    `orders` table row marked `stub=true` so we have a realistic
-    "would have sent X" log.
-  - Hardening: 10 alerts/sec rate limit per deployment (sliding window),
-    body-size cap, structured log output ready for a future aggregator.
-- **DEFERRED:** tax pool, real exchange adapter, portfolio-level
-  allocation across strategies, position sizing that consults live
-  equity.
-- **Gate (`scripts/deployment-live-stub-check.js`):**
-  payload price $100 vs candle close $100.50 → fill at $100.50, drift
-  logged at 50 bps. 11 events in 1s → 11th = 429. Runtime mode-flip
-  request → 403 (mode change requires restart).
-- **Risks:** candle not yet ingested for most-recent bar (fall back to
-  TV price with warning, don't block); rate-limiter memory leak
-  (sliding window per deployment, cap at N).
-- **Exit:** run a live-stub deployment on a real symbol for a week.
-  Reconciler shows zero drift; `orders` table captures every intended
-  order with realistic timestamps.
+**Why this is better:** TPs and SLs as exchange conditional orders are
+not reliant on the TV alert pipeline. If TV goes down after the entry,
+the exchange still holds the stops — a qualitative reliability
+improvement over our planned Pine-alert-driven exit flow.
+
+**Wundertrading webhook security:** bearer-URL auth (the URL is the
+secret). Same model as 4.7a. TV can't add custom headers, so all
+TV-webhook integrations use this pattern. Mitigation: treat the URL
+as a secret; Wundertrading's per-bot capital limits cap blast radius.
+
+The 4.7a webhook receiver remains available as an optional parallel
+logging endpoint (TV supports multiple webhook URLs per alert).
+
+##### 4.7b (revised) — Wundertrading-compatible Pine alert payloads
+
+**Goal:** update `engine/pine-codegen.js` so generated indicators emit
+Wundertrading Signal Bot-compatible JSON in their `alert()` calls. The
+gene's frozen TP/SL parameters are computed into absolute prices at
+alert time and embedded in the JSON payload, so Wundertrading can place
+them as conditional orders on the exchange.
+
+**Why now:** this is the only remaining code change needed for a working
+end-to-end flow: optimizer → Pine → TV alert → Wundertrading → exchange.
+
+**Wundertrading JSON spec** (from their Signal Bot Comprehensive JSON
+Guide):
+```json
+{
+  "code": "ENTER-LONG",
+  "orderType": "market",
+  "amountPerTradeType": "percents",
+  "amountPerTrade": 0.1,
+  "leverage": 5,
+  "takeProfits": [
+    {"price": 148.50, "portfolio": 0.33},
+    {"price": 155.00, "portfolio": 0.33},
+    {"price": 162.00, "portfolio": 0.34}
+  ],
+  "stopLoss": {"price": 138.00},
+  "placeConditionalOrdersOnExchange": true,
+  "reduceOnly": true
+}
+```
+
+Key fields: `code` = bot trigger comment; `takeProfits` = array of up
+to 6 levels with absolute prices + portfolio fraction (0,1] to close;
+`stopLoss` = single level with absolute price; `reduceOnly` = safety
+flag preventing accidental position opens. Wundertrading supports
+`placeConditionalOrdersOnExchange: true` which places TPs/SLs as
+actual orders on the exchange (not just server-side monitoring).
+
+**IN scope:**
+- **New Pine inputs** (Webhook group, alongside existing `i_tickerOverride`):
+  - `i_posSize` (float, default 0.1) — fraction of portfolio per trade.
+    Wundertrading `amountPerTrade` with `amountPerTradeType: "percents"`
+    (0.1 = 10%).
+  - `i_leverage` (int, default 1) — leverage multiplier [1, 125].
+  - `i_codeLong` (string, default `"ENTER-LONG"`) — Wundertrading bot
+    comment code for long entries.
+  - `i_codeShort` (string, default `"ENTER-SHORT"`) — code for short entries.
+  - `i_codeExit` (string, default `"EXIT-ALL"`) — code for structural /
+    time exits. TPs/SLs don't use this — they're exchange-side.
+- **Refactored `f_entry_json(dir)`** — multi-line Pine function that
+  builds the Wundertrading JSON:
+  - Computes `is_long` from `dir` parameter.
+  - Reads ATR from the same series the exit state machine uses
+    (`nz(atr_<len>[1])` — prior bar's ATR, matching the backtest's
+    fill-at-next-bar-open convention).
+  - Computes TP prices: for each active tranche (tpNPct > 0),
+    `close ± ATR × tpNMult`. Tranche mults and pcts are frozen from the
+    gene as numeric literals. Portfolio fractions = `tpNPct / 100`.
+  - Computes SL price: `close ∓ ATR × atrSL` from the hardStop block.
+  - Assembles JSON: `code`, `orderType: "market"`,
+    `amountPerTradeType: "percents"`, `amountPerTrade: i_posSize`,
+    `leverage: i_leverage`, `takeProfits: [...]`, `stopLoss: {price: ...}`,
+    `placeConditionalOrdersOnExchange: true`, `reduceOnly: true`.
+- **Refactored `f_exit_json(dir, reason)`** — minimal close payload:
+  `{"code":"<i_codeExit>","orderType":"market","reduceOnly":true}`.
+  Only fired for exits that exchange conditional orders can't handle.
+- **Exit alert gating:** `alert(f_exit_json(...))` fires ONLY when
+  `bar_exit_reason` is `"Structural"`, `"Time"`, or `"Reversal"` —
+  NOT for `"TP1"`/`"TP2"`/`"TP3"`/`"SL"`/`"ESL"` (those are handled
+  by the exchange's conditional orders). Reversal entries (goShort
+  while long) are also handled by Wundertrading's swing mode — the
+  ENTER-SHORT signal auto-closes the open long — so in practice only
+  Structural and Time exits produce an EXIT-ALL alert.
+- **Exit state machine PRESERVED** for chart visualization. The
+  plotshape/label arrows still fire on all exit types so the chart
+  overlay shows the complete picture. Only the `alert()` dispatch path
+  changes.
+- **Graceful degradation** (specs without full exit config):
+  - No `target` block → `takeProfits` array omitted from JSON
+  - No `hardStop` block → `stopLoss` omitted from JSON
+  - Neither → alert carries entry + sizing only, no TP/SL
+    (user configures them in Wundertrading's form settings instead)
+- **ATR series reuse:** TP/SL computation uses the same ATR series
+  the exit state machine already declares (e.g., `atr_14`). No new
+  indicator series needed.
+- **`f_ts()` preserved** — not part of the Wundertrading payload, but
+  kept for the parallel logging path (our 4.7a webhook) and for any
+  future dual-webhook use.
+
+**Dual-webhook note:** TV allows multiple webhook URLs per alert but
+only ONE message per alert. The Wundertrading JSON is the primary
+format. Our 4.7a webhook (`POST /webhook/:id/:secret`) still receives
+the same payload — it logs `raw_body` as-is. The 4.7a dedup key
+computation (`dedupKey()` in `db/deployments.js`) may need a minor
+update to extract `action`/`direction` from the Wundertrading `code`
+field (e.g. `ENTER-LONG` → action=`open`, direction=`long`), OR we
+accept the new key shape and just key on `code` + `bar_time`. Either
+way this is a small follow-up, not blocking.
+
+**DEFERRED:**
+- Wundertrading DCA settings in the alert JSON (complex, user can
+  configure DCA in the bot's form settings if needed)
+- Limit order support (market orders only in v1)
+- Move-to-breakeven automation via Wundertrading's `moveToBreakeven`
+  field (exchange-side logic, our backtest doesn't model it yet)
+- `amountPerTradeType` as an input (hardcoded to `"percents"` — user
+  can override in TV's alert message editor if needed)
+- Trailing stop in Wundertrading format (their trailing stop is
+  percentage-based, not ATR-based — format mismatch with our
+  `structuralExit` block)
+
+**Gate (`scripts/pine-wundertrading-check.js`):**
+- [1] **Codegen output**: generate Pine from the migration-gate spec +
+  a known gene (same fixture as `ui-pine-export-check.js`). Verify:
+  - New inputs present in Webhook group: `i_posSize`, `i_leverage`,
+    `i_codeLong`, `i_codeShort`, `i_codeExit` with correct types and
+    defaults.
+  - `f_entry_json` contains Wundertrading fields: `code`, `orderType`,
+    `amountPerTradeType`, `amountPerTrade`, `leverage`, `takeProfits`,
+    `stopLoss`, `placeConditionalOrdersOnExchange`, `reduceOnly`.
+  - TP prices use correct formula direction-aware:
+    long = `close + ATR × mult`, short = `close - ATR × mult`.
+  - SL price uses correct formula: long = `close - ATR × atrSL`,
+    short = `close + ATR × atrSL`.
+  - Only active tranches (tpNPct > 0) emitted in the TP array.
+  - Portfolio fractions sum to ≤ 1.0 (normalized from gene's pct values).
+- [2] **Exit alert gating**: verify `alert(f_exit_json(...))` is guarded
+  by `bar_exit_reason` check — fires for Structural/Time/Reversal, NOT
+  for TP/SL/ESL.
+- [3] **Graceful degradation**: generate Pine from a synthetic spec
+  with no target block → `takeProfits` absent from JSON. No hardStop →
+  `stopLoss` absent. Neither → entry-only alert.
+- [4] **Backward compatibility**: exit state machine visualization
+  (plotshape/label arrows) unchanged from 4.6 output. Entry/exit arrows
+  still render on the chart regardless of alert format.
+
+**Risks:**
+- **Wundertrading `portfolio` field semantics**: we assume it's the
+  fraction of the ORIGINAL position to close at each TP level. If it's
+  the fraction of the REMAINING position, the math differs (our TP3 at
+  34% of original would need to be 100% of remaining after TP1+TP2
+  close 66%). Verify with a test trade before going live.
+- **ATR[1] lag**: the ATR value for TP/SL computation is the prior
+  bar's ATR (`nz(atr_<len>[1])`), same offset the backtest runtime
+  uses for fill-at-next-bar-open. If the alert fires at bar close,
+  the TP/SL prices reflect the prior bar's volatility — acceptable
+  and consistent with backtested results.
+- **Pine v5 string length**: deeply nested JSON as a single-line string
+  concatenation. Pine v5's max string length is 4096 chars. Our payload
+  with 3 TPs is ~350 chars — well within limits even with 6 TPs.
+
+**Exit:** generate Pine for the migration-gate spec, paste the entry
+alert payload into a Wundertrading test bot, verify the JSON is
+accepted and TPs/SLs appear as conditional orders on the exchange.
+
+##### 4.7c (revised) — Deploy-from-run UI (Wundertrading setup guide)
+
+**Goal:** one-click "Deploy" on run-detail that generates Pine and
+shows a guided setup checklist for Wundertrading bot configuration:
+webhook URL, required bot settings, alert message template.
+
+**IN scope:**
+- "Deploy" button on run-detail (spec-mode only, gates same as 4.6).
+- Modal / expanded card:
+  - Pine filename + generate button (reuses 4.6's codegen endpoint).
+  - Wundertrading setup checklist:
+    1. Create Signal Bot in Wundertrading dashboard
+    2. Copy the bot's webhook URL
+    3. Set up TV alert on the generated indicator
+    4. Paste bot webhook URL as TV alert destination
+    5. Alert message: already in the Pine's `alert()` calls (explain
+       that TV uses the indicator's `alert()` output automatically)
+  - Deployment record creation (links run → deployment for logging
+    via our 4.7a webhook, optional).
+- Deployments list page: status, last signal time, link to Wundertrading.
+
+**DEFERRED:** arm/pause/retire lifecycle (manual for now), real-time
+signal monitoring, Wundertrading API integration for automated bot
+setup.
+
+##### 4.7d / 4.7e — SUPERSEDED by Wundertrading integration
+
+The original dispatcher, position ledger, reconciler, process split,
+independent price feed, and live-stub adapter are no longer needed.
+Wundertrading handles:
+- **Exchange execution** — Signal Bot → exchange order
+- **TP/SL management** — conditional orders on exchange
+- **Position tracking** — Wundertrading dashboard + exchange
+- **Analytics and trade visibility** — Wundertrading dashboard
+- **Reconciliation** — Wundertrading monitors position state
+
+The independent price feed concept (verify TV's price against our
+candle DB) could be resurrected as a lightweight monitoring tool if
+needed, but is not on the critical path.
 
 ---
 
 #### Critical files (touched across 4.7)
-- `db/schema.sql` — 4 new tables (deployments, webhook_events,
-  positions, orders) + `system` k/v table for kill switch
-- `api/routes.js` — webhook + deployments endpoints
-- `api/dispatcher.js` (new) — event → position state machine
-- `api/reconciler.js` (new) — periodic drift check
-- `adapters/exchange.js` (new) — `paper` + `live-stub` impls behind a
-  swap-friendly interface
-- `bin/webhookd.js` (new, 4.7d) — out-of-process receiver
-- `ui/index.html` + `ui/app.js` — Deploy button, modal, deployments
-  list page
-- `scripts/pine-deploy.js` — already exists, reused via a server
-  endpoint in 4.7c
+- `db/schema.sql` — 2 new tables (deployments, webhook_events) ✅ 4.7a
+- `db/deployments.js` — CRUD helpers ✅ 4.7a
+- `api/routes.js` — webhook + deployments endpoints ✅ 4.7a
+- `engine/pine-codegen.js` — Wundertrading JSON alert format (4.7b)
+- `ui/index.html` + `ui/app.js` — Deploy button, setup guide (4.7c)
+- `scripts/pine-deploy.js` — already exists, reused by Deploy flow
 
 ---
 
