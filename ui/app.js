@@ -1548,7 +1548,7 @@ const PARAM_LABELS = {
   tp3Mult:       { label: 'TP3 Multiplier',     unit: '×',  desc: 'TP3 price = entry ± ATR × this value' },
   tp1Pct:        { label: 'TP1 Close %',        unit: '%',  desc: 'Position % closed at TP1' },
   tp2Pct:        { label: 'TP2 Close %',        unit: '%',  desc: 'Position % closed at TP2' },
-  riskPct:       { label: 'Risk %',             unit: '%',  desc: 'Capital % risked per trade (sizes the position)' },
+  riskPct:       { label: 'Risk %',             unit: '%',  desc: 'Equity % at risk on full stop-out (position size = risk / stop distance)' },
   maxBars:       { label: 'Max Bars',           unit: '',   desc: 'Time-based exit: close if open longer than this many bars' },
   emergencySlPct:{ label: 'Emergency SL',       unit: '%',  desc: 'Hard intra-bar circuit-breaker stop loss' },
 };
@@ -1777,11 +1777,28 @@ function renderSpecGeneCards(gene) {
     (byInstance[instance] ??= []).push({ param, value: v, qid: k });
   }
 
+  // Pre-compute normalized TP% for any block that has tpNPct params.
+  // The GA stores raw weights (may sum > 100); the runtime normalizes.
+  const tpNorm = Object.create(null); // qid -> normalized%
+  for (const [blockId, byInstance] of Object.entries(blocks)) {
+    for (const [instance, params] of Object.entries(byInstance)) {
+      const tpPcts = params.filter(p => /^tp\d+Pct$/.test(p.param) && p.value > 0);
+      if (tpPcts.length > 0) {
+        const rawSum = tpPcts.reduce((s, p) => s + p.value, 0);
+        if (rawSum !== 100) { // only annotate when sum != 100
+          for (const p of tpPcts) {
+            tpNorm[p.qid] = Math.round(p.value / rawSum * 100);
+          }
+        }
+      }
+    }
+  }
+
   const blockSections = Object.entries(blocks).map(([blockId, byInstance]) => {
     const instanceSections = Object.entries(byInstance).map(([instance, params]) => {
       const label = instance === 'main' ? blockId : `${blockId} · ${instance}`;
       const cards = params
-        .map(p => paramCardHtml(p.param, label, p.value, p.qid))
+        .map(p => paramCardHtml(p.param, label, p.value, p.qid, tpNorm[p.qid]))
         .join('');
       return cards;
     }).join('');
@@ -1797,11 +1814,15 @@ function renderSpecGeneCards(gene) {
  * (the caller's parent container) lines up whether the run is legacy
  * or spec-mode.
  */
-function paramCardHtml(paramName, subtitle, value, qid) {
+function paramCardHtml(paramName, subtitle, value, qid, normalizedPct) {
   const displayVal = formatGeneNum(value);
+  // When tpNPct raw weights don't sum to 100, show the effective split.
+  const normNote = normalizedPct != null
+    ? ` <span style="color:#d2a8ff;font-size:11px">(eff. ${normalizedPct}%)</span>`
+    : '';
   return `<div style="background:#21262d;border:1px solid #30363d;border-radius:6px;padding:10px 12px" title="${qid}">
     <div style="font-size:11px;color:#8b949e;margin-bottom:4px">${paramName}</div>
-    <div style="font-size:16px;font-weight:700;color:#e6edf3;font-family:monospace">${displayVal}</div>
+    <div style="font-size:16px;font-weight:700;color:#e6edf3;font-family:monospace">${displayVal}${normNote}</div>
     <div style="font-size:10px;color:#6e7681;margin-top:4px">${subtitle}</div>
   </div>`;
 }
@@ -2697,6 +2718,7 @@ function renderTradeTable(trades) {
       <td style="padding:5px 8px;text-align:right;font-family:monospace">${fmtNum(t.exitPrice, 2)}</td>
       <td style="padding:5px 8px;text-align:right;font-family:monospace">${fmtNum(t.sizeAsset, 4)}</td>
       <td style="padding:5px 8px;text-align:right;font-family:monospace">$${fmtNum(t.sizeUsdt, 0)}</td>
+      <td style="padding:5px 8px;text-align:right;font-family:monospace;color:#d2a8ff">${t.riskUsdt != null ? '$' + fmtNum(t.riskUsdt, 0) : '—'}</td>
       <td style="padding:5px 8px;text-align:right;font-weight:700;font-family:monospace;color:${pnlColor}">$${fmtNum(t.pnl, 2)}</td>
       <td style="padding:5px 8px;text-align:right;font-family:monospace;color:${pnlColor}">${fmtNum(t.pnlPct * 100, 3)}%</td>
     </tr>`;
@@ -2711,11 +2733,12 @@ window.exportTrades = () => {
     const pad = n => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   };
-  const header = ['#','Direction','Entry Date','Exit Date','Signal','Entry Price','Exit Price','Size Asset','Size USDT','Net PnL','PnL %'];
+  const header = ['#','Direction','Entry Date','Exit Date','Signal','Entry Price','Exit Price','Size Asset','Size USDT','Risk $','Net PnL','PnL %'];
   const rows = detailTradeList.map((t, i) => [
     i + 1, t.direction, fmtDate(t.entryTs), fmtDate(t.exitTs), t.signal,
     t.entryPrice?.toFixed(2), t.exitPrice?.toFixed(2),
     t.sizeAsset?.toFixed(4), t.sizeUsdt?.toFixed(2),
+    t.riskUsdt != null ? t.riskUsdt.toFixed(2) : '',
     t.pnl?.toFixed(2), (t.pnlPct * 100)?.toFixed(3),
   ]);
   const csv = [header, ...rows].map(r => r.join(',')).join('\n');

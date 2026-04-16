@@ -209,6 +209,12 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
     }
 
     if (collectTrades) {
+      // riskUsdt: pro-rata share of the position's total risk at entry.
+      // If the position has N subs, each sub's risk = entryRisk × (subUnits / totalUnits).
+      const totalPosUnits = position.subs.reduce((s, sb) => s + sb.units, 0);
+      const subRisk = (position.entryRisk != null && totalPosUnits > 0)
+        ? position.entryRisk * (sub.units / totalPosUnits)
+        : null;
       tradeList.push({
         direction: isLong ? 'Long' : 'Short',
         entryTs:   base.ts ? Number(base.ts[position.entryBar]) : null,
@@ -218,6 +224,7 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
         exitPrice,
         sizeAsset: sub.units,
         sizeUsdt:  sub.units * exitPrice,
+        riskUsdt:  subRisk,
         pnl,
         pnlPct:    pnl / initialCapital,
         regime:    position.entryRegime ?? null,
@@ -299,12 +306,17 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
     const units = Math.min(totalUnits, maxUnits);
     if (!(units > 0)) return;
 
+    // Risk $ at entry — units × stopDistance is the dollar loss on a full stop-out
+    // (before commissions). Stored on the position so each sub-trade can report it.
+    const entryRisk = stopDistance != null ? units * stopDistance : null;
+
     position = makePosition({
       isLong,
       entryPrice: fillPrice,
       entryBar: atBar,
       entryRegime: collectRegimeLabels && regimeLabels ? regimeLabels[atBar] : labelAt(atBar),
       totalUnits: units,
+      entryRisk,
     });
 
     // Optional: target block splits the position into tranches.
@@ -666,12 +678,13 @@ function aggregateFilters(filterSlot, bundle, i) {
 
 // ─── Position factory ───────────────────────────────────────
 
-function makePosition({ isLong, entryPrice, entryBar, entryRegime, totalUnits }) {
+function makePosition({ isLong, entryPrice, entryBar, entryRegime, totalUnits, entryRisk }) {
   return {
     dir: isLong ? 1 : -1,
     entryPrice,
     entryBar,
     entryRegime: entryRegime ?? null,
+    entryRisk: entryRisk ?? null,
     // Default: one sub holding the full size. Target block can replace
     // this with N tranches via its onPositionOpen hook.
     subs: [{ units: totalUnits, closed: false, meta: { tag: 'main' } }],
