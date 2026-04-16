@@ -732,21 +732,32 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titl
         return { ...t, adjPct: adj };
       });
 
+      // SL price expressions — attached to every TP exit as OCO (limit+stop).
+      // TradingView ignores a separate strategy.exit("SL") when TP exits
+      // already exist for the same entry; the OCO pattern ensures the stop
+      // is always active alongside each take-profit limit.
+      const slLongExpr  = wt_hasSl ? `, stop=strat_entry - strat_atr_hs * ${wt_hs.params.atrSL}` : '';
+      const slShortExpr = wt_hasSl ? `, stop=strat_entry + strat_atr_hs * ${wt_hs.params.atrSL}` : '';
+
       // Long exits
       push('if strategy.position_size > 0');
-      for (const { n, mult, adjPct } of adjTranches) {
-        push(`    strategy.exit("TP${n}", "Long", qty_percent=${adjPct}, limit=strat_entry + strat_atr_tp * ${mult})`);
-      }
-      if (wt_hasSl) {
+      if (adjTranches.length > 0) {
+        for (const { n, mult, adjPct } of adjTranches) {
+          push(`    strategy.exit("TP${n}", "Long", qty_percent=${adjPct}, limit=strat_entry + strat_atr_tp * ${mult}${slLongExpr})`);
+        }
+      } else if (wt_hasSl) {
+        // SL-only (no TPs) — standalone stop exit
         push(`    strategy.exit("SL", "Long", stop=strat_entry - strat_atr_hs * ${wt_hs.params.atrSL})`);
       }
 
       // Short exits
       push('if strategy.position_size < 0');
-      for (const { n, mult, adjPct } of adjTranches) {
-        push(`    strategy.exit("TP${n}", "Short", qty_percent=${adjPct}, limit=strat_entry - strat_atr_tp * ${mult})`);
-      }
-      if (wt_hasSl) {
+      if (adjTranches.length > 0) {
+        for (const { n, mult, adjPct } of adjTranches) {
+          push(`    strategy.exit("TP${n}", "Short", qty_percent=${adjPct}, limit=strat_entry - strat_atr_tp * ${mult}${slShortExpr})`);
+        }
+      } else if (wt_hasSl) {
+        // SL-only (no TPs) — standalone stop exit
         push(`    strategy.exit("SL", "Short", stop=strat_entry + strat_atr_hs * ${wt_hs.params.atrSL})`);
       }
       push('');

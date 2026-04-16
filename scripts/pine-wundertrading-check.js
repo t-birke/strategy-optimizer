@@ -456,11 +456,24 @@ console.log('\n[5] Strategy mode — strategy tester support');
       src.includes(`strategy.exit("TP${n}", "Short"`));
   }
 
-  // strategy.exit SL calls
-  assertTrue('strategy.exit SL for Long',
-    src.includes('strategy.exit("SL", "Long"'));
-  assertTrue('strategy.exit SL for Short',
-    src.includes('strategy.exit("SL", "Short"'));
+  // OCO pattern: stop= is on every TP exit, not a separate SL exit
+  const atrSL = hydrated.exits.hardStop.params.atrSL;
+  if (activeTranches.length > 0) {
+    assertTrue('TP exits include stop= for OCO (Long)',
+      activeTranches.every(({ n }) =>
+        new RegExp(`strategy\\.exit\\("TP${n}", "Long".*stop=`).test(src)));
+    assertTrue('TP exits include stop= for OCO (Short)',
+      activeTranches.every(({ n }) =>
+        new RegExp(`strategy\\.exit\\("TP${n}", "Short".*stop=`).test(src)));
+    assertTrue('No separate SL exit when TPs present',
+      !src.includes('strategy.exit("SL"'));
+  } else {
+    // SL-only (no TPs) — standalone stop exit
+    assertTrue('strategy.exit SL for Long (no TPs)',
+      src.includes('strategy.exit("SL", "Long"'));
+    assertTrue('strategy.exit SL for Short (no TPs)',
+      src.includes('strategy.exit("SL", "Short"'));
+  }
 
   // strategy.close_all for structural/time exits
   assertTrue('strategy.close_all for Structural/Time',
