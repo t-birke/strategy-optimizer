@@ -998,6 +998,34 @@ router.get('/api/specs', async (req, res) => {
 });
 
 /**
+ * GET /api/specs/:filename — return full spec JSON for one file.
+ *
+ * Used by the spec editor's "Load" flow to populate the form from an
+ * existing spec. The list endpoint (GET /api/specs) only returns metadata;
+ * this one returns the full parsed JSON.
+ */
+router.get('/api/specs/:filename', async (req, res) => {
+  try {
+    const filename = req.params.filename;
+    if (!filename.endsWith('.json')) {
+      return res.status(400).json({ error: 'filename must end with .json' });
+    }
+    const path = resolve(process.cwd(), 'strategies', filename);
+    let raw;
+    try {
+      raw = await readFile(path, 'utf8');
+    } catch (err) {
+      if (err.code === 'ENOENT') return res.status(404).json({ error: 'spec not found' });
+      throw err;
+    }
+    const spec = JSON.parse(raw);
+    res.json({ ok: true, filename, spec });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
  * GET /api/blocks
  *
  * Dump the in-memory block registry so the UI can render a block picker

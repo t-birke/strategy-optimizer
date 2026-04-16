@@ -3095,14 +3095,14 @@ function makeParamControlRow(param, override) {
 // Populate (or clear) a slot's param-controls container based on the
 // currently-selected block. If blockId is empty, the container is emptied
 // and CSS (`.spec-params:empty`) hides it entirely.
-function renderParamControls(containerEl, blockId) {
+function renderParamControls(containerEl, blockId, overrides = {}) {
   if (!containerEl) return;
   containerEl.innerHTML = '';
   if (!blockId) return;
   const block = blocksById[blockId];
   if (!block || !Array.isArray(block.params) || block.params.length === 0) return;
   for (const p of block.params) {
-    containerEl.appendChild(makeParamControlRow(p));
+    containerEl.appendChild(makeParamControlRow(p, overrides[p.id]));
   }
 }
 
@@ -3152,7 +3152,7 @@ function readParamOverrides(containerEl, block) {
 // We track rows by reading the DOM on each preview render rather than
 // keeping a parallel JS state array — simpler, and the DOM is the source
 // of truth for what the user sees.
-function makeBlockRow(kind, value = '') {
+function makeBlockRow(kind, value = '', overrides = {}) {
   // Outer wrapper holds the select-row AND the description line below it
   // so a row is visually one unit — description moves with the row when
   // it's reordered or removed. Spacing + the dashed separator between
@@ -3199,7 +3199,7 @@ function makeBlockRow(kind, value = '') {
   paramBox.className = 'spec-params';
   paramBox.dataset.role = 'params';
   paramBox.style.cssText = 'margin-top:6px';
-  renderParamControls(paramBox, select.value);
+  renderParamControls(paramBox, select.value, overrides);
 
   select.addEventListener('change', () => {
     desc.textContent = blockDescriptionFor(select.value);
@@ -3357,7 +3357,9 @@ function buildSpecFromUi() {
     // Phase 4.4: fitness config is now UI-driven. Sliders/inputs emit
     // the same shape engine/spec.js normalizes; walkForward stays
     // hardcoded at the runner defaults (not yet exposed in the editor).
-    fitness: readFitnessFromUi(),
+    // Extra fields (gaOosRatio, frequencyTarget) from the loaded spec
+    // are preserved so they survive a load→edit→save round-trip.
+    fitness: { ...loadedFitnessExtras, ...readFitnessFromUi() },
     walkForward: { nWindows: 5, scheme: 'anchored' },
   };
 }
@@ -3639,20 +3641,251 @@ document.getElementById('spec-copy-json').addEventListener('click', async () => 
   setTimeout(() => { status.textContent = ''; }, 2000);
 });
 
-// ── Save spec to strategies/ (Phase 4.3e) ─────────────────
+// ── Load / Save spec (Phase 4.3e+) ─────────────────────────
 //
-// POSTs the currently-previewed spec to /api/specs. The server re-runs
-// the authoritative validator — the client-side clamps we do in the
-// param-narrowing controls are advisory; the backend is the gate.
+// `currentSpecFilename` tracks the file we loaded from (null = new spec).
+// `loadedFitnessExtras` preserves fitness fields (gaOosRatio, frequencyTarget)
+// that have no UI controls yet, so they survive a load→edit→save round-trip.
+let currentSpecFilename = null;
+let loadedFitnessExtras = {};
+
+function updateEditorHeading() {
+  const el = document.getElementById('spec-editor-heading');
+  if (!el) return;
+  el.textContent = currentSpecFilename
+    ? `Editing: ${currentSpecFilename}`
+    : 'New Strategy Spec';
+}
+
+/**
+ * Populate the "Load existing" picker with specs from GET /api/specs.
+ * Called on page load and after each save so newly-saved specs appear.
+ */
+async function loadSpecPicker() {
+  const $pick = document.getElementById('spec-load-picker');
+  if (!$pick) return;
+  const prev = $pick.value;
+  $pick.innerHTML = '<option value="">— new spec —</option>';
+  try {
+    const r = await fetch('/api/specs');
+    if (!r.ok) return;
+    const data = await r.json();
+    for (const s of data.specs || []) {
+      const opt = document.createElement('option');
+      opt.value = s.filename;
+      opt.textContent = `${s.name}  (${s.filename})`;
+      $pick.appendChild(opt);
+    }
+    // Restore previous selection if still valid.
+    if ([...$pick.options].some(o => o.value === prev)) $pick.value = prev;
+  } catch (err) {
+    console.warn('loadSpecPicker failed:', err.message);
+  }
+}
+
+/**
+ * Reset the spec editor to a blank "new spec" state.
+ */
+function resetSpecEditor() {
+  currentSpecFilename = null;
+  loadedFitnessExtras = {};
+  document.getElementById('spec-name').value = '';
+  document.getElementById('spec-desc').value = '';
+
+  // Fixed-slot selects: reset to first option (None or default).
+  for (const id of ['spec-regime', 'spec-exit-hardstop', 'spec-exit-target', 'spec-exit-trail']) {
+    const sel = document.getElementById(id);
+    if (sel) sel.value = '';
+    renderParamControls(document.getElementById(id + '-params'), '');
+    updateBlockDescription(id);
+  }
+  // Sizing: reset to 'flat' or first available.
+  const sizingSel = document.getElementById('spec-sizing');
+  if (sizingSel) sizingSel.value = [...sizingSel.options].find(o => o.value === 'flat')?.value || sizingSel.options[0]?.value || '';
+  renderParamControls(document.getElementById('spec-sizing-params'), sizingSel?.value || '');
+  updateBlockDescription('spec-sizing');
+  updateSizingReqHint();
+
+  // Entry/filter rows: clear.
+  document.getElementById('spec-entries-list').innerHTML = '';
+  document.getElementById('spec-filters-list').innerHTML = '';
+
+  // Entry mode: reset to 'all'.
+  const modeEl = document.getElementById('spec-entries-mode');
+  if (modeEl) modeEl.value = 'all';
+  const fmodeEl = document.getElementById('spec-filters-mode');
+  if (fmodeEl) fmodeEl.value = 'all';
+  // Threshold inputs.
+  const thrMinEl = document.getElementById('spec-entries-threshold-min');
+  const thrMaxEl = document.getElementById('spec-entries-threshold-max');
+  if (thrMinEl) thrMinEl.value = '1';
+  if (thrMaxEl) thrMaxEl.value = '1';
+
+  // Fitness: reset to defaults.
+  applyFitnessDefaultsToUi();
+
+  updateEditorHeading();
+
+  // Sync load picker.
+  const $pick = document.getElementById('spec-load-picker');
+  if ($pick) $pick.value = '';
+
+  renderSpecPreview();
+}
+
+/**
+ * Load a full spec object into the editor, populating every field.
+ * `filename` is the on-disk filename (e.g. 'my-strat.json') — set to
+ * null when loading a pasted/imported spec that isn't on disk yet.
+ */
+function loadSpecIntoEditor(spec, filename = null) {
+  currentSpecFilename = filename;
+  loadedFitnessExtras = {};
+
+  // ── Name + description ───────────────────────────────────
+  document.getElementById('spec-name').value = spec.name || '';
+  document.getElementById('spec-desc').value = spec.description || '';
+
+  // ── Helper: set a fixed-slot select + render its params ──
+  const setFixedSlot = (selectId, blockRef) => {
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    const blockId = blockRef?.block || '';
+    // Ensure the option exists before setting.
+    if (blockId && ![...sel.options].some(o => o.value === blockId)) {
+      const opt = document.createElement('option');
+      opt.value = blockId;
+      opt.textContent = blockId;
+      sel.appendChild(opt);
+    }
+    sel.value = blockId;
+    renderParamControls(
+      document.getElementById(selectId + '-params'),
+      blockId,
+      blockRef?.params || {},
+    );
+    updateBlockDescription(selectId);
+  };
+
+  // ── Regime ───────────────────────────────────────────────
+  setFixedSlot('spec-regime', spec.regime);
+
+  // ── Exits ────────────────────────────────────────────────
+  setFixedSlot('spec-exit-hardstop', spec.exits?.hardStop);
+  setFixedSlot('spec-exit-target',   spec.exits?.target);
+  setFixedSlot('spec-exit-trail',    spec.exits?.trail);
+
+  // ── Sizing ───────────────────────────────────────────────
+  setFixedSlot('spec-sizing', spec.sizing);
+  updateSizingReqHint();
+
+  // ── Entries ──────────────────────────────────────────────
+  const entriesMode = spec.entries?.mode || 'all';
+  const modeEl = document.getElementById('spec-entries-mode');
+  if (modeEl) {
+    modeEl.value = entriesMode;
+    modeEl.dispatchEvent(new Event('change'));
+  }
+  if (entriesMode === 'score' && spec.entries?.threshold) {
+    const thr = spec.entries.threshold;
+    const thrMinEl = document.getElementById('spec-entries-threshold-min');
+    const thrMaxEl = document.getElementById('spec-entries-threshold-max');
+    if ('value' in thr) {
+      if (thrMinEl) thrMinEl.value = thr.value;
+      if (thrMaxEl) thrMaxEl.value = thr.value;
+    } else {
+      if (thrMinEl) thrMinEl.value = thr.min ?? 1;
+      if (thrMaxEl) thrMaxEl.value = thr.max ?? thr.min ?? 1;
+    }
+  }
+  const entriesList = document.getElementById('spec-entries-list');
+  entriesList.innerHTML = '';
+  for (const block of (spec.entries?.blocks || [])) {
+    if (!block?.block) continue;
+    const row = makeBlockRow('entry', block.block, block.params || {});
+    entriesList.appendChild(row);
+  }
+
+  // ── Filters ──────────────────────────────────────────────
+  const fmodeEl = document.getElementById('spec-filters-mode');
+  if (fmodeEl) {
+    fmodeEl.value = spec.filters?.mode || 'all';
+    fmodeEl.dispatchEvent(new Event('change'));
+  }
+  const filtersList = document.getElementById('spec-filters-list');
+  filtersList.innerHTML = '';
+  for (const block of (spec.filters?.blocks || [])) {
+    if (!block?.block) continue;
+    const row = makeBlockRow('filter', block.block, block.params || {});
+    filtersList.appendChild(row);
+  }
+
+  // ── Fitness ──────────────────────────────────────────────
+  if (spec.fitness) {
+    const fit = spec.fitness;
+    setFitnessInputs({
+      weights: { pf: fit.weights?.pf ?? 0.5, dd: fit.weights?.dd ?? 0.3, ret: fit.weights?.ret ?? 0.2 },
+      caps:    { pf: fit.caps?.pf ?? 4.0, ret: fit.caps?.ret ?? 2.0 },
+      gates:   {
+        minTradesPerWindow: fit.gates?.minTradesPerWindow ?? 30,
+        worstRegimePfFloor: fit.gates?.worstRegimePfFloor ?? 1.0,
+        wfeMin:             fit.gates?.wfeMin ?? 0.5,
+      },
+    });
+    // Preserve fields that the UI doesn't have controls for yet
+    // (gaOosRatio, frequencyTarget, etc.) so they survive a round-trip.
+    const knownKeys = new Set(['weights', 'caps', 'gates']);
+    for (const k of Object.keys(fit)) {
+      if (!knownKeys.has(k)) loadedFitnessExtras[k] = fit[k];
+    }
+  }
+
+  updateEditorHeading();
+
+  // Sync load picker to current file.
+  const $pick = document.getElementById('spec-load-picker');
+  if ($pick && filename) $pick.value = filename;
+
+  renderSpecPreview();
+}
+
+/**
+ * Fetch a spec from disk by filename and load it into the editor.
+ */
+async function loadSpecFromFile(filename) {
+  if (!filename) return resetSpecEditor();
+  const status = document.getElementById('spec-save-status');
+  const setStatus = (text, color) => { status.textContent = text; status.style.color = color; };
+  setStatus('Loading…', '#8b949e');
+  try {
+    const r = await fetch(`/api/specs/${encodeURIComponent(filename)}`);
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      setStatus(body.error || `Load failed (HTTP ${r.status})`, '#f85149');
+      return;
+    }
+    const data = await r.json();
+    loadSpecIntoEditor(data.spec, data.filename);
+    setStatus(`Loaded ${filename}`, '#3fb950');
+    setTimeout(() => { if (status.textContent.startsWith('Loaded')) status.textContent = ''; }, 2000);
+  } catch (err) {
+    setStatus(`Network error: ${err.message}`, '#f85149');
+  }
+}
+
+// Load-picker wiring: click Load to fetch + populate.
+document.getElementById('spec-load-btn').addEventListener('click', () => {
+  loadSpecFromFile(document.getElementById('spec-load-picker').value);
+});
+
+// ── Save / Save As ─────────────────────────────────────────
 //
-// Three interesting branches:
-//   400 — validation failed. Server returns a newline-joined bullet
-//         list; we render it verbatim so the user sees every issue.
-//   409 — a file with that name already exists. Show a confirm()
-//         prompt; on yes, re-POST with ?overwrite=1.
-//   200/201 — happy path. Show "Saved ✓ as <filename>" and leave the
-//         form alone so the user can keep iterating.
-async function saveSpec({ overwrite = false } = {}) {
+// Save: if editing an existing spec, overwrites it directly. If creating
+// a new spec, behaves like the old save (409 on conflict → confirm).
+//
+// Save As: always saves as a new file. Prompts for a new name if the
+// current name matches the loaded spec (to avoid accidental overwrite).
+async function saveSpec({ overwrite = false, saveAs = false } = {}) {
   const status = document.getElementById('spec-save-status');
   const setStatus = (text, color) => {
     status.textContent = text;
@@ -3660,10 +3893,30 @@ async function saveSpec({ overwrite = false } = {}) {
   };
   setStatus('Saving…', '#8b949e');
 
-  // Always rebuild from the UI — don't trust the preview pre text, which
-  // could be stale if the user somehow typed between build and save.
   const spec = buildSpecFromUi();
-  const url = '/api/specs' + (overwrite ? '?overwrite=1' : '');
+
+  // Save As: if the name still produces the same filename as the loaded
+  // spec, nudge the user to rename so they don't accidentally overwrite.
+  if (saveAs && currentSpecFilename) {
+    const wouldProduce = spec.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') + '.json';
+    if (wouldProduce === currentSpecFilename) {
+      const newName = prompt(
+        'Save As requires a new name.\n\nEnter a name for the variation:',
+        spec.name + '-v2',
+      );
+      if (!newName) {
+        setStatus('Save As cancelled.', '#8b949e');
+        return;
+      }
+      spec.name = newName.trim();
+      document.getElementById('spec-name').value = spec.name;
+      renderSpecPreview();
+    }
+  }
+
+  // When editing a loaded spec (not Save As), auto-overwrite.
+  const shouldOverwrite = overwrite || (!saveAs && currentSpecFilename != null);
+  const url = '/api/specs' + (shouldOverwrite ? '?overwrite=1' : '');
   let res, body;
   try {
     res = await fetch(url, {
@@ -3680,11 +3933,14 @@ async function saveSpec({ overwrite = false } = {}) {
   if (res.ok && body.ok) {
     const verb = body.overwritten ? 'Overwrote' : 'Saved';
     setStatus(`✓ ${verb} ${body.filename}`, '#3fb950');
+    // After save: track the file so subsequent Saves overwrite it.
+    currentSpecFilename = body.filename;
+    updateEditorHeading();
+    loadSpecPicker(); // refresh the picker so the new/updated spec appears
     return;
   }
 
   if (res.status === 409 && body.filename) {
-    // Duplicate — ask before clobbering the user's existing file.
     const go = confirm(
       `A spec named "${body.filename}" already exists.\n\nOverwrite it?`
     );
@@ -3692,12 +3948,10 @@ async function saveSpec({ overwrite = false } = {}) {
       setStatus('Save cancelled — existing file kept.', '#8b949e');
       return;
     }
-    return saveSpec({ overwrite: true });
+    return saveSpec({ overwrite: true, saveAs });
   }
 
   if (res.status === 400) {
-    // validateSpec's message is newline-joined; rendering in a
-    // white-space:pre-wrap block preserves the bullet layout.
     setStatus(body.error || 'Validation failed', '#f85149');
     return;
   }
@@ -3705,6 +3959,7 @@ async function saveSpec({ overwrite = false } = {}) {
   setStatus(body.error || `Save failed (HTTP ${res.status})`, '#f85149');
 }
 document.getElementById('spec-save').addEventListener('click', () => saveSpec());
+document.getElementById('spec-save-as').addEventListener('click', () => saveSpec({ saveAs: true }));
 
 // ─── Init ───────────────────────────────────────────────────
 loadSymbols();
@@ -3712,6 +3967,7 @@ loadRuns();
 loadQueue();
 loadBlocksForEditor();
 loadFitnessDefaults();
+loadSpecPicker();
 
 // Refresh periodically
 setInterval(loadSymbols, 30000);
