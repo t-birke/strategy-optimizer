@@ -408,7 +408,7 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titl
   push(`// Generated: ${new Date().toISOString()}`);
   push('');
   push('//@version=5');
-  push(`indicator("${title}", "${stitle}", overlay=true, max_labels_count=500)`);
+  push(`strategy("${title}", "${stitle}", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.04, pyramiding=0)`);
   push('');
 
   // ─── Ticker override input (for webhook routing) ───────────
@@ -654,6 +654,76 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titl
     push('if barstate.islast');
     push(`    table.cell(regimeTbl, 0, 0, "regime: " + str.tostring(${regimeName}), text_color=color.white, text_size=size.small)`);
   }
+
+  // ─── Strategy execution ──────────────────────────────────────
+  // strategy.entry/exit/close calls for TradingView's strategy tester.
+  // These run in parallel with the exit state machine (which drives
+  // visualization + Wundertrading alerts). Small discrepancies between
+  // the two are acceptable: the state machine uses close-based SL with
+  // 1-bar defer and closes the full position on first TP (v1
+  // simplification), while the strategy tester uses intra-bar stops
+  // and proper multi-TP scale-out via strategy.exit(qty_percent).
+  push('');
+  push('// ============ STRATEGY EXECUTION ============');
+
+  // Track entry prices independently of the exit state machine, which
+  // resets pos_entry/pos_entry_atr on first TP hit. The strategy needs
+  // these prices to stay valid for the remaining partial position.
+  push('var float strat_entry  = na');
+  if (wt_hasTp) push('var float strat_atr_tp = na');
+  if (wt_hasSl) push('var float strat_atr_hs = na');
+
+  push('if goLong or goShort');
+  push('    strat_entry := close');
+  if (wt_hasTp) push(`    strat_atr_tp := nz(atr_${idSfx(wt_tg.params.atrLen)}[1])`);
+  if (wt_hasSl) push(`    strat_atr_hs := nz(atr_${idSfx(wt_hs.params.atrLen)}[1])`);
+
+  push('if goLong');
+  push('    strategy.entry("Long", strategy.long)');
+  push('if goShort');
+  push('    strategy.entry("Short", strategy.short)');
+  push('');
+
+  // TP exits — each tranche gets its own strategy.exit with adjusted
+  // qty_percent. TradingView's qty_percent is of the CURRENT position
+  // (not the original), so we adjust: tranche_pct / remaining * 100.
+  if (wt_tranches.length > 0 || wt_hasSl) {
+    // Compute adjusted qty_percent at codegen time (tranches are frozen literals).
+    let remaining = 100;
+    const adjTranches = wt_tranches.map((t, i) => {
+      const adj = i === wt_tranches.length - 1
+        ? 100  // last tranche always closes remaining
+        : Math.round(t.pct / remaining * 10000) / 100;
+      remaining -= t.pct;
+      return { ...t, adjPct: adj };
+    });
+
+    // Long exits
+    push('if strategy.position_size > 0');
+    for (const { n, mult, adjPct } of adjTranches) {
+      push(`    strategy.exit("TP${n}", "Long", qty_percent=${adjPct}, limit=strat_entry + strat_atr_tp * ${mult})`);
+    }
+    if (wt_hasSl) {
+      push(`    strategy.exit("SL", "Long", stop=strat_entry - strat_atr_hs * ${wt_hs.params.atrSL})`);
+    }
+
+    // Short exits
+    push('if strategy.position_size < 0');
+    for (const { n, mult, adjPct } of adjTranches) {
+      push(`    strategy.exit("TP${n}", "Short", qty_percent=${adjPct}, limit=strat_entry - strat_atr_tp * ${mult})`);
+    }
+    if (wt_hasSl) {
+      push(`    strategy.exit("SL", "Short", stop=strat_entry + strat_atr_hs * ${wt_hs.params.atrSL})`);
+    }
+    push('');
+  }
+
+  // Structural / Time exits — close the entire remaining position.
+  // Reversals don't need strategy.close: strategy.entry in the opposite
+  // direction auto-closes the current position (pyramiding=0).
+  push('if bar_exit and (bar_exit_reason == "Structural" or bar_exit_reason == "Time")');
+  push('    strategy.close_all(comment=bar_exit_reason)');
+  push('');
 
   return {
     source: lines.join('\n') + '\n',

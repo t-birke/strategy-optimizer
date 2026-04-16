@@ -323,7 +323,7 @@ console.log('\n[3] Graceful degradation — partial or missing exit blocks');
 }
 
 // ═══════════════════════════════════════════════════════════════
-// [4] Backward compatibility
+// [4] Backward compatibility — viz + alertcondition preserved
 // ═══════════════════════════════════════════════════════════════
 console.log('\n[4] Backward compatibility — viz + alertcondition preserved');
 {
@@ -365,6 +365,81 @@ console.log('\n[4] Backward compatibility — viz + alertcondition preserved');
   // Ticker override input still present.
   assertTrue('i_tickerOverride input preserved',
     src.includes('i_tickerOverride'));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// [5] Strategy execution — strategy() + entry/exit/close calls
+// ═══════════════════════════════════════════════════════════════
+console.log('\n[5] Strategy execution — strategy tester support');
+{
+  const { result, hydrated } = generateFull();
+  const src = result.source;
+
+  // strategy() declaration instead of indicator()
+  assertTrue('strategy() declaration (not indicator)',
+    src.includes('strategy(') && !src.includes('indicator('));
+  assertTrue('pyramiding=0',
+    src.includes('pyramiding=0'));
+  assertTrue('overlay=true',
+    src.includes('overlay=true'));
+
+  // strategy.entry calls
+  assertTrue('strategy.entry Long',
+    src.includes('strategy.entry("Long", strategy.long)'));
+  assertTrue('strategy.entry Short',
+    src.includes('strategy.entry("Short", strategy.short)'));
+
+  // strategy.exit TP calls for active tranches
+  const tg = hydrated.exits.target;
+  const activeTranches = [];
+  for (let n = 1; n <= 6; n++) {
+    const pct = tg.params[`tp${n}Pct`];
+    const mult = tg.params[`tp${n}Mult`];
+    if (pct > 0 && mult > 0) activeTranches.push({ n, mult, pct });
+  }
+  activeTranches.sort((a, b) => a.mult - b.mult);
+
+  for (const { n } of activeTranches) {
+    assertTrue(`strategy.exit TP${n} for Long`,
+      src.includes(`strategy.exit("TP${n}", "Long"`));
+    assertTrue(`strategy.exit TP${n} for Short`,
+      src.includes(`strategy.exit("TP${n}", "Short"`));
+  }
+
+  // strategy.exit SL calls
+  assertTrue('strategy.exit SL for Long',
+    src.includes('strategy.exit("SL", "Long"'));
+  assertTrue('strategy.exit SL for Short',
+    src.includes('strategy.exit("SL", "Short"'));
+
+  // strategy.close_all for structural/time exits
+  assertTrue('strategy.close_all for Structural/Time',
+    src.includes('strategy.close_all(comment=bar_exit_reason)'));
+
+  // Independent price tracking vars (not reset by exit state machine)
+  assertTrue('strat_entry var declared',
+    src.includes('var float strat_entry'));
+  assertTrue('strat_atr_tp var declared',
+    src.includes('var float strat_atr_tp'));
+  assertTrue('strat_atr_hs var declared',
+    src.includes('var float strat_atr_hs'));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// [5b] Strategy graceful degradation — no exits
+// ═══════════════════════════════════════════════════════════════
+console.log('\n[5b] Strategy — no exits → entry-only strategy');
+{
+  const { result } = generateWithExits({
+    hardStop: null, target: null, trail: null,
+  });
+  const src = result.source;
+  assertTrue('strategy.entry still present',
+    src.includes('strategy.entry("Long", strategy.long)'));
+  assertTrue('No strategy.exit calls',
+    !src.includes('strategy.exit('));
+  assertTrue('strategy.close_all still present (dead path when no exits)',
+    src.includes('strategy.close_all(comment=bar_exit_reason)'));
 }
 
 // ═══════════════════════════════════════════════════════════════
