@@ -1190,7 +1190,7 @@ trade at any time. Consequences:
 - **P&L attribution is automatic** — one sub-account per strategy
   means exchange-level P&L *is* strategy-level P&L.
 
-##### 4.7b (revised) — Wundertrading-compatible Pine alert payloads
+##### ✅ 4.7b (revised) — Wundertrading-compatible Pine alert payloads — done.
 
 **Goal:** update `engine/pine-codegen.js` so generated indicators emit
 Wundertrading Signal Bot-compatible JSON in their `alert()` calls. The
@@ -1320,9 +1320,9 @@ way this is a small follow-up, not blocking.
   percentage-based, not ATR-based — format mismatch with our
   `structuralExit` block)
 
-**Gate (`scripts/pine-wundertrading-check.js`):**
+**Gate (`scripts/pine-wundertrading-check.js`) — 74/74 ✓:**
 - [1] **Codegen output**: generate Pine from the migration-gate spec +
-  a known gene (same fixture as `ui-pine-export-check.js`). Verify:
+  a random gene (same fixture pattern as `ui-pine-export-check.js`). Verify:
   - New inputs present in Webhook group: `i_posSize`, `i_leverage`,
     `i_codeLong`, `i_codeShort`, `i_codeExit` with correct types and
     defaults.
@@ -1339,8 +1339,8 @@ way this is a small follow-up, not blocking.
   - Only active tranches (tpNPct > 0) emitted in the TP array.
   - Portfolio fractions = `tpNPct / 100` per tranche, sum ≤ 1.0.
 - [2] **Exit alert gating**: verify `alert(f_exit_json(...))` is guarded
-  by `bar_exit_reason` check — fires for Structural/Time/Reversal, NOT
-  for TP/SL/ESL.
+  by `bar_exit_reason` check — fires for Structural/Time only, NOT
+  for TP/SL/ESL (exchange orders) or Reversal (swing mode).
 - [3] **Graceful degradation**: generate Pine from a synthetic spec
   with no target block → `takeProfits` absent from JSON. No hardStop →
   `stopLoss` absent. Neither → entry-only alert.

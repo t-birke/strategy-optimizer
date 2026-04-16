@@ -152,6 +152,11 @@ function directionGatedSignals(blockId, version, pineRet) {
 // Safe Pine identifier suffix from a numeric param (dots → 'p').
 function idSfx(v) { return String(v).replace(/\./g, 'p').replace(/-/g, 'n'); }
 
+/** Format a 0–1 fraction for a Pine numeric literal: strip trailing zeros. */
+function formatFrac(f) {
+  return f.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+}
+
 function emitExitStateMachine(push, hydrated) {
   const hs = hydrated.exits.hardStop;
   const tg = hydrated.exits.target;
@@ -409,6 +414,11 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, shortTitle 
   push('GRP_WH = "Webhook"');
   push('i_tickerOverride = input.string("", "Ticker Override", tooltip="Leave empty to use chart ticker. Set e.g. \'SOLUSDT.P\' for exchange-specific routing.", group=GRP_WH)');
   push('string ticker = i_tickerOverride != "" ? i_tickerOverride : syminfo.ticker');
+  push('i_posSize = input.float(0.1, "Position Size (fraction)", minval=0.001, maxval=1.0, step=0.01, tooltip="Wundertrading amountPerTrade: 0.1 = 10%% of sub-account equity.", group=GRP_WH)');
+  push('i_leverage = input.int(1, "Leverage", minval=1, maxval=125, step=1, tooltip="Exchange leverage multiplier.", group=GRP_WH)');
+  push('i_codeLong = input.string("ENTER-LONG", "Code: Long Entry", tooltip="Wundertrading Signal Bot comment code for long entries.", group=GRP_WH)');
+  push('i_codeShort = input.string("ENTER-SHORT", "Code: Short Entry", tooltip="Wundertrading Signal Bot comment code for short entries.", group=GRP_WH)');
+  push('i_codeExit = input.string("EXIT-ALL", "Code: Exit", tooltip="Wundertrading Signal Bot comment code for structural/time exits. TPs and SLs are handled by exchange conditional orders.", group=GRP_WH)');
   push('');
 
   // ─── Regime (optional, passive for now) ────────────────────
@@ -531,21 +541,100 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, shortTitle 
   push('if bar_exit and bar_exit_dir < 0');
   push('    label.new(bar_index, low,  bar_exit_reason, xloc=xloc.bar_index, yloc=yloc.belowbar, style=label.style_label_up,   color=color.aqua,   textcolor=color.black, size=size.small)');
   push('');
-  // Single-line JSON to keep Pine v5 => syntax happy.
+  // ── Wundertrading alert payloads ──────────────────────────────
+  // Pre-compute ATR values on every bar as global floats. Avoids the
+  // Pine v5 gotcha where historical references ([1]) inside a function
+  // that's only called conditionally may give stale values.
+  const wt_hs = hydrated.exits?.hardStop;
+  const wt_tg = hydrated.exits?.target;
+  const wt_hasTp = wt_tg?.blockId === 'atrScaleOutTarget';
+  const wt_hasSl = wt_hs?.blockId === 'atrHardStop';
+  const wt_hasBe = wt_hasTp && wt_hasSl;
+
+  // Active tranches sorted by mult ascending (nearest TP fires first).
+  const wt_tranches = [];
+  if (wt_hasTp) {
+    for (let n = 1; n <= 6; n++) {
+      const pct  = wt_tg.params[`tp${n}Pct`];
+      const mult = wt_tg.params[`tp${n}Mult`];
+      if (pct > 0 && mult > 0) wt_tranches.push({ n, mult, pct });
+    }
+    wt_tranches.sort((a, b) => a.mult - b.mult);
+  }
+
+  push('// ============ WUNDERTRADING ALERT PAYLOADS ============');
+  if (wt_hasTp) {
+    push(`float wt_atr_tp = nz(atr_${idSfx(wt_tg.params.atrLen)}[1])`);
+  }
+  if (wt_hasSl && (!wt_hasTp || wt_hs.params.atrLen !== wt_tg.params.atrLen)) {
+    push(`float wt_atr_sl = nz(atr_${idSfx(wt_hs.params.atrLen)}[1])`);
+  }
+  push('');
+
+  // f_ts() preserved for dual-webhook / logging use.
   push('f_ts() =>');
   push(`    str.tostring(year) + '-' + str.tostring(month, "00") + '-' + str.tostring(dayofmonth, "00") + 'T' + str.tostring(hour, "00") + ':' + str.tostring(minute, "00") + 'Z'`);
   push('');
+
+  // f_entry_json — Wundertrading Signal Bot entry payload.
+  // TP prices = close ± ATR × mult; SL = close ∓ ATR × slMult.
+  // moveToBreakeven shifts SL to entry price when TP1 is reached.
   push('f_entry_json(string dir) =>');
-  push(`    '{"action":"open","ticker":"' + ticker + '","direction":"' + dir + '","reason":"signal","price":' + str.tostring(close, "#.####") + ',"time":"' + f_ts() + '"}'`);
+  push('    bool is_l = dir == "long"');
+
+  for (const { n, mult } of wt_tranches) {
+    push(`    float tp${n} = is_l ? close + wt_atr_tp * ${mult} : close - wt_atr_tp * ${mult}`);
+  }
+  if (wt_hasSl) {
+    const atrVar = (wt_hasTp && wt_hs.params.atrLen === wt_tg.params.atrLen) ? 'wt_atr_tp' : 'wt_atr_sl';
+    push(`    float sl = is_l ? close - ${atrVar} * ${wt_hs.params.atrSL} : close + ${atrVar} * ${wt_hs.params.atrSL}`);
+  }
+
+  // JSON assembled from local string parts for readability.
+  push(`    string s_code = '{"code":"' + (is_l ? i_codeLong : i_codeShort) + '"'`);
+  push(`    string s_order = ',"orderType":"market","amountPerTradeType":"percents","amountPerTrade":' + str.tostring(i_posSize) + ',"leverage":' + str.tostring(i_leverage)`);
+
+  if (wt_tranches.length > 0) {
+    let tpLine = `    string s_tp = ',"takeProfits":['`;
+    for (let i = 0; i < wt_tranches.length; i++) {
+      const { n, pct } = wt_tranches[i];
+      if (i > 0) tpLine += ` + ','`;
+      tpLine += ` + '{"price":' + str.tostring(tp${n}, "#.####") + ',"portfolio":${formatFrac(pct / 100)}}'`;
+    }
+    tpLine += ` + ']'`;
+    push(tpLine);
+  }
+
+  if (wt_hasSl) {
+    push(`    string s_sl = ',"stopLoss":{"price":' + str.tostring(sl, "#.####") + '}'`);
+  }
+
+  if (wt_hasBe && wt_tranches.length > 0) {
+    const tp1Var = `tp${wt_tranches[0].n}`;
+    push(`    string s_be = ',"moveToBreakeven":{"activationPrice":' + str.tostring(${tp1Var}, "#.####") + ',"executePrice":' + str.tostring(close, "#.####") + '}'`);
+  }
+
+  // Return expression — concatenate parts + fixed tail.
+  const parts = ['s_code', 's_order'];
+  if (wt_tranches.length > 0)             parts.push('s_tp');
+  if (wt_hasSl)                           parts.push('s_sl');
+  if (wt_hasBe && wt_tranches.length > 0) parts.push('s_be');
+  push(`    ${parts.join(' + ')} + ',"placeConditionalOrdersOnExchange":true,"reduceOnly":true}'`);
   push('');
+
+  // f_exit_json — minimal close payload for structural / time exits.
+  // TPs/SLs are exchange conditional orders; reversals use swing mode.
   push('f_exit_json(string dir, string reason) =>');
-  push(`    '{"action":"close","ticker":"' + ticker + '","direction":"' + dir + '","reason":"' + reason + '","price":' + str.tostring(close, "#.####") + ',"time":"' + f_ts() + '"}'`);
+  push(`    '{"code":"' + i_codeExit + '","orderType":"market","reduceOnly":true}'`);
   push('');
+
   push('if goLong');
   push('    alert(f_entry_json("long"),  alert.freq_once_per_bar)');
   push('if goShort');
   push('    alert(f_entry_json("short"), alert.freq_once_per_bar)');
-  push('if bar_exit');
+  // Exit alerts: only structural/time. TP/SL = exchange conditional
+  // orders, reversals = handled by the entry alert via swing mode.
+  push('if bar_exit and (bar_exit_reason == "Structural" or bar_exit_reason == "Time")');
   push('    alert(f_exit_json(bar_exit_dir > 0 ? "long" : "short", bar_exit_reason), alert.freq_once_per_bar)');
   push('');
   push('alertcondition(goLong,   "Long Entry",   "Long entry opens new position")');
