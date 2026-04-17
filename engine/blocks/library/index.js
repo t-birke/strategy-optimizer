@@ -36,12 +36,14 @@ import structuralExit     from './exit/structural-exit.js';
 // ── Sizing ──────────────────────────────────────────────────
 import flat               from './sizing/flat.js';
 import pctOfEquity        from './sizing/pct-of-equity.js';
+import pctOfInitial       from './sizing/pct-of-initial.js';
 import atrRisk            from './sizing/atr-risk.js';
 import martingale         from './sizing/martingale.js';
 import antiMartingale     from './sizing/anti-martingale.js';
 import kelly              from './sizing/kelly.js';
 import fixedFractional    from './sizing/fixed-fractional.js';
 import equityCurveTrading from './sizing/equity-curve-trading.js';
+import volTargetSizing    from './sizing/vol-target.js';
 
 const BLOCKS = [
   // Entries
@@ -68,13 +70,14 @@ const BLOCKS = [
   // Sizing
   flat,
   pctOfEquity,
+  pctOfInitial,
   atrRisk,
   martingale,
   antiMartingale,
   kelly,
   fixedFractional,
   equityCurveTrading,
-  // Filter / regime blocks appended below as tiers land.
+  volTargetSizing,
 ];
 
 for (const b of BLOCKS) register(b);
