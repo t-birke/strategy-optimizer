@@ -18,7 +18,10 @@
  *      explicit caps so the weights compose additively:
  *        pf  → min(PF, caps.pf)   / caps.pf
  *        dd  → clamp(1 - maxDDPct, 0, 1)
- *        ret → clamp(netPct / caps.ret, 0, 1)
+ *        ret → clamp(CAGR / caps.ret, 0, 1)
+ *      The return term uses annualized return (CAGR) so the cap is
+ *      duration-independent — the same `caps.ret` works whether the
+ *      dataset spans 3 months or 5 years.
  *      Final: Σ w_i · normalized_i, with weights normalized to sum 1.
  *
  * Design choices worth calling out:
@@ -180,9 +183,15 @@ export function computeFitness({ metrics, fitnessConfig, wfReport = null }) {
   // ─── Composite normalization ───────────────────────────────
   // Happens even for eliminated genes so the breakdown is observable —
   // useful for UI / debugging "why did this gene fail?".
+  //
+  // Return dimension uses ANNUALIZED return (CAGR) so the cap is
+  // duration-independent — a 3-month sprint and a 5-year marathon are
+  // scored on the same scale. Falls back to total return if runtime
+  // didn't emit annualizedReturnPct (legacy / missing periodYears).
   const normPf  = normalizePf(metrics.pf, caps.pf);
   const normDd  = normalizeDd(metrics.maxDDPct);
-  const normRet = normalizeRet(metrics.netProfitPct, caps.ret);
+  const retForScoring = numberOr(metrics.annualizedReturnPct, metrics.netProfitPct);
+  const normRet = normalizeRet(retForScoring, caps.ret);
 
   const weightsN = normalizeWeights(weights);
   const rawComposite =
@@ -256,12 +265,14 @@ export function normalizeDd(maxDdPct) {
 }
 
 /**
- * Net-profit fraction normalized by caps.ret. Negative net → 0 (losers
- * don't collect the return premium). caps.ret=2.0 means "a 200% return
- * saturates"; anything beyond is already maximum on this dimension.
+ * Annualized return fraction normalized by caps.ret. Negative → 0
+ * (losers don't collect the return premium). caps.ret=1.0 means
+ * "100% annualized return saturates". The input should be CAGR (from
+ * metrics.annualizedReturnPct); falls back to total netProfitPct when
+ * annualized data isn't available.
  */
 export function normalizeRet(netProfitPct, capRet) {
-  const cap = numberOr(capRet, 2.0);
+  const cap = numberOr(capRet, 1.0);
   const net = numberOr(netProfitPct, 0);
   if (net <= 0) return 0;
   return Math.min(net, cap) / cap;

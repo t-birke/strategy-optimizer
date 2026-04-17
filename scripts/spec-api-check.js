@@ -332,7 +332,7 @@ async function main() {
       assertEq('weights.dd',  fit.weights.dd,  0.3);
       assertEq('weights.ret', fit.weights.ret, 0.2);
       assertEq('caps.pf',     fit.caps.pf,     4.0);
-      assertEq('caps.ret',    fit.caps.ret,    2.0);
+      assertEq('caps.ret',    fit.caps.ret,    1.0);  // annualized (CAGR)
       assertEq('gates.minTradesPerWindow', fit.gates.minTradesPerWindow, 30);
       assertEq('gates.worstRegimePfFloor', fit.gates.worstRegimePfFloor, 1.0);
       assertEq('gates.wfeMin',             fit.gates.wfeMin,             0.5);

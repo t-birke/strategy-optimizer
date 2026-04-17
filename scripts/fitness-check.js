@@ -142,7 +142,7 @@ console.log('\n[6] computeFitness — happy path (BTC-winner-ish metrics)');
   assertEq('gatesFailed empty', r.gatesFailed, []);
   // normPf = 1.34/4.0 = 0.335
   // normDd = 1 - 0.18 = 0.82
-  // normRet= min(2.40,2.0)/2.0 = 1.0
+  // normRet= min(2.40,1.0)/1.0 = 1.0  (caps.ret is annualized CAGR cap)
   // score  = 0.5*0.335 + 0.3*0.82 + 0.2*1.0 = 0.1675 + 0.246 + 0.2 = 0.6135
   assertClose('score',    r.score,               0.6135, 1e-4);
   assertClose('normPf',   r.breakdown.normPf,    0.335,  1e-4);
@@ -519,6 +519,59 @@ console.log('\n[18] computeFitness — trade frequency scaling (4.9b)');
     r80.score > r40.score,
     `80pos=${r80.score.toFixed(4)}, 40pos=${r40.score.toFixed(4)}`,
   );
+}
+
+// ─── 19. Annualized return scoring ─────────────────────────────
+// The return dimension now uses annualizedReturnPct (CAGR) when available
+// in metrics, falling back to netProfitPct. This makes caps.ret duration-
+// independent: a 3-month run and a 5-year run compete on the same scale.
+console.log('\n[19] computeFitness — annualized return (CAGR) scoring');
+{
+  // Two strategies with identical total returns (200%) but different periods.
+  // 200% over 1 year → CAGR = 200%/yr
+  // 200% over 4 years → CAGR ≈ 31.6%/yr  ((1+2)^(1/4) - 1)
+  // With caps.ret = 1.0 (100% annualized):
+  //   short run: normRet = min(2.0, 1.0)/1.0 = 1.0 (saturated)
+  //   long  run: normRet = min(0.316, 1.0)/1.0 ≈ 0.316
+  const baseMetrics = {
+    trades: 500, totalPositions: 500, pf: 1.5, maxDDPct: 0.15,
+    netProfitPct: 2.0,
+    regimeBreakdown: {
+      bull: { trades: 300, pf: 1.8, net: 90000, wins: 180, grossProfit: 200000, grossLoss: 110000 },
+      bear: { trades: 200, pf: 1.3, net: 30000, wins: 110, grossProfit: 130000, grossLoss: 100000 },
+    },
+  };
+
+  // 1-year strategy: CAGR = (1+2)^(1/1) - 1 = 2.0
+  const shortRun = {
+    ...baseMetrics,
+    annualizedReturnPct: Math.pow(1 + 2.0, 1 / 1) - 1, // 2.0
+    periodYears: 1,
+  };
+  // 4-year strategy: CAGR = (1+2)^(1/4) - 1 ≈ 0.3161
+  const longRun = {
+    ...baseMetrics,
+    annualizedReturnPct: Math.pow(1 + 2.0, 1 / 4) - 1,  // ≈ 0.3161
+    periodYears: 4,
+  };
+
+  const rShort = computeFitness({ metrics: shortRun, fitnessConfig: DEFAULT_FITNESS });
+  const rLong  = computeFitness({ metrics: longRun,  fitnessConfig: DEFAULT_FITNESS });
+
+  assertTrue('short run not eliminated', !rShort.eliminated);
+  assertTrue('long run not eliminated',  !rLong.eliminated);
+  assertClose('short run: normRet saturates at 1.0', rShort.breakdown.normRet, 1.0, 1e-4);
+  assertClose('long run: normRet ≈ 0.316', rLong.breakdown.normRet, 0.3161, 1e-3);
+  assertTrue(
+    'short run scores higher (same total return, faster CAGR)',
+    rShort.score > rLong.score,
+    `short=${rShort.score.toFixed(4)}, long=${rLong.score.toFixed(4)}`,
+  );
+
+  // Fallback: without annualizedReturnPct, uses raw netProfitPct
+  const noAnnualized = { ...baseMetrics }; // no annualizedReturnPct field
+  const rFallback = computeFitness({ metrics: noAnnualized, fitnessConfig: DEFAULT_FITNESS });
+  assertClose('fallback normRet = min(2.0, 1.0)/1.0 = 1.0', rFallback.breakdown.normRet, 1.0, 1e-4);
 }
 
 // ─── Summary ────────────────────────────────────────────────

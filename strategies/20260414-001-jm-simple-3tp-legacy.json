@@ -208,13 +208,13 @@
   "constraints": [],
   "fitness": {
     "weights": {
-      "pf": 0.3,
-      "dd": 0.25,
-      "ret": 0.45
+      "pf": 0.25,
+      "dd": 0.2,
+      "ret": 0.55
     },
     "caps": {
       "pf": 4,
-      "ret": 3
+      "ret": 1.5
     },
     "gates": {
       "minTradesPerWindow": 30,

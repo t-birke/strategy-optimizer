@@ -550,6 +550,15 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
     };
   }
 
+  // Annualized return (CAGR). Used by computeFitness so the return cap
+  // is duration-independent: a 3-month run and a 5-year run are scored
+  // on the same scale. periodYears comes from the bundle; 0 or missing
+  // means "unknown" — fitness falls back to total return in that case.
+  const periodYears = bundle.periodYears ?? 0;
+  const annualizedReturnPct = periodYears > 0 && netProfitPct > -1
+    ? Math.pow(1 + netProfitPct, 1 / periodYears) - 1
+    : netProfitPct;
+
   return {
     trades: totalTrades,
     totalPositions,
@@ -558,6 +567,8 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
     pf,
     netProfit,
     netProfitPct,
+    annualizedReturnPct,
+    periodYears,
     maxDD,
     maxDDPct,
     sharpe,

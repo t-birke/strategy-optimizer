@@ -83,7 +83,7 @@ export const REPAIR_MODES = Object.freeze(['clamp-lhs', 'clamp-rhs']);
 
 export const DEFAULT_FITNESS = Object.freeze({
   weights: { pf: 0.5, dd: 0.3, ret: 0.2 },
-  caps:    { pf: 4.0, ret: 2.0 },
+  caps:    { pf: 4.0, ret: 1.0 },  // ret cap is ANNUALIZED (CAGR): 1.0 = 100%/yr saturates
   gates:   { minTradesPerWindow: 30, worstRegimePfFloor: 1.0, wfeMin: 0.5 },
   // GA train/test split: fraction of bars reserved for out-of-sample scoring.
   // During GA evolution, indicators compute on ALL bars but fitness metrics
