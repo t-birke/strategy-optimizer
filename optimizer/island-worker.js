@@ -30,6 +30,7 @@ import { runSpec } from '../engine/runtime.js';
 import { computeFitness } from './fitness.js';
 import { validateSpec } from '../engine/spec.js';
 import { buildParamSpace } from './param-space.js';
+import { unpackHtfPayloads } from './htf-transport.js';
 import * as registry from '../engine/blocks/registry.js';
 import * as legacyParams from './params.js';
 
@@ -47,6 +48,12 @@ const {
   specMode = false,
   spec: rawSpec = null,
   periodYears = null,
+  baseTfMin = null,
+  // Phase 2.6 — HTF payloads from the runner. Each entry is
+  // { tfMin, tfMs, htfLen, candleBuffer, htfBarIndexBuffer } where
+  // candleBuffer is a 6-col Float64 SAB [ts|open|high|low|close|volume]
+  // and htfBarIndexBuffer is a Uint32 SAB of length candleLength (base).
+  htfPayloads = [],
   // Persistent fitness-cache preload (spec mode only). Plain object of
   // geneKey → { fitness, metrics }. Each island hydrates its own Map
   // from this on startup so a re-run of the same spec on the same data
@@ -120,12 +127,24 @@ const candles = specMode
       volume: new Float64Array(candleBuffer, colOff(4), candleLength),
     };
 
+// Phase 2.6 — Reassemble HTF candles + htfBarIndex from SAB payloads into
+// the `bundle.htfs[tfMin]` shape `engine/data-bundle.js` produces. Views
+// are zero-copy over the SABs; the runtime reads from them directly.
+const specHtfs = specMode ? unpackHtfPayloads(htfPayloads) : {};
+
 // Spec-mode bundle is built once and shared across every fitness call.
-// runSpec only reads from `bundle.base` arrays (no mutation), so reuse is
-// safe. tradingStartBar tells the engine which bar marks "actual trading
-// start" — earlier bars are warmup-only.
+// runSpec only reads from `bundle.base` / `bundle.htfs` arrays (no
+// mutation), so reuse is safe. tradingStartBar tells the engine which
+// bar marks "actual trading start" — earlier bars are warmup-only.
 const specBundle = specMode
-  ? { base: candles, tradingStartBar, periodYears: periodYears ?? 0 }
+  ? {
+      base: candles,
+      htfs: specHtfs,
+      tradingStartBar,
+      periodYears: periodYears ?? 0,
+      baseTfMin:   baseTfMin ?? undefined,
+      baseTfMs:    baseTfMin != null ? baseTfMin * 60_000 : undefined,
+    }
   : null;
 
 // GA train/test split: fitnessStartBar is passed via opts to runSpec.
@@ -495,7 +514,8 @@ parentPort.on('message', async (msg) => {
     }
 
     case 'get_results': {
-      // One `results` message per owned island
+      // One `results` message per owned island (without cache snapshot —
+      // the per-worker delta is sent separately below to avoid OOM).
       for (const [islandIdx, island] of islands) {
         const b = best(island.ga.options);
         const entry = island.fitnessCache.get(geneKey(b.gene));
@@ -506,19 +526,6 @@ parentPort.on('message', async (msg) => {
           .sort((a, b) => b.fitness - a.fitness)
           .slice(0, 20);
 
-        // Spec mode: snapshot the full per-island cache so the runner
-        // can merge across islands/workers and persist. Object form is
-        // the right shape for fitness-cache.js (geneKey → entry). Cost
-        // is one structured-clone per island at end of run, which is
-        // negligible vs the GA itself.
-        let cacheSnapshot = null;
-        if (specMode) {
-          cacheSnapshot = {};
-          for (const [k, v] of island.fitnessCache.entries()) {
-            cacheSnapshot[k] = v;
-          }
-        }
-
         parentPort.postMessage({
           type: 'results',
           islandIdx,
@@ -526,8 +533,25 @@ parentPort.on('message', async (msg) => {
           topResults: topFromCache,
           evalCount: island.state.evalCount,
           cacheSize: island.fitnessCache.size,
-          cacheSnapshot,
         });
+      }
+
+      // Spec mode: merge all islands' NEW entries (not in the preload)
+      // into ONE delta snapshot per worker. The old approach sent a full
+      // cache snapshot per island — with a 50K-entry preload and 96
+      // islands that's ~3.8 GB of structured-clone data hitting the main
+      // thread's heap simultaneously, causing an OOM crash. Sending only
+      // the delta keeps the message size proportional to actual new work.
+      if (specMode) {
+        const delta = {};
+        for (const [, island] of islands) {
+          for (const [k, v] of island.fitnessCache.entries()) {
+            if (!fitnessCachePreload || !(k in fitnessCachePreload)) {
+              delta[k] = v;
+            }
+          }
+        }
+        parentPort.postMessage({ type: 'cache_delta', delta });
       }
       break;
     }

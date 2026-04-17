@@ -51,10 +51,16 @@
  *
  *   - It does not do regime stratification. That lives in fitness.js.
  *
- *   - It does not handle HTF bundles correctly *yet* — it passes
- *     `bundle.htfs` through unchanged. For tests that don't use HTFs
- *     this is fine. HTF slicing by timestamp is a follow-up; the
- *     current migration-gate spec uses no HTFs, so this is unblocked.
+ * HTF handling (Phase 2.6): each HTF in `bundle.htfs[tfMin]` carries its
+ * own `htfBarIndex` of length `baseLen` — the precomputed mapping from
+ * base-bar index to last-closed HTF-bar index. When we slice the base to
+ * `upperBar`, we need the HTF's `htfBarIndex` sliced to the same length so
+ * `htfBarIndex[baseIdx]` stays valid for every baseIdx < upperBar. The HTF
+ * candle arrays themselves (ts/open/high/low/close/volume) stay full — they
+ * are referenced by index through the sliced `htfBarIndex`, never by the
+ * slice length. This is safe because `htfBarIndex[i]` was computed against
+ * the full base `ts` array, and the ts values at indices 0..upperBar-1 are
+ * identical in the full base and the sliced base.
  */
 
 import { runSpec } from '../engine/runtime.js';
@@ -257,7 +263,11 @@ export function computeWindows({ totalLen, warmup, scheme, nWindows, oosFraction
  * `.subarray(0, upperBar)` on each typed array so there's no copy —
  * the runtime just sees shorter arrays.
  *
- * HTFs are passed through unchanged. See module header for the caveat.
+ * HTFs: the `htfBarIndex` Uint32Array on each HTF is sliced to
+ * `upperBar` length so lookups inside the sliced timeline are correct.
+ * The HTF candle arrays (ts/open/high/low/close/volume) are intentionally
+ * NOT sliced — they're indexed via `htfBarIndex`, not via base-bar offset.
+ * See module header for the correctness argument.
  */
 export function sliceBundle(bundle, { upperBar, tradingStartBar }) {
   const base = bundle.base;
@@ -272,13 +282,38 @@ export function sliceBundle(bundle, { upperBar, tradingStartBar }) {
       ? arr.subarray(0, upperBar)
       : Array.isArray(arr) ? arr.slice(0, upperBar) : arr;
   }
+  const slicedHtfs = sliceHtfs(bundle.htfs, upperBar);
   return {
     ...bundle,
     base: slicedBase,
+    htfs: slicedHtfs,
     tradingStartBar,
     // periodYears is informational; adjust so callers see a truthy value.
     periodYears: computePeriodYears(slicedBase, tradingStartBar),
   };
+}
+
+/**
+ * For each HTF in `htfs`, return a shallow-cloned HTF object whose
+ * `htfBarIndex` is sliced to `upperBar` length. Candle arrays unchanged.
+ * Returns `undefined` if `htfs` is falsy (preserves existing behavior for
+ * base-TF-only bundles).
+ *
+ * Exported for unit testing.
+ */
+export function sliceHtfs(htfs, upperBar) {
+  if (!htfs) return htfs;
+  const out = {};
+  for (const tfMin of Object.keys(htfs)) {
+    const htf = htfs[tfMin];
+    if (!htf) { out[tfMin] = htf; continue; }
+    const hbi = htf.htfBarIndex;
+    const slicedHbi = hbi && typeof hbi.subarray === 'function'
+      ? hbi.subarray(0, Math.min(upperBar, hbi.length))
+      : hbi;
+    out[tfMin] = { ...htf, htfBarIndex: slicedHbi };
+  }
+  return out;
 }
 
 function computePeriodYears(base, startBar) {

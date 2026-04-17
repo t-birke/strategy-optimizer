@@ -39,6 +39,9 @@ import {
 } from './fitness-cache.js';
 import { walkForward } from './walk-forward.js';
 import { runSpec } from '../engine/runtime.js';
+import { computeDataRequirements, makeHtfBarIndex } from '../engine/data-bundle.js';
+import { packHtfPayload, unpackHtfPayloads } from './htf-transport.js';
+import * as registry from '../engine/blocks/registry.js';
 
 const MIN_TRADES = 10;
 const WORKER_URL = new URL('./island-worker.js', import.meta.url);
@@ -118,11 +121,20 @@ export async function runOptimization(config) {
   // The functions in paramSpace are NOT serializable across worker_threads,
   // so we ship the raw spec object and let the worker rebuild paramSpace.
   const specMode  = Boolean(rawSpec);
+  if (specMode) {
+    // validateSpec + buildParamSpace touch the block registry via
+    // indicatorDeps and declaredParams. Ensure it's populated on the main
+    // thread so both those calls AND computeDataRequirements (below) work.
+    await registry.ensureLoaded();
+  }
   const spec      = specMode ? validateSpec(rawSpec)   : null;
   const paramSpace = specMode ? buildParamSpace(spec) : null;
-  if (specMode && spec.htfs && spec.htfs.length > 0) {
-    throw new Error('runOptimization: spec.htfs not yet supported in runner integration (Phase 2.6 follow-up)');
-  }
+  // HTF requirements come from blocks' indicatorDeps, NOT from a top-level
+  // `spec.htfs` field (no such field in the spec schema). Phase 2.6:
+  // compute the needed TFs once on the main thread and package them
+  // alongside the base candles for the workers.
+  const dataReqs  = specMode ? computeDataRequirements(spec) : null;
+  const htfTfMins = specMode ? dataReqs.htfTfMins : [];
 
   // PARAMS-and-helpers shim. In spec mode they come from paramSpace; in
   // legacy mode from the static params.js. Everything below this line is
@@ -259,6 +271,65 @@ export async function runOptimization(config) {
     new Float64Array(sab, len * 4 * 8, len).set(candles.volume);
   }
 
+  // 2b. Phase 2.6 — HTF candle transport.
+  //
+  //   For each HTF the spec's blocks require, load the full-period candles
+  //   (with block-declared warmup), compute the per-base-bar last-closed
+  //   index, and pack both into SharedArrayBuffers. Workers reassemble
+  //   these into the `bundle.htfs[tfMin]` shape `engine/data-bundle.js`
+  //   produces, so the runtime sees no difference between a main-thread
+  //   bundle and a worker-assembled one.
+  //
+  //   Schema per HTF:
+  //     - candleBuffer (Float64):  6 cols × htfLen = [ts|open|high|low|close|volume]
+  //     - htfBarIndexBuffer (Uint32): baseLen entries, one per base bar
+  //       (HTF_NONE sentinel = 0xFFFFFFFF for "no HTF bar closed yet")
+  //
+  //   We could have crammed everything into one big SAB with a header, but
+  //   separate SABs per HTF keep the unpacking code obvious in the worker
+  //   and there's no measurable per-SAB cost at these sizes (each HTF is
+  //   tens of KB).
+  const htfPayloads = [];  // [{ tfMin, tfMs, htfLen, candleBuffer, htfBarIndexBuffer }]
+  if (specMode && htfTfMins.length > 0) {
+    status('loading', `Loading ${htfTfMins.length} HTF timeframe${htfTfMins.length === 1 ? '' : 's'}: ${htfTfMins.map(m => `${m}min`).join(', ')}`);
+    const baseTsView = candles.ts;  // Float64Array from the base load
+    for (const htfTfMin of htfTfMins) {
+      const htfWarmupBars = dataReqs.warmupBarsByTf.get(htfTfMin) ?? 0;
+      const htfTfMs = htfTfMin * 60_000;
+      const htfPreloadTs = startTs - htfWarmupBars * htfTfMs;
+      let htfCandles = await loadCandles(symbol, htfTfMin, htfPreloadTs);
+      if (htfCandles.close.length === 0) {
+        throw new Error(`HTF ${htfTfMin}min: no data for ${symbol} from ${new Date(htfPreloadTs).toISOString()}`);
+      }
+      // Trim HTF tail to base end (symmetry with base trim above).
+      if (endTs < Infinity) {
+        let lastIdx = htfCandles.close.length;
+        for (let i = 0; i < htfCandles.close.length; i++) {
+          if (htfCandles.ts[i] > endTs) { lastIdx = i; break; }
+        }
+        if (lastIdx < htfCandles.close.length) {
+          htfCandles = {
+            ts:     htfCandles.ts.slice(0, lastIdx),
+            open:   htfCandles.open.slice(0, lastIdx),
+            high:   htfCandles.high.slice(0, lastIdx),
+            low:    htfCandles.low.slice(0, lastIdx),
+            close:  htfCandles.close.slice(0, lastIdx),
+            volume: htfCandles.volume.slice(0, lastIdx),
+          };
+        }
+      }
+      const htfLen = htfCandles.close.length;
+      const htfBarIndex = makeHtfBarIndex(baseTsView, htfCandles.ts, htfTfMs);
+      htfPayloads.push(packHtfPayload({
+        tfMin: htfTfMin,
+        tfMs:  htfTfMs,
+        candles: htfCandles,
+        htfBarIndex,
+      }));
+      console.log(`[runner] HTF ${htfTfMin}min: ${htfLen} bars packed (warmup ${htfWarmupBars})`);
+    }
+  }
+
   const actualStartTs = candles.ts[tradingStartBar];
   const actualEndTs = candles.ts[len - 1];
   const periodYears = (actualEndTs - actualStartTs) / (365.25 * 24 * 60 * 60 * 1000);
@@ -380,6 +451,12 @@ export async function runOptimization(config) {
         specMode,
         spec: specMode ? rawSpec : null,
         periodYears: specMode ? periodYears : null,
+        baseTfMin: specMode ? timeframe : null,
+        // Phase 2.6 — HTF transport. Each entry is
+        //   { tfMin, tfMs, htfLen, candleBuffer, htfBarIndexBuffer }.
+        // Worker reassembles into bundle.htfs[tfMin] matching
+        // engine/data-bundle.js shape.
+        htfPayloads: specMode ? htfPayloads : [],
         // Persistent-cache preload (spec mode only). Plain object of
         // geneKey → { fitness, metrics }. Workers hydrate their in-mem
         // cache from this on startup. Each worker gets the SAME preload —
@@ -817,6 +894,25 @@ export async function runOptimization(config) {
       w.on('message', handler);
     }));
   }
+
+  // Spec mode: one `cache_delta` per worker (new entries only, excluding
+  // preload). Set up listeners BEFORE sending `get_results` so messages
+  // aren't dropped.
+  const cacheDeltaPromises = [];
+  if (specMode) {
+    for (const w of workers) {
+      cacheDeltaPromises.push(new Promise(resolve => {
+        const handler = (msg) => {
+          if (msg.type === 'cache_delta') {
+            w.off('message', handler);
+            resolve(msg.delta);
+          }
+        };
+        w.on('message', handler);
+      }));
+    }
+  }
+
   for (const w of workers) {
     w.postMessage({ type: 'get_results' });
   }
@@ -830,10 +926,11 @@ export async function runOptimization(config) {
   // partial results are useful for the next run.
   let cacheSaveInfo = null;
   if (specMode) {
-    const snapshots = finalResults
-      .map(r => r.cacheSnapshot)
-      .filter(s => s && typeof s === 'object');
-    const merged = mergeCaches(snapshots);
+    // Workers send only NEW entries (delta) — not the full cache — to
+    // avoid OOM when many islands each re-serialize the entire preload.
+    // We merge preload + all worker deltas here on the main thread.
+    const deltas = await Promise.all(cacheDeltaPromises);
+    const merged = mergeCaches([cachePreload || {}, ...deltas]);
     try {
       cacheSaveInfo = await saveCache({
         specHash: spec.hash,
@@ -909,7 +1006,15 @@ export async function runOptimization(config) {
   // complete backtest. GA fitness scores (used for ranking) are kept from
   // the OOS run — only the display metrics change.
   if (specMode && fitnessStartBar > 0) {
-    const fullBundle = { base: candles, tradingStartBar, periodYears: periodYears ?? 0 };
+    // Reconstruct HTFs from payloads so the full-data re-eval sees the same
+    // HTF shape the workers did (otherwise blocks that resolve HTF deps
+    // would throw "TF N min not loaded in bundle").
+    const fullBundle = {
+      base:  candles,
+      htfs:  unpackHtfPayloads(htfPayloads),
+      tradingStartBar,
+      periodYears: periodYears ?? 0,
+    };
     for (const entry of topResults) {
       if (!entry.gene) continue;
       try {
@@ -945,12 +1050,18 @@ export async function runOptimization(config) {
   if (specMode && !cancelSent && finalBest.gene) {
     try {
       const wfStart = Date.now();
+
+      // Rebuild an in-process bundle for walk-forward. Reconstruct HTFs
+      // from the same payloads we packed for workers — zero-copy views
+      // over the SABs.
+      const htfs = unpackHtfPayloads(htfPayloads);
+
       const bundle = {
         symbol,
         baseTfMin: timeframe,
         baseTfMs:  timeframe * 60_000,
         base:      candles,
-        htfs:      {},
+        htfs,
         tradingStartBar,
         periodYears,
         n:         len,
