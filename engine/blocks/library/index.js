@@ -23,6 +23,11 @@ import volatilityFloor    from './filter/volatility-floor.js';
 import volumeFilter       from './filter/volume-filter.js';
 import regimeGate         from './filter/regime-gate.js';
 
+// ── Regime ──────────────────────────────────────────────────
+import htfTrendRegime     from './regime/htf-trend-regime.js';
+import volRegime          from './regime/vol-regime.js';
+import rangeRegime        from './regime/range-regime.js';
+
 // ── Exit ────────────────────────────────────────────────────
 import atrHardStop        from './exit/atr-hard-stop.js';
 import atrScaleOutTarget  from './exit/atr-scale-out-target.js';
@@ -52,6 +57,10 @@ const BLOCKS = [
   volatilityFloor,
   volumeFilter,
   regimeGate,
+  // Regimes
+  htfTrendRegime,
+  volRegime,
+  rangeRegime,
   // Exits
   atrHardStop,
   atrScaleOutTarget,
