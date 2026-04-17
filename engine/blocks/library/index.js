@@ -12,6 +12,10 @@ import { register } from '../registry.js';
 import stochCross         from './entry/stoch-cross.js';
 import emaTrend           from './entry/ema-trend.js';
 import bbSqueezeBreakout  from './entry/bb-squeeze-breakout.js';
+import rsiPullback        from './entry/rsi-pullback.js';
+import maPullback         from './entry/ma-pullback.js';
+import donchianBreakout   from './entry/donchian-breakout.js';
+import volumeSurge        from './entry/volume-surge.js';
 
 // ── Exit ────────────────────────────────────────────────────
 import atrHardStop        from './exit/atr-hard-stop.js';
@@ -33,6 +37,10 @@ const BLOCKS = [
   stochCross,
   emaTrend,
   bbSqueezeBreakout,
+  rsiPullback,
+  maPullback,
+  donchianBreakout,
+  volumeSurge,
   // Exits
   atrHardStop,
   atrScaleOutTarget,
@@ -46,7 +54,7 @@ const BLOCKS = [
   kelly,
   fixedFractional,
   equityCurveTrading,
-  // Regime / filter blocks — to be added in later chunks.
+  // Filter / regime blocks appended below as tiers land.
 ];
 
 for (const b of BLOCKS) register(b);
