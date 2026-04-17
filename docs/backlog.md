@@ -12,8 +12,9 @@ Organized as:
 4. **Phase 4** — persistence, queue, UI, deployment
 5. **Phase 5** — AI idea generator (parked; separate effort)
 6. **Phase 6** — robustness selector
-7. **Deferred features** — good ideas we explicitly postponed
-8. **Open questions** — undecided design calls
+7. **Phase 7** — prepare real world launch
+8. **Deferred features** — good ideas we explicitly postponed
+9. **Open questions** — undecided design calls
 
 ---
 
@@ -251,64 +252,62 @@ runner and walk-forward. **All 6 verification gates green**:
 ## 3. Phase 3 — Block library expansion
 
 **Goal:** enough blocks to express a reasonable breadth of strategies without
-writing new blocks for each one.
+writing new blocks for each one. **Scoped version** — session-dependent
+blocks and new exit blocks are punted to Phase 7 (Prepare Real World
+Launch) so Phase 3 closes as a coherent unit without unblocking the
+generic-exit-Pine-codegen refactor.
 
-### Entry blocks
-- `stochCross` ✅ (needed for migration gate)
-- `emaTrend` ✅ (needed for migration gate)
-- `bbSqueezeBreakout` ✅ (needed for migration gate)
-- `orb` — opening-range breakout (session-based)
-- `rangeBreakout` — breakout from N-bar range
-- `maPullback` — pullback to MA during trend
+### 3.A Indicator expansion
+New entries in `engine/indicators.js` + indicator-cache dispatcher:
+- `highest` (N-bar high) — used by Donchian, range/ORB
+- `lowest` (N-bar low) — symmetric
+- `adx` (directional movement, rmaSmoothed) — rangeRegime
+- `vwap` (rolling volume-weighted average price) — volTargetSizing and Phase 7's `vwapReclaim`
+
+### 3.B Entry blocks (new)
 - `rsiPullback` — RSI oversold/overbought in trend
-- `vwapReclaim` — price reclaiming VWAP (intraday)
+- `maPullback` — pullback to MA during trend (price crosses back through the MA after trending)
+- `donchianBreakout` — classic turtle-style (entry on N-bar high/low break)
 - `volumeSurge` — entry on volume spike with price confirmation
-- `donchianBreakout` — classic turtle-style
 
-### Filter blocks
-- `htfTrendFilter` — only longs above HTF MA
-- `sessionFilter` — time-of-day gating
-- `volumeFilter` — min volume multiple of average
-- `volatilityFloor` — min ATR / BB width
-- `spreadFilter` — reject wide-spread bars (needs spread data — future)
-- `regimeGate` — filter on regime label
+Previously-shipped (kept for reference):
+- `stochCross` ✅ · `emaTrend` ✅ · `bbSqueezeBreakout` ✅
 
-### Regime blocks
-- `htfTrendRegime` — HTF MA slope → bull/chop/bear
-- `volRegime` — ATR percentile → low/normal/high
+### 3.C Filter blocks (new)
+- `htfTrendFilter` — only longs above HTF MA (**unblocks the end-to-end
+  HTF gate left open in Phase 2.6**)
+- `volatilityFloor` — min ATR / BB width — rejects dead-market bars
+- `volumeFilter` — min volume multiple of rolling average
+- `regimeGate` — filter on regime label (e.g. allow longs only in bull regime)
+
+### 3.D Regime blocks (new)
+- `htfTrendRegime` — HTF MA slope → bull / chop / bear
+- `volRegime` — ATR percentile → low / normal / high
 - `rangeRegime` — ADX-based trending vs ranging
-- `sessionRegime` — asia/london/ny (intraday)
 
-### Exit blocks
-- **hardStop:** `atrHardStop` ✅, `pctHardStop`, `structuralHardStop`
-- **target:** `atrScaleOutTarget` ✅ (generic up-to-6-tier, zero overhead
-  for unused tiers — pinning `tpNPct=0` removes the tranche from both the
-  genome and the runtime), `rrTarget`, `fibExtTarget`. `singleTpTarget`
-  is unnecessary — just use `atrScaleOutTarget` with a single active
-  tranche.
-- **trail:** `atrTrail`, `chandelierTrail`, `maTrail`, `structuralExit` ✅,
-  `timeStop` (note: `timeStop` as standalone is redundant with
-  `structuralExit.maxBars` — fold into whatever trail a spec uses rather
-  than shipping a separate block).
+### 3.E Sizing blocks (fill-ins)
+Previously covered in Phase 1 chunk 6.5:
+- `flat` ✅ · `pctOfEquity` ✅ · `atrRisk` ✅ · `martingale` ✅ ·
+  `antiMartingale` ✅ · `kelly` ✅ · `fixedFractional` ✅ ·
+  `equityCurveTrading` ✅
 
-### Sizing blocks (covered in chunk 6.5)
-- `flat` — fixed dollar amount
-- `pctOfEquity` — % of current equity
-- `pctOfInitial` — % of starting capital
-- `atrRisk` — Van Tharp risk-per-trade (needs `stopDistance`)
-- `martingale` — escalate after losses
-- `antiMartingale` — escalate after wins
-- `kelly` — Kelly-fraction based on running stats
-- `fixedFractional` — Ralph Vince
-- `equityCurveTrading` — meta-sizing based on equity vs its MA
+New:
+- `pctOfInitial` — % of starting capital (vs pctOfEquity which compounds)
 - `volTargetSizing` — scaled to hit target portfolio volatility
 
-### Library housekeeping
+### 3.F Library housekeeping
 - `engine/blocks/library/index.js` — imports every block file, registers them.
-- Per-block unit tests: contract validation + a deterministic fixture.
+- Per-block unit tests: contract validation + a deterministic-fixture smoke.
 - **Lookahead detection harness** (`engine/blocks/lookahead-check.js`):
-  call `onBar` for each bar with candles[>i] and indicators[>i] set to NaN;
-  any block that reads those values gets flagged.
+  call `onBar` for each bar with candles[>i] and indicators[>i] set to
+  NaN; any block that reads those values gets flagged. Runs over every
+  registered block — catches regressions at CI time.
+
+### Deferred to Phase 7 (see §7)
+**All new exit blocks** and **session-dependent entry/filter/regime blocks**
+— see §7 for the full list and rationale. The shared dependency is the
+generic-exit-Pine-codegen refactor; lumping them together avoids
+half-shipping an expansion.
 
 ---
 
@@ -1851,7 +1850,113 @@ the option exists; pull in only when concrete pain appears.
 
 ---
 
-## 7. Deferred features
+## 7. Phase 7 — Prepare Real World Launch
+
+**Goal:** wrap up every block the strategy library still needs so a run can
+test a whole new range of strategies — breakout-retest, trail-and-scale,
+session-structured intraday, fibonacci targets, etc. Bundles the
+remaining block-library items that Phase 3 deliberately scoped out
+(session-dependent blocks, new exit blocks) together with the
+`pineExitTemplate` contract refactor they all depend on.
+
+**Why one phase:** every unbuilt exit block is blocked on the same Pine-
+codegen refactor. Shipping them one at a time means touching
+`emitExitStateMachine()` 7 times; extracting the contract once and
+re-using it is strictly less work and removes the current
+throw-on-unknown-exit-block footgun. Session-dependent blocks are
+lumped in because they all need the same session/timezone helper —
+same "build the tool once, use it N times" logic.
+
+### 7.A Generic exit-block Pine codegen contract (prereq)
+
+Extract a structured hook contract from `pine-codegen.js`'s hardcoded
+exit machinery. Proposed shape (moved from Deferred features §8 below):
+
+```js
+pineExitTemplate(params, paramRefs) {
+  return {
+    stateVars:  ['var float myStop = na'],
+    indicators: ['myAtr = ta.atr(14)'],
+    onEntry:    ['myStop := close - myAtr * 2'],
+    check:      { model: 'close-deferred', code: 'close <= myStop', tag: '"SL"' },
+    onTpHit:    ['myStop := strat_entry * 1.003'],  // optional
+  }
+}
+```
+
+Models: `intra-bar` (strategy.exit stop=), `close-deferred` (flag →
+strategy.close_all next bar), `limit` (strategy.exit limit=). Codegen
+orchestrator assembles pieces in the correct execution order.
+
+Each existing exit block (`atrHardStop`, `atrScaleOutTarget`,
+`structuralExit`) is rewritten to use the contract as an acceptance test:
+current Pine output must be byte-identical before/after the refactor
+(or equivalent — the three deep TV-parity fixes from earlier this
+session stay intact).
+
+### 7.B New exit blocks
+
+All require 7.A.
+
+- **hardStop:** `pctHardStop` (fixed % SL), `structuralHardStop` (SL at
+  last swing low/high)
+- **target:**   `rrTarget` (R-multiple TP based on stop distance),
+                `fibExtTarget` (1.618 / 2.618 from swing)
+- **trail:**    `atrTrail`, `chandelierTrail`, `maTrail`
+
+(Skip: `singleTpTarget` — redundant with 1-tier `atrScaleOutTarget`.
+Skip: `timeStop` standalone — fold into structural trail.)
+
+### 7.C Session / timezone helper
+
+`engine/session.js` — utilities to classify a bar by session:
+- `bar → { session: 'asia'|'london'|'ny'|'off-hours', hourUtc, dayOfWeek }`
+- Optional session-open detection for ORB.
+
+Only makes sense at ≤1H timeframes, which also matches Phase 6.3's
+15-min fork — the two efforts can share this helper.
+
+### 7.D Session-dependent entry / filter / regime blocks
+
+All require 7.C.
+- **Entry:**   `orb` (opening-range breakout), `vwapReclaim`,
+               `rangeBreakout` (N-bar range; mostly useful at intraday
+               where "range" has a defined reset point)
+- **Filter:**  `sessionFilter` (time-of-day gating)
+- **Regime:**  `sessionRegime` (asia / london / ny label)
+
+### 7.E Diverse-strategy smoke test
+
+A gate that composes 8–10 materially different strategies from the
+post-Phase-7 block library and verifies each one:
+1. Validates cleanly (spec.js).
+2. Passes `lookahead-check` (from 3.F).
+3. Runs end-to-end via `runSpec` without throwing.
+4. Produces a Pine export that compiles in TV strategy tester.
+5. Generates a non-zero number of trades on the standard BTCUSDT/4H
+   test dataset.
+
+Catches the "added 10 blocks, 3 of them silently broken" failure mode
+that per-block unit tests miss.
+
+### 7.F Readiness checklist
+
+A one-page doc generated from the backlog + this phase that says
+"Before Run-First-Real-Money-Strategy you need to: …" — execution
+cost validation, slippage audit, Wundertrading webhook end-to-end
+smoke, exit-block Pine parity across the whole library, etc. Not a
+code deliverable; deferred content but owned by this phase.
+
+**Exit criterion for Phase 7:**
+- All 7 new exit blocks shipped + Pine-parity-tested.
+- All 5 session-dependent blocks shipped.
+- 7.E diverse-strategy smoke test green.
+- Deferred-features §8 "Generic exit block Pine codegen" marked ✅
+  (its content is subsumed by 7.A).
+
+---
+
+## 8. Deferred features
 
 Things we intentionally postponed from earlier design discussions.
 
@@ -2052,7 +2157,7 @@ isn't urgent — for the migration gate we rely on the GA preferring
 constraint-respecting genomes naturally (small loss on fitness). Revisit
 if we see the population getting stuck against this wall.
 
-### Generic exit block Pine codegen
+### Generic exit block Pine codegen — SUBSUMED by Phase 7.A
 
 **Problem:** `pine-codegen.js` hardcodes the strategy-tester and
 indicator exit logic for the three current exit blocks (`atrHardStop`,
@@ -2111,7 +2216,7 @@ copy-pasting 80% of an existing case with minor tweaks.
 
 ---
 
-## 8. Open questions
+## 9. Open questions
 
 Design calls we haven't yet made — flag them when they come up.
 
