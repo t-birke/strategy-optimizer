@@ -147,6 +147,36 @@ function directionGatedSignals(blockId, version, pineRet) {
 // when any armed exit fills. Dispatched per block.id for the three
 // known exit blocks (atrHardStop, atrScaleOutTarget, structuralExit).
 // New exit blocks need a case added here.
+//
+// ── WHY THIS IS HARDCODED (not a generic pineTemplate contract) ──
+//
+// Entry/filter/regime blocks are simple: each emits a boolean signal,
+// the codegen aggregates them. Exit blocks are fundamentally different —
+// they declare state variables, indicator series, an execution model
+// (intra-bar stop= vs close-based deferral vs limit fill), cross-block
+// interactions (breakeven shift after TP1 requires hardStop to know when
+// the target block fires), and a strict evaluation order (ESL → TP →
+// close-based SL → structural). A flat pineTemplate() returning a code
+// string can't express any of this.
+//
+// Generalizing would require a structured-hook contract like:
+//   pineExitTemplate(params, paramRefs) → {
+//     stateVars, indicators, onEntry, onTpHit,
+//     check: { model: 'close-deferred'|'intra-bar'|'limit', code, tag }
+//   }
+// with the codegen assembling pieces in the correct order. This is
+// viable but premature — the number of fundamentally different exit
+// *behaviors* in trading is small (ATR/fixed stop, ATR/R target,
+// trailing stop, time/structural). We'd design better hooks after
+// implementing 2-3 more concrete blocks than by speculating now.
+//
+// Decision: keep hardcoded, add blocks lazily. The throw-on-unknown
+// below serves as a "you need to add TV support" reminder. When the
+// 4th or 5th exit block reveals repeated patterns, extract the
+// structured-hook contract based on real cases.
+//
+// Tracked in: docs/backlog.md → "Deferred features → Generic exit
+// block Pine codegen"
 // ──────────────────────────────────────────────────────────────
 
 // Safe Pine identifier suffix from a numeric param (dots → 'p').
@@ -170,6 +200,25 @@ function emitExitStateMachine(push, hydrated) {
         `Add a case in emitExitStateMachine() or set that exit slot to null in the spec.`);
     }
   }
+
+  // ── Resolve active TP tranches ONCE (used by multiple steps) ──
+  // The tp_fired per-tranche flags let step 2 skip already-hit tranches
+  // without closing the position, so later tranches and the structural
+  // exit still reference the same pos_entry/pos_entry_bar as the runtime.
+  let tranches = [];
+  if (tg?.blockId === 'atrScaleOutTarget') {
+    const p = tg.params;
+    for (let n = 1; n <= 6; n++) {
+      const pct  = p[`tp${n}Pct`];
+      const mult = p[`tp${n}Mult`];
+      if (pct > 0 && mult > 0) tranches.push({ n, mult, pct });
+    }
+    tranches.sort((a, b) => a.mult - b.mult);
+  }
+  // Helper to reset tp_fired flags on any new entry (goLong, goShort, reversal)
+  const emitTpFlagReset = (indent) => {
+    for (const { n } of tranches) push(`${indent}tp${n}_fired := false`);
+  };
 
   push('// ============ EXIT INDICATOR SERIES ============');
   // ATR(s) — hardStop and target may use same or different lengths. Emit
@@ -220,8 +269,12 @@ function emitExitStateMachine(push, hydrated) {
   if (hs?.blockId === 'atrHardStop')       push(`var float  pos_entry_atr_hs = na`);
   if (tg?.blockId === 'atrScaleOutTarget') push(`var float  pos_entry_atr_tp = na`);
   push('var bool   sl_armed      = false');
-  push('var bool   struct_armed  = false');
-  push('var string struct_reason = ""');
+  // Per-tranche TP hit flags — prevent a tranche firing more than once per
+  // position, and let later tranches / structural exit keep running against
+  // the original pos_entry/pos_entry_bar instead of flattening the indicator.
+  for (const { n } of tranches) {
+    push(`var bool   tp${n}_fired    = false`);
+  }
   push('');
 
   // ── Per-bar working flags ──
@@ -231,20 +284,22 @@ function emitExitStateMachine(push, hydrated) {
   push('string bar_exit_reason = ""');
   push('');
 
-  // ── (0) Deferred fills from prior-bar arming ──
-  push('// ── (0) Deferred exits armed on the prior bar fill at THIS bar ──');
-  push('if pos_dir != 0 and (sl_armed or struct_armed)');
+  // ── (0) Deferred SL fill from prior-bar arming ──
+  // Only the ATR close-based SL uses the 1-bar arming mechanism (sl_armed).
+  // Structural/time/reversal exits fire immediately in step 4 (no arming),
+  // matching the runtime where trail returns closeNextBarOpen directly.
+  push('// ── (0) Deferred SL armed on the prior bar → fill at THIS bar ──');
+  push('if pos_dir != 0 and sl_armed');
   push('    bar_exit := true');
   push('    bar_exit_dir := pos_dir');
-  push('    bar_exit_reason := sl_armed ? "SL" : struct_reason');
+  push('    bar_exit_reason := "SL"');
   push('    pos_dir := 0');
   push('    pos_entry := na');
   push('    pos_entry_bar := na');
   if (hs?.blockId === 'atrHardStop')       push('    pos_entry_atr_hs := na');
   if (tg?.blockId === 'atrScaleOutTarget') push('    pos_entry_atr_tp := na');
   push('    sl_armed := false');
-  push('    struct_armed := false');
-  push('    struct_reason := ""');
+  emitTpFlagReset('    ');
   push('');
 
   // ── (1) ESL (hardStop: emergency %, intra-bar, same-bar including entry) ──
@@ -265,53 +320,54 @@ function emitExitStateMachine(push, hydrated) {
     if (tg?.blockId === 'atrScaleOutTarget') push('        pos_entry_atr_tp := na');
     push('        pos_entry_atr_hs := na');
     push('        sl_armed := false');
-    push('        struct_armed := false');
+    emitTpFlagReset('        ');
     push('');
   }
 
   // ── (2) TP (target: intra-bar, limit, skip entry bar) ──
-  if (tg?.blockId === 'atrScaleOutTarget') {
-    const p = tg.params;
-    // Collect active tranches (pct>0) sorted by mult ascending → first-to-fire order
-    const tranches = [];
-    for (let n = 1; n <= 6; n++) {
-      const pct  = p[`tp${n}Pct`];
-      const mult = p[`tp${n}Mult`];
-      if (pct > 0 && mult > 0) tranches.push({ n, mult, pct });
+  // Per-tranche: first hit of each tranche sets tpN_fired := true. The
+  // position is NOT closed — later tranches and the structural exit
+  // must keep running against the original pos_entry/pos_entry_bar to
+  // match the runtime's scale-out behavior. bar_exit is still set so
+  // later steps (SL arm, structural) can't fire on the same bar.
+  //
+  // Multiple tranches CAN fire on the same bar (e.g. a big candle
+  // sweeps TP1 and TP2) — we iterate all active tranches and set
+  // every fired flag, but bar_exit / bar_exit_reason only reflect the
+  // first-fired (nearest) tranche since the runtime processes them in
+  // sequence and only one "Tp" reason is tagged per bar exit.
+  if (tranches.length > 0) {
+    push('// ── (2) TP — per-tranche partial fill tracking (no position close) ──');
+    push('//       (matches runtime scale-out: TP1 flag set, pos stays open for TP2/TP3)');
+    push('if pos_dir != 0 and not bar_exit and bar_index > pos_entry_bar');
+    push('    bool is_long_tp = pos_dir > 0');
+    // Emit per-tranche price + hit check (skip already-fired tranches)
+    for (const { n, mult } of tranches) {
+      push(`    float tp${n}_price = is_long_tp ? pos_entry + pos_entry_atr_tp * ${mult} : pos_entry - pos_entry_atr_tp * ${mult}`);
+      push(`    bool  tp${n}_hit   = not tp${n}_fired and (is_long_tp ? high >= tp${n}_price : low <= tp${n}_price)`);
     }
-    tranches.sort((a, b) => a.mult - b.mult);
-    if (tranches.length > 0) {
-      push('// ── (2) TP — any active tranche hit closes the whole position ──');
-      push('//       (v1 simplification: runtime scales out per tranche, indicator does not)');
-      push('if pos_dir != 0 and not bar_exit and bar_index > pos_entry_bar');
-      push('    bool is_long_tp = pos_dir > 0');
-      // Emit per-tranche price + hit check
-      for (const { n, mult } of tranches) {
-        push(`    float tp${n}_price = is_long_tp ? pos_entry + pos_entry_atr_tp * ${mult} : pos_entry - pos_entry_atr_tp * ${mult}`);
-        push(`    bool  tp${n}_hit   = is_long_tp ? high >= tp${n}_price : low <= tp${n}_price`);
-      }
-      // any-hit OR in sorted order → reason tag uses first-fire positional label (TP1, TP2, ...)
-      const orExpr = tranches.map(t => `tp${t.n}_hit`).join(' or ');
-      push(`    if ${orExpr}`);
-      // Build a chained ternary: first tranche (nearest) = "TP1", etc.
-      //   tp<first>_hit ? "TP1" : tp<second>_hit ? "TP2" : ... : "TP<last>"
-      const ternaryChain = tranches
-        .map((t, i) => i === tranches.length - 1
-          ? `"TP${i + 1}"`
-          : `tp${t.n}_hit ? "TP${i + 1}"`)
-        .join(' : ');
-      push(`        bar_exit := true`);
-      push(`        bar_exit_dir := pos_dir`);
-      push(`        bar_exit_reason := ${ternaryChain}`);
-      push(`        pos_dir := 0`);
-      push(`        pos_entry := na`);
-      push(`        pos_entry_bar := na`);
-      push(`        pos_entry_atr_tp := na`);
-      if (hs?.blockId === 'atrHardStop') push('        pos_entry_atr_hs := na');
-      push(`        sl_armed := false`);
-      push(`        struct_armed := false`);
-      push('');
+    // any-hit OR in sorted order → sets bar_exit with first-fired reason
+    const orExpr = tranches.map(t => `tp${t.n}_hit`).join(' or ');
+    push(`    if ${orExpr}`);
+    // Mark each hit tranche as fired (all fired flags update on same bar).
+    for (const { n } of tranches) {
+      push(`        if tp${n}_hit`);
+      push(`            tp${n}_fired := true`);
     }
+    // Chained ternary: first-fired (nearest) tranche label wins
+    //   tp<first>_hit ? "TP1" : tp<second>_hit ? "TP2" : ... : "TP<last>"
+    const ternaryChain = tranches
+      .map((t, i) => i === tranches.length - 1
+        ? `"TP${i + 1}"`
+        : `tp${t.n}_hit ? "TP${i + 1}"`)
+      .join(' : ');
+    push(`        bar_exit := true`);
+    push(`        bar_exit_dir := pos_dir`);
+    push(`        bar_exit_reason := ${ternaryChain}`);
+    // NOTE: pos_dir / pos_entry / pos_entry_bar / pos_entry_atr_* / sl_armed
+    // intentionally unchanged — the position continues running for later
+    // tranches and the structural exit.
+    push('');
   }
 
   // ── (3) Arm close-based ATR SL (1-bar defer — v1 simplification) ──
@@ -327,27 +383,54 @@ function emitExitStateMachine(push, hydrated) {
     push('');
   }
 
-  // ── (4) Arm structural / time / reversal ──
+  // ── (4) Structural / time / reversal — fires IMMEDIATELY ──
+  // The runtime's trail (structuralExit) returns closeNextBarOpen directly —
+  // a 1-bar delay (detect → fill at next open). The old indicator used
+  // struct_armed (2-bar delay: arm → fire close_all → fill), which was
+  // 1 bar too slow. Fix: set bar_exit immediately so strategy.close_all()
+  // fires on the detection bar, filling at the next bar's open.
+  //
+  // Guard: `not sl_armed` removed. In the runtime, when hardStop sets
+  // triggered=true (returns null), the trail slot still evaluates. If
+  // structural fires on the same bar as SL arms, structural wins (1-bar
+  // delay beats the SL's 2-bar delay). Removing the guard matches this.
+  //
+  // Reversal: the indicator enters the opposite position immediately.
+  // Without this, the indicator stays flat after a reversal (bar_exit
+  // blocked step 5 from entering), losing track of the position. The
+  // strategy handles reversals via strategy.entry (auto-close with
+  // pyramiding=0), but the indicator's structural exit uses bar_exit
+  // which requires the indicator to know about the position.
   if (tr?.blockId === 'structuralExit') {
     const p = tr.params;
     const rsi = `rsi_${idSfx(p.rsiLen)}`;
-    push('// ── (4) Arm structural exit — time / stoch / RSI / reversal ──');
-    push('if pos_dir != 0 and not bar_exit and not sl_armed and not struct_armed');
+    push('// ── (4) Structural / time / reversal exit — fires immediately ──');
+    push('if pos_dir != 0 and not bar_exit');
     push('    bool is_long_st = pos_dir > 0');
     push('    int  bars_held = bar_index - pos_entry_bar');
     push(`    bool time_hit = bars_held >= ${p.maxBars} - 1`);
     push(`    bool stoch_exit = is_long_st ? (ta.crossunder(${stochExitK}, ${stochExitD}) and ${stochExitK} > 60) : (ta.crossover(${stochExitK}, ${stochExitD}) and ${stochExitK} < 40)`);
     push(`    bool rsi_exit = is_long_st ? (${rsi} < 40 and ${rsi}[3] > 55) : (${rsi} > 60 and ${rsi}[3] < 45)`);
     push('    bool rev = (is_long_st and rawShort) or (not is_long_st and rawLong)');
-    push('    if rev');
-    push('        struct_armed := true');
-    push('        struct_reason := "Reversal"');
-    push('    else if time_hit');
-    push('        struct_armed := true');
-    push('        struct_reason := "Time"');
-    push('    else if stoch_exit or rsi_exit');
-    push('        struct_armed := true');
-    push('        struct_reason := "Structural"');
+    push('    if rev or time_hit or stoch_exit or rsi_exit');
+    push('        bar_exit := true');
+    push('        bar_exit_dir := pos_dir');
+    push('        bar_exit_reason := rev ? "Reversal" : time_hit ? "Time" : "Structural"');
+    push('        pos_dir := 0');
+    push('        pos_entry := na');
+    push('        pos_entry_bar := na');
+    if (hs?.blockId === 'atrHardStop')       push('        pos_entry_atr_hs := na');
+    if (tg?.blockId === 'atrScaleOutTarget') push('        pos_entry_atr_tp := na');
+    push('        sl_armed := false');
+    // Reset tp_fired flags — the next position (reversal or later goLong/goShort)
+    // starts fresh with no tranches fired.
+    emitTpFlagReset('        ');
+    push('        if rev');
+    push('            pos_dir := -bar_exit_dir');
+    push('            pos_entry := close');
+    push('            pos_entry_bar := bar_index');
+    if (hs?.blockId === 'atrHardStop')       push(`            pos_entry_atr_hs := nz(atr_${idSfx(hs.params.atrLen)})`);
+    if (tg?.blockId === 'atrScaleOutTarget') push(`            pos_entry_atr_tp := nz(atr_${idSfx(tg.params.atrLen)})`);
     push('');
   }
 
@@ -359,20 +442,18 @@ function emitExitStateMachine(push, hydrated) {
   push('    pos_dir := 1');
   push('    pos_entry := close');
   push('    pos_entry_bar := bar_index');
-  if (hs?.blockId === 'atrHardStop')       push(`    pos_entry_atr_hs := nz(atr_${idSfx(hs.params.atrLen)}[1])`);
-  if (tg?.blockId === 'atrScaleOutTarget') push(`    pos_entry_atr_tp := nz(atr_${idSfx(tg.params.atrLen)}[1])`);
+  if (hs?.blockId === 'atrHardStop')       push(`    pos_entry_atr_hs := nz(atr_${idSfx(hs.params.atrLen)})`);
+  if (tg?.blockId === 'atrScaleOutTarget') push(`    pos_entry_atr_tp := nz(atr_${idSfx(tg.params.atrLen)})`);
   push('    sl_armed := false');
-  push('    struct_armed := false');
-  push('    struct_reason := ""');
+  emitTpFlagReset('    ');
   push('if goShort');
   push('    pos_dir := -1');
   push('    pos_entry := close');
   push('    pos_entry_bar := bar_index');
-  if (hs?.blockId === 'atrHardStop')       push(`    pos_entry_atr_hs := nz(atr_${idSfx(hs.params.atrLen)}[1])`);
-  if (tg?.blockId === 'atrScaleOutTarget') push(`    pos_entry_atr_tp := nz(atr_${idSfx(tg.params.atrLen)}[1])`);
+  if (hs?.blockId === 'atrHardStop')       push(`    pos_entry_atr_hs := nz(atr_${idSfx(hs.params.atrLen)})`);
+  if (tg?.blockId === 'atrScaleOutTarget') push(`    pos_entry_atr_tp := nz(atr_${idSfx(tg.params.atrLen)})`);
   push('    sl_armed := false');
-  push('    struct_armed := false');
-  push('    struct_reason := ""');
+  emitTpFlagReset('    ');
   push('');
 }
 
@@ -573,9 +654,28 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titl
   // ── Exit block analysis (shared between alert + strategy sections) ──
   const wt_hs = hydrated.exits?.hardStop;
   const wt_tg = hydrated.exits?.target;
+  const wt_tr = hydrated.exits?.trail;
   const wt_hasTp = wt_tg?.blockId === 'atrScaleOutTarget';
   const wt_hasSl = wt_hs?.blockId === 'atrHardStop';
+  const wt_hasStructural = wt_tr?.blockId === 'structuralExit';
   const wt_hasBe = wt_hasTp && wt_hasSl;
+
+  // Resolve structural exit indicator variable names (stoch K/D + RSI).
+  // These are emitted by emitExitStateMachine() earlier in the Pine source,
+  // so the strategy section can reference them for its own independent
+  // structural detection. Logic mirrors that function's naming decisions.
+  let wt_stochK = null, wt_stochD = null, wt_rsi = null;
+  if (wt_hasStructural) {
+    const p = wt_tr.params;
+    const sfx = `${p.stochLen}_${p.stochSmth}`;
+    const matchesEntryStoch = hydrated.entries.blocks.some(b =>
+      b.blockId === 'stochCross' &&
+      b.params.stochLen === p.stochLen &&
+      b.params.stochSmth === p.stochSmth);
+    wt_stochK = matchesEntryStoch ? `stoch_k_${sfx}` : `stoch_exit_k_${sfx}`;
+    wt_stochD = matchesEntryStoch ? `stoch_d_${sfx}` : `stoch_exit_d_${sfx}`;
+    wt_rsi = `rsi_${idSfx(p.rsiLen)}`;
+  }
 
   // Active tranches sorted by mult ascending (nearest TP fires first).
   const wt_tranches = [];
@@ -596,10 +696,10 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titl
     // that's only called conditionally may give stale values.
     push('// ============ WUNDERTRADING ALERT PAYLOADS ============');
     if (wt_hasTp) {
-      push(`float wt_atr_tp = nz(atr_${idSfx(wt_tg.params.atrLen)}[1])`);
+      push(`float wt_atr_tp = nz(atr_${idSfx(wt_tg.params.atrLen)})`);
     }
     if (wt_hasSl && (!wt_hasTp || wt_hs.params.atrLen !== wt_tg.params.atrLen)) {
-      push(`float wt_atr_sl = nz(atr_${idSfx(wt_hs.params.atrLen)}[1])`);
+      push(`float wt_atr_sl = nz(atr_${idSfx(wt_hs.params.atrLen)})`);
     }
     push('');
 
@@ -680,95 +780,306 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titl
   if (isStrategy) {
     // strategy.entry/exit/close calls for TradingView's strategy tester.
     // These run in parallel with the exit state machine (which drives
-    // visualization + Wundertrading alerts). Small discrepancies between
-    // the two are acceptable: the state machine uses close-based SL with
-    // 1-bar defer and closes the full position on first TP (v1
-    // simplification), while the strategy tester uses intra-bar stops
-    // and proper multi-TP scale-out via strategy.exit(qty_percent).
+    // visualization + Wundertrading alerts).
+    //
+    // SL parity model (matches runtime atr-hard-stop.js and main-branch
+    // jm_simple_3tp.pine):
+    //   - ATR SL: close-based check → slTriggered flag → strategy.close()
+    //     on the NEXT bar (1-bar deferral). NOT a stop= order.
+    //   - Emergency SL: fixed % from entry, on stop= parameter so TV fills
+    //     it intra-bar on wick touches. Circuit-breaker for flash crashes.
+    //   - Breakeven: after TP1 fills, ATR SL tightens to entry × 1.003/0.997.
     push('');
     push('// ============ STRATEGY EXECUTION ============');
 
+    // ── State vars ──
     // Track entry prices independently of the exit state machine, which
     // resets pos_entry/pos_entry_atr on first TP hit. The strategy needs
     // these prices to stay valid for the remaining partial position.
     push('var float strat_entry  = na');
     if (wt_hasTp) push('var float strat_atr_tp = na');
     if (wt_hasSl) push('var float strat_atr_hs = na');
+    // Bar index of the strategy's fill — used by the independent structural /
+    // time detection further down. Tracking it here (rather than reading the
+    // indicator's pos_entry_bar) decouples the strategy from the indicator
+    // state machine, which can go stale when the indicator's internal SL
+    // fires earlier than the strategy's (indicator uses close[signal] as its
+    // entry reference, strategy uses the actual fill price — see section 20
+    // of the reference doc).
+    if (wt_hasStructural) push('var int   strat_entry_bar = na');
+    // Close-based SL: flag arms when close pierces ATR SL → executes
+    // via strategy.close() on the NEXT bar (1-bar deferral, matching the
+    // runtime's closeNextBarOpen and the main-branch jm_simple_3tp.pine).
+    // Emergency SL (fixed %) stays on the strategy.exit(stop=) for
+    // intra-bar protection. This is the key parity fix: the old codegen
+    // put ATR SL on stop= which TV fills intra-bar on wick touches, but
+    // the runtime only checks close vs SL.
+    if (wt_hasSl) {
+      push('var bool  slTriggered  = false');
+      // Bar index when TP1 filled (-1 = not hit yet). Using bar_index with a
+      // STRICT `>` comparison in the SL check gives a 1-bar delay between TP1
+      // fill and the breakeven-SL transition — matches runtime's
+      // `i > tp1HitBar` in atr-hard-stop.js. Without this delay, the SL
+      // check on the TP1 fill bar itself uses the tight breakeven SL,
+      // causing it to trigger ~1 bar earlier than the runtime.
+      push('var int   strat_tp1HitBar = -1');
+    }
 
-    push('if goLong or goShort');
-    push('    strat_entry := close');
+    // Signal detection — fires on the SIGNAL bar (bar N).
+    //
+    // IMPORTANT: Use rawLong/rawShort here, NOT goLong/goShort. The indicator
+    // state machine gates goLong with `pos_dir == 0 and not bar_exit`, which
+    // suppresses the entry signal on bars where the deferred SL fires
+    // (bar_exit = true from step 0). The strategy needs to see the raw entry
+    // signal so it can detect reversals even when the indicator thinks the
+    // position is already being closed by SL. strategy.position_size provides
+    // the correct gating for the strategy execution path.
+    //
+    // `position_size <= 0` captures flat OR short (new long = fresh entry or
+    // reversal-to-long). `position_size >= 0` captures flat OR long.
+    push('bool strat_new_long  = rawLong  and strategy.position_size <= 0');
+    push('bool strat_new_short = rawShort and strategy.position_size >= 0');
+    push('');
+
+    // Fill-bar capture — fires on the FILL bar (bar N+1, one bar after signal).
+    //
+    // THIS IS A PARITY FIX (Trade #32 SL timing): the runtime's
+    // `position.entryPrice = fillPrice` uses the bar-open ± slippage.
+    // Pine's `strategy.position_avg_price` also reflects the real fill
+    // price (open ± strategy slippage), so using it matches runtime.
+    //
+    // The OLD code captured `strat_entry := close` on the SIGNAL bar — that
+    // value differs from the real fill by one bar's open-close gap plus
+    // slippage, and when an up/down gap between signal close and fill open
+    // shifts the SL price, the close-based cross-detection fires on a
+    // different bar than the runtime's. Symptom: SL exit 4 hours early/late
+    // in TV vs runtime.
+    //
+    // Detection: `position_size` sign transitions from "non-long" to long
+    // (or "non-short" to short) — fires on the fill bar only. Matches the
+    // runtime's `openPosition(fill, i)` at bar N+1 open.
+    //
+    // ATR capture on the fill bar uses `atr_N[1]` = atr on the PRIOR bar =
+    // atr[signalBar]. Matches the runtime which reads
+    // `atr[fillBar - 1] = atr[signalBar]`. (The legacy hand-written Pine
+    // used the same [1] offset because it also captured on the fill bar.)
+    //
+    // slTriggered/strat_tp1Hit reset on fill bar (NOT signal bar): an old
+    // position's SL armed from a prior bar should still fire on the signal
+    // bar (the reset used to cancel it on reversal signals). After the
+    // reversal fills on bar N+1, the NEW position needs a clean slate.
+    push('bool strat_fill_long  = strategy.position_size > 0 and strategy.position_size[1] <= 0');
+    push('bool strat_fill_short = strategy.position_size < 0 and strategy.position_size[1] >= 0');
+    push('if strat_fill_long or strat_fill_short');
+    push('    strat_entry := strategy.position_avg_price');
     if (wt_hasTp) push(`    strat_atr_tp := nz(atr_${idSfx(wt_tg.params.atrLen)}[1])`);
     if (wt_hasSl) push(`    strat_atr_hs := nz(atr_${idSfx(wt_hs.params.atrLen)}[1])`);
+    if (wt_hasStructural) push('    strat_entry_bar := bar_index');
+    if (wt_hasSl) {
+      push('    slTriggered     := false');
+      push('    strat_tp1HitBar := -1');
+    }
+    push('');
 
     // Position sizing: Van Tharp ATR-risk formula (matches GA engine).
     // qty = (equity × riskPct / 100) / (ATR × atrSL)
-    // Uses the hardStop block's ATR and atrSL for stop distance.
+    //
+    // Sizing runs on the SIGNAL bar (before strategy.entry), so strat_atr_hs
+    // isn't captured yet. Use `atr_N` directly (= atr[signalBar]), which
+    // matches the runtime's `planStop` which reads `atr[i-1]` at
+    // fillBar → atr[signalBar]. Same value, just read at different points.
+    //
+    // Capped by leverage (default 1×) to match the runtime's
+    //   maxUnits = (equity * leverage) / fillPrice
+    // — without this cap, TV opens positions larger than equity.
     const riskPct = hydrated.sizing?.params?.riskPct;
     if (riskPct != null && wt_hasSl) {
-      push('');
       push(`float strat_risk = strategy.equity * ${riskPct} / 100`);
-      push(`float strat_stop = strat_atr_hs * ${wt_hs.params.atrSL}`);
-      push('float strat_qty  = strat_stop > 0 ? strat_risk / strat_stop : 0');
+      push(`float strat_stop = nz(atr_${idSfx(wt_hs.params.atrLen)}) * ${wt_hs.params.atrSL}`);
+      push('float strat_qty_raw = strat_stop > 0 ? strat_risk / strat_stop : 0');
+      push('float strat_max_qty = close > 0 ? strategy.equity / close : 0');
+      push('float strat_qty = math.min(strat_qty_raw, strat_max_qty)');
     }
     const qtyArg = (riskPct != null && wt_hasSl) ? ', qty=strat_qty' : '';
 
-    push('if goLong and in_date_range');
+    // Gate entries on actual position change — matching the signal gate above.
+    // Calling strategy.entry for the same direction with pyramiding=0 is a
+    // no-op in TV, but gating avoids confusing the trade list and keeps the
+    // entry qty consistent with the freshly-computed strat_qty.
+    push('if strat_new_long and in_date_range');
     push(`    strategy.entry("Long", strategy.long${qtyArg})`);
-    push('if goShort and in_date_range');
+    push('if strat_new_short and in_date_range');
     push(`    strategy.entry("Short", strategy.short${qtyArg})`);
     push('');
 
-    // TP exits — each tranche gets its own strategy.exit with adjusted
-    // qty_percent. TradingView's qty_percent is of the CURRENT position
-    // (not the original), so we adjust: tranche_pct / remaining * 100.
-    if (wt_tranches.length > 0 || wt_hasSl) {
-      // Compute adjusted qty_percent at codegen time (tranches are frozen literals).
-      let remaining = 100;
-      const adjTranches = wt_tranches.map((t, i) => {
-        const adj = i === wt_tranches.length - 1
-          ? 100  // last tranche always closes remaining
-          : Math.round(t.pct / remaining * 10000) / 100;
-        remaining -= t.pct;
-        return { ...t, adjPct: adj };
-      });
+    // ── Execute pending close-based SL (deferred from previous bar) ──
+    // Must run BEFORE strategy.exit() calls so the close takes effect at
+    // this bar's open, matching Pine's execution model where
+    // strategy.close() on bar N fills at bar N's open.
+    if (wt_hasSl) {
+      push('if slTriggered and strategy.position_size != 0');
+      push('    strategy.close_all(comment="SL")');
+      push('    slTriggered := false');
+      push('');
+    }
 
-      // SL price expressions — attached to every TP exit as OCO (limit+stop).
-      // TradingView ignores a separate strategy.exit("SL") when TP exits
-      // already exist for the same entry; the OCO pattern ensures the stop
-      // is always active alongside each take-profit limit.
-      const slLongExpr  = wt_hasSl ? `, stop=strat_entry - strat_atr_hs * ${wt_hs.params.atrSL}` : '';
-      const slShortExpr = wt_hasSl ? `, stop=strat_entry + strat_atr_hs * ${wt_hs.params.atrSL}` : '';
+    // ── Detect TP1 hit for breakeven SL shift (1-bar-delayed) ──
+    // Stamp strat_tp1HitBar with bar_index when position size decreases
+    // (long) or increases (short). The effective strat_tp1Hit boolean
+    // uses a STRICT `bar_index > strat_tp1HitBar`, so on the TP1 fill
+    // bar itself (bar_index == strat_tp1HitBar) the SL still uses the
+    // ORIGINAL wide ATR SL. The transition to breakeven SL happens on
+    // the NEXT bar.
+    //
+    // Matches runtime atr-hard-stop.js line 134:
+    //   const tp1Hit = Number.isInteger(tp1HitBar) && i > tp1HitBar;
+    //
+    // The `strat_tp1HitBar < 0` gate prevents re-stamping on subsequent
+    // partial TP fills (TP2, TP3 also decrease position_size for long).
+    if (wt_hasSl && wt_hasTp) {
+      push('if strat_tp1HitBar < 0 and strategy.position_size > 0 and strategy.position_size < strategy.position_size[1]');
+      push('    strat_tp1HitBar := bar_index');
+      push('if strat_tp1HitBar < 0 and strategy.position_size < 0 and strategy.position_size > strategy.position_size[1]');
+      push('    strat_tp1HitBar := bar_index');
+      // Effective flag: strict `>` for 1-bar delay (matches runtime).
+      push('bool strat_tp1Hit = strat_tp1HitBar >= 0 and bar_index > strat_tp1HitBar');
+      push('');
+    }
+
+    // TP exits — each tranche gets its own strategy.exit with normalized
+    // qty_percent. TradingView's strategy.exit LOCKS the exit order
+    // quantity at first placement time and does NOT recalculate when
+    // the order is updated on subsequent bars. When multiple exits
+    // fire, ALL use the ORIGINAL full position size for their
+    // qty_percent calculation — NOT the remaining position after
+    // prior fills. So we pass normalized percentages directly.
+    //
+    // The runtime (atr-scale-out-target.js) NORMALIZES the raw tp pcts to
+    // sum to 100% (e.g., 10+50+10=70 → 14.29/71.43/14.29). The Pine
+    // must match: normalize, then pass directly as qty_percent (no
+    // cascading adjustment needed).
+    //
+    // The stop= parameter is ONLY the emergency SL (fixed % from entry),
+    // NOT the ATR SL. The ATR SL uses close-based detection + deferred
+    // strategy.close() (see below). This matches the runtime where ATR SL
+    // checks close and defers, while ESL fires intra-bar on wick touches.
+    if (wt_tranches.length > 0 || wt_hasSl) {
+      // Normalize percentages to sum to 100% (matches runtime behavior).
+      const pctSum = wt_tranches.reduce((s, t) => s + t.pct, 0);
+      const normTranches = wt_tranches.map(t => ({
+        ...t,
+        normPct: pctSum > 0 ? (t.pct / pctSum) * 100 : 0,
+      }));
+
+      // Use normalized pcts directly as TV qty_percent — TV applies
+      // qty_percent to the ORIGINAL position size (locked at first
+      // order placement), not the remaining after prior fills.
+      const adjTranches = normTranches.map(t => ({
+        ...t,
+        adjPct: Math.round(t.normPct * 100) / 100,
+      }));
+
+      // Emergency SL only — intra-bar protection via stop=. The ATR-based
+      // SL is handled by the close-based check further below.
+      const eslPct = wt_hasSl ? wt_hs.params.emergencySlPct : 0;
+      const eslLongExpr  = wt_hasSl ? `, stop=strat_entry * ${formatFrac(1 - eslPct / 100)}` : '';
+      const eslShortExpr = wt_hasSl ? `, stop=strat_entry * ${formatFrac(1 + eslPct / 100)}` : '';
 
       // Long exits
       push('if strategy.position_size > 0');
       if (adjTranches.length > 0) {
         for (const { n, mult, adjPct } of adjTranches) {
-          push(`    strategy.exit("TP${n}", "Long", qty_percent=${adjPct}, limit=strat_entry + strat_atr_tp * ${mult}${slLongExpr})`);
+          push(`    strategy.exit("TP${n}", "Long", qty_percent=${adjPct}, limit=strat_entry + strat_atr_tp * ${mult}${eslLongExpr})`);
         }
       } else if (wt_hasSl) {
-        // SL-only (no TPs) — standalone stop exit
-        push(`    strategy.exit("SL", "Long", stop=strat_entry - strat_atr_hs * ${wt_hs.params.atrSL})`);
+        push(`    strategy.exit("ESL", "Long", stop=strat_entry * ${formatFrac(1 - eslPct / 100)})`);
       }
 
       // Short exits
       push('if strategy.position_size < 0');
       if (adjTranches.length > 0) {
         for (const { n, mult, adjPct } of adjTranches) {
-          push(`    strategy.exit("TP${n}", "Short", qty_percent=${adjPct}, limit=strat_entry - strat_atr_tp * ${mult}${slShortExpr})`);
+          push(`    strategy.exit("TP${n}", "Short", qty_percent=${adjPct}, limit=strat_entry - strat_atr_tp * ${mult}${eslShortExpr})`);
         }
       } else if (wt_hasSl) {
-        // SL-only (no TPs) — standalone stop exit
-        push(`    strategy.exit("SL", "Short", stop=strat_entry + strat_atr_hs * ${wt_hs.params.atrSL})`);
+        push(`    strategy.exit("ESL", "Short", stop=strat_entry * ${formatFrac(1 + eslPct / 100)})`);
       }
       push('');
     }
 
-    // Structural / Time exits — close the entire remaining position.
-    // Reversals don't need strategy.close: strategy.entry in the opposite
-    // direction auto-closes the current position (pyramiding=0).
-    push('if bar_exit and (bar_exit_reason == "Structural" or bar_exit_reason == "Time")');
-    push('    strategy.close_all(comment=bar_exit_reason)');
-    push('');
+    // ── Close-based ATR SL with breakeven shift ──
+    // Checks close vs SL price. When triggered, sets slTriggered flag;
+    // strategy.close_all() fires at the NEXT bar's open (see above).
+    // After TP1 hits, SL tightens to breakeven-plus (entry × 1.003/0.997),
+    // matching atr-hard-stop.js BE_PLUS_LONG / BE_PLUS_SHORT.
+    if (wt_hasSl) {
+      const atrSL = wt_hs.params.atrSL;
+      push('if strategy.position_size > 0 and not slTriggered');
+      if (wt_hasTp) {
+        push(`    float sl_long = strat_tp1Hit ? strat_entry * 1.003 : strat_entry - strat_atr_hs * ${atrSL}`);
+      } else {
+        push(`    float sl_long = strat_entry - strat_atr_hs * ${atrSL}`);
+      }
+      push('    if close <= sl_long');
+      push('        slTriggered := true');
+
+      push('if strategy.position_size < 0 and not slTriggered');
+      if (wt_hasTp) {
+        push(`    float sl_short = strat_tp1Hit ? strat_entry * 0.997 : strat_entry + strat_atr_hs * ${atrSL}`);
+      } else {
+        push(`    float sl_short = strat_entry + strat_atr_hs * ${atrSL}`);
+      }
+      push('    if close >= sl_short');
+      push('        slTriggered := true');
+      push('');
+    }
+
+    // Safety reset: if position went flat while slTriggered was pending
+    if (wt_hasSl) {
+      push('if strategy.position_size == 0');
+      push('    slTriggered := false');
+      push('');
+    }
+
+    // ── Structural / Time exits — INDEPENDENT of the indicator state ──
+    //
+    // PARITY FIX (Trades 34–36 structural vs Pine SL late-fire): the old
+    // codegen read `bar_exit and bar_exit_reason == "Structural"|"Time"`
+    // from the indicator's step 4. That's fragile because the indicator's
+    // `pos_dir` can go to 0 EARLY — the indicator's internal SL (step 3
+    // arm + step 0 deferred fill) uses `close[signalBar]` as its entry
+    // reference, while the strategy uses the actual fill price. On a gap
+    // between signal close and fill open, the indicator's SL can cross
+    // BEFORE the strategy's (real) SL crosses. That sets
+    // `pos_dir := 0` in step 0, which gates step 4 off for the rest of
+    // the position's life — so structural / time exits never fire for
+    // the strategy, and the position is held until the strategy's own
+    // SL eventually crosses. Result: "SL" exit in TV where runtime
+    // shows "Structural" (5-bar gap in the original bug report).
+    //
+    // Fix: compute structural / time detection IN the strategy, using
+    // `strategy.position_size` as the in-position gate and
+    // `strat_entry_bar` (captured on fill bar) for bars-held. This is
+    // independent of the indicator's state machine, so the indicator's
+    // internal SL firing early doesn't affect the strategy.
+    //
+    // Reversals are still NOT handled here: with pyramiding=0, a
+    // `strategy.entry` in the opposite direction auto-closes the current
+    // position. The strat_new_long/short gate above takes care of it.
+    if (wt_hasStructural) {
+      const p = wt_tr.params;
+      push('if strategy.position_size != 0 and not na(strat_entry_bar)');
+      push('    bool strat_is_long_st = strategy.position_size > 0');
+      push('    int  strat_bars_held  = bar_index - strat_entry_bar');
+      push(`    bool strat_time_hit   = strat_bars_held >= ${p.maxBars} - 1`);
+      push(`    bool strat_stoch_exit = strat_is_long_st ? (ta.crossunder(${wt_stochK}, ${wt_stochD}) and ${wt_stochK} > 60) : (ta.crossover(${wt_stochK}, ${wt_stochD}) and ${wt_stochK} < 40)`);
+      push(`    bool strat_rsi_exit   = strat_is_long_st ? (${wt_rsi} < 40 and ${wt_rsi}[3] > 55) : (${wt_rsi} > 60 and ${wt_rsi}[3] < 45)`);
+      push('    if strat_time_hit or strat_stoch_exit or strat_rsi_exit');
+      push('        strategy.close_all(comment=strat_time_hit ? "Time" : "Structural")');
+      push('');
+    } else {
+      // No trail block configured → no structural/time exit. Nothing to emit.
+    }
   }
 
   return {
