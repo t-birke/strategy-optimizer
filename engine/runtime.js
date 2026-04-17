@@ -411,7 +411,10 @@ export function runSpec({ spec, paramSpace, bundle, gene, opts = {} }) {
     // Entry block onBar is pure (typed-array reads) so computing unconditionally
     // is cheap and preserves a consistent call pattern for each block.
     const entrySignals  = aggregateEntries(slots.entries, bundle, i);
-    const filterSignals = aggregateFilters(slots.filters, bundle, i);
+    // Filters receive `regimeLabel` via the fifth arg to their onBar,
+    // so regimeGate (and future regime-aware filters) can consult the
+    // current regime without duplicating its computation.
+    const filterSignals = aggregateFilters(slots.filters, bundle, i, { regimeLabel });
     const runtimeCtx = { entrySignals, filterSignals, slippage: SLIPPAGE };
 
     // --- 5e. Exits ---
@@ -684,7 +687,7 @@ function aggregateEntries(entrySlot, bundle, i) {
  * Mode semantics mirror entries; 'score' counts the number of filters
  * voting `true` for each direction.
  */
-function aggregateFilters(filterSlot, bundle, i) {
+function aggregateFilters(filterSlot, bundle, i, ctx = null) {
   if (!filterSlot || !filterSlot.blocks?.length) return { long: true, short: true };
   const mode = filterSlot.mode;
   let longTrue = 0, shortTrue = 0;
@@ -694,7 +697,7 @@ function aggregateFilters(filterSlot, bundle, i) {
   for (const f of filterSlot.blocks) {
     if (!f) continue;
     const dir = f.block.direction;
-    const r = f.block.onBar(bundle, i, f.state, f.params) ?? { long: false, short: false };
+    const r = f.block.onBar(bundle, i, f.state, f.params, ctx) ?? { long: false, short: false };
     if (dir === 'long' || dir === 'both') {
       longEligible++;
       if (r.long) longTrue++;

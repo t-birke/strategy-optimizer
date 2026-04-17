@@ -17,6 +17,12 @@ import maPullback         from './entry/ma-pullback.js';
 import donchianBreakout   from './entry/donchian-breakout.js';
 import volumeSurge        from './entry/volume-surge.js';
 
+// ── Filter ──────────────────────────────────────────────────
+import htfTrendFilter     from './filter/htf-trend-filter.js';
+import volatilityFloor    from './filter/volatility-floor.js';
+import volumeFilter       from './filter/volume-filter.js';
+import regimeGate         from './filter/regime-gate.js';
+
 // ── Exit ────────────────────────────────────────────────────
 import atrHardStop        from './exit/atr-hard-stop.js';
 import atrScaleOutTarget  from './exit/atr-scale-out-target.js';
@@ -41,6 +47,11 @@ const BLOCKS = [
   maPullback,
   donchianBreakout,
   volumeSurge,
+  // Filters
+  htfTrendFilter,
+  volatilityFloor,
+  volumeFilter,
+  regimeGate,
   // Exits
   atrHardStop,
   atrScaleOutTarget,
