@@ -19,6 +19,7 @@
 
 import {
   sma, ema, rsi, stoch, atr, stdev, percentrank, crossover, crossunder,
+  highest, lowest, adx, vwap,
 } from './indicators.js';
 import * as registry from './blocks/registry.js';
 import { tfToMin } from './data-bundle.js';
@@ -30,13 +31,17 @@ import { tfToMin } from './data-bundle.js';
 //   inputMode: 'source' — input is a single Float64Array (close/volume/etc.)
 //              'candles' — input is the per-TF candle bundle (needs H/L/C)
 const INDICATORS = {
-  sma:         { fn: (src, a)    => sma(src, a.period),        inputMode: 'source'  },
-  ema:         { fn: (src, a)    => ema(src, a.period),        inputMode: 'source'  },
-  rsi:         { fn: (src, a)    => rsi(src, a.period),        inputMode: 'source'  },
-  stdev:       { fn: (src, a)    => stdev(src, a.period),      inputMode: 'source'  },
-  percentrank: { fn: (src, a)    => percentrank(src, a.period), inputMode: 'source' },
-  stoch:       { fn: (c, a)      => stoch(c.close, c.high, c.low, a.period), inputMode: 'candles' },
-  atr:         { fn: (c, a)      => atr(c.high, c.low, c.close, a.period),   inputMode: 'candles' },
+  sma:         { fn: (src, a)    => sma(src, a.period),         inputMode: 'source'  },
+  ema:         { fn: (src, a)    => ema(src, a.period),         inputMode: 'source'  },
+  rsi:         { fn: (src, a)    => rsi(src, a.period),         inputMode: 'source'  },
+  stdev:       { fn: (src, a)    => stdev(src, a.period),       inputMode: 'source'  },
+  percentrank: { fn: (src, a)    => percentrank(src, a.period), inputMode: 'source'  },
+  highest:     { fn: (src, a)    => highest(src, a.period),     inputMode: 'source'  },
+  lowest:      { fn: (src, a)    => lowest(src, a.period),      inputMode: 'source'  },
+  stoch:       { fn: (c, a)      => stoch(c.close, c.high, c.low, a.period),     inputMode: 'candles' },
+  atr:         { fn: (c, a)      => atr(c.high, c.low, c.close, a.period),       inputMode: 'candles' },
+  adx:         { fn: (c, a)      => adx(c.high, c.low, c.close, a.period),       inputMode: 'candles' },
+  vwap:        { fn: (c, a)      => vwap(c.high, c.low, c.close, c.volume, a.period), inputMode: 'candles' },
 };
 
 /**

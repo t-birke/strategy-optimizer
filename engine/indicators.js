@@ -260,3 +260,165 @@ export function crossunder(a, b) {
   }
   return out;
 }
+
+/**
+ * Rolling maximum — ta.highest(src, period).
+ * Includes the current bar. Returns NaN for bars < period-1.
+ *
+ * O(n × period) naive scan; at period ≤ 200 on ~10–50k bars the hot-path
+ * cost is negligible. If this ever profiles as a problem we can swap in a
+ * monotonic-deque O(n) implementation.
+ */
+export function highest(src, period) {
+  const len = src.length;
+  const out = new Float64Array(len);
+  for (let i = 0; i < len; i++) {
+    if (i < period - 1) { out[i] = NaN; continue; }
+    let hi = -Infinity;
+    for (let j = i - period + 1; j <= i; j++) {
+      const v = src[j];
+      if (!isNaN(v) && v > hi) hi = v;
+    }
+    out[i] = hi === -Infinity ? NaN : hi;
+  }
+  return out;
+}
+
+/**
+ * Rolling minimum — ta.lowest(src, period).
+ * Mirror of `highest`. Returns NaN for bars < period-1.
+ */
+export function lowest(src, period) {
+  const len = src.length;
+  const out = new Float64Array(len);
+  for (let i = 0; i < len; i++) {
+    if (i < period - 1) { out[i] = NaN; continue; }
+    let lo = Infinity;
+    for (let j = i - period + 1; j <= i; j++) {
+      const v = src[j];
+      if (!isNaN(v) && v < lo) lo = v;
+    }
+    out[i] = lo === Infinity ? NaN : lo;
+  }
+  return out;
+}
+
+/**
+ * Average Directional Index — ta.adx(dilen, adxlen) (with dilen == adxlen == period).
+ *
+ * Wilder's classic trend-strength oscillator, range 0–100. Above ~25 is
+ * "trending", below ~20 is "ranging" (thresholds are conventional, not
+ * hard-coded here — leave interpretation to the caller).
+ *
+ * Steps (Wilder 1978):
+ *   1. +DM, -DM: directional movement from bar-to-bar high/low moves.
+ *   2. TR: true range (same as `atr`).
+ *   3. Wilder-smooth all three over `period` bars (RMA).
+ *   4. +DI = 100 * smoothed+DM / smoothedTR
+ *      -DI = 100 * smoothed-DM / smoothedTR
+ *   5. DX = 100 * |+DI - -DI| / (+DI + -DI)   (→ NaN when sum is 0)
+ *   6. ADX = Wilder-smooth DX over `period` bars.
+ *
+ * NaN for the first `2*period - 1` bars (one warmup for the DI smoothing,
+ * another for ADX smoothing on top of that). Pine's `ta.adx` uses the
+ * same convention.
+ */
+export function adx(high, low, close, period) {
+  const len = high.length;
+  const plusDm  = new Float64Array(len);
+  const minusDm = new Float64Array(len);
+  const tr      = new Float64Array(len);
+  const out     = new Float64Array(len);
+  out.fill(NaN);
+
+  // Bar 0: all zeros (no prior bar to diff against).
+  for (let i = 1; i < len; i++) {
+    const upMove   = high[i] - high[i - 1];
+    const downMove = low[i - 1] - low[i];
+    plusDm[i]  = (upMove   > downMove && upMove   > 0) ? upMove   : 0;
+    minusDm[i] = (downMove > upMove   && downMove > 0) ? downMove : 0;
+    const hl = high[i] - low[i];
+    const hc = Math.abs(high[i] - close[i - 1]);
+    const lc = Math.abs(low[i]  - close[i - 1]);
+    tr[i] = Math.max(hl, hc, lc);
+  }
+
+  // Wilder's smoothing (RMA), seeded by the sum of the first `period` values.
+  // Needs period bars of data first, so valid output starts at index `period`.
+  if (len <= period) return out;
+
+  let smTr = 0, smPlusDm = 0, smMinusDm = 0;
+  for (let i = 1; i <= period; i++) {
+    smTr      += tr[i];
+    smPlusDm  += plusDm[i];
+    smMinusDm += minusDm[i];
+  }
+
+  const dx = new Float64Array(len);
+  dx.fill(NaN);
+
+  for (let i = period; i < len; i++) {
+    if (i > period) {
+      smTr      = smTr      - smTr      / period + tr[i];
+      smPlusDm  = smPlusDm  - smPlusDm  / period + plusDm[i];
+      smMinusDm = smMinusDm - smMinusDm / period + minusDm[i];
+    }
+    const plusDi  = smTr > 0 ? 100 * smPlusDm  / smTr : 0;
+    const minusDi = smTr > 0 ? 100 * smMinusDm / smTr : 0;
+    const sumDi   = plusDi + minusDi;
+    dx[i] = sumDi > 0 ? 100 * Math.abs(plusDi - minusDi) / sumDi : NaN;
+  }
+
+  // ADX = Wilder-smooth DX over `period` bars. First valid ADX is at
+  // index `2*period - 1` (period bars of DX built up, then averaged).
+  const firstAdxBar = 2 * period - 1;
+  if (len <= firstAdxBar) return out;
+
+  let sum = 0, count = 0;
+  for (let i = period; i <= firstAdxBar; i++) {
+    if (!isNaN(dx[i])) { sum += dx[i]; count++; }
+  }
+  if (count === 0) return out;
+  out[firstAdxBar] = sum / count;
+
+  for (let i = firstAdxBar + 1; i < len; i++) {
+    if (isNaN(dx[i])) { out[i] = out[i - 1]; continue; }
+    out[i] = (out[i - 1] * (period - 1) + dx[i]) / period;
+  }
+  return out;
+}
+
+/**
+ * Rolling VWAP — volume-weighted average typical price over the last
+ * `period` bars (inclusive of current). Typical price = (H+L+C)/3.
+ *
+ * This is the *rolling* flavor, not session-anchored VWAP. It's useful as
+ * a fair-price reference at any timeframe. Session-anchored VWAP (the
+ * intraday day-reset flavor) is Phase 7 work — it needs a session helper
+ * that doesn't exist yet.
+ *
+ * Returns NaN for bars < period-1, or any bar whose window has zero
+ * cumulative volume.
+ *
+ * O(n) via sliding sums.
+ */
+export function vwap(high, low, close, volume, period) {
+  const len = close.length;
+  const out = new Float64Array(len);
+  out.fill(NaN);
+
+  let num = 0, den = 0;
+  for (let i = 0; i < len; i++) {
+    const tp = (high[i] + low[i] + close[i]) / 3;
+    num += tp * volume[i];
+    den += volume[i];
+    if (i >= period) {
+      const o = i - period;
+      const otp = (high[o] + low[o] + close[o]) / 3;
+      num -= otp * volume[o];
+      den -= volume[o];
+    }
+    if (i >= period - 1 && den > 0) out[i] = num / den;
+  }
+  return out;
+}
