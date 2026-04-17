@@ -6,13 +6,14 @@ evaporates with a session.
 
 Organized as:
 
-1. **Phase 1** — foundation (in progress)
+1. **Phase 1** — foundation
 2. **Phase 2** — fitness, walk-forward, runner integration
 3. **Phase 3** — block library expansion
 4. **Phase 4** — persistence, queue, UI, deployment
 5. **Phase 5** — AI idea generator (parked; separate effort)
-6. **Deferred features** — good ideas we explicitly postponed
-7. **Open questions** — undecided design calls
+6. **Phase 6** — robustness selector
+7. **Deferred features** — good ideas we explicitly postponed
+8. **Open questions** — undecided design calls
 
 ---
 
@@ -136,7 +137,7 @@ cleanup item.
 - **Worker** rebuilds the paramSpace itself (functions don't survive structured-clone), calls `registry.ensureLoaded()` first because each Worker has a fresh module graph, then swaps the legacy `runStrategy + score formula` for `runSpec → computeFitness`. The composite score is mapped from `[0, 1]` to `[0, 1000]` so it sits in roughly the same magnitude as the legacy fitness; eliminated genes get `-10000` so they sort below the legacy soft-penalty band `[-5000, -1000]`.
 - **Diagnostics**: in spec mode the worker stamps `metrics._fitness = { score, eliminated, gatesFailed, breakdown, reason? }` so the UI can show *which gate killed which gene*.
 - **Shared candle transport** kept (zero-copy SAB) — re-loading from DuckDB per worker was rejected because the SAB extension to 6 columns was a one-line change and DuckDB has lock contention with the UI server.
-- **HTFs deferred** to Phase 2.6: the runner throws if `spec.htfs` is non-empty so multi-TF specs fail loud rather than silently using only the base.
+- **HTFs deferred** to Phase 2.6 at the time this section was written; **now implemented (§2.6 ✅)**. HTF requirements are derived from blocks' `indicatorDeps(params).tf` via `computeDataRequirements(spec)` (there's no top-level `spec.htfs` field — that part of the original note was wrong), and shipped via per-HTF SAB payloads; see §2.6 below.
 - **Walk-forward not run per-generation**: per-gene WF every generation would multiply runtime by `nWindows`. Phase 2.4 keeps WF a one-shot post-GA step (the harness already exists in `optimizer/walk-forward.js`); a future 2.4b can promote selected top-N to per-gen WF if needed.
 - **Verification**: new `scripts/runner-spec-mode-check.js` runs a tiny GA (pop=8, gens=3) on the migration-gate spec in **both** modes and asserts: bestGene uses spec QIDs (e.g. `emaTrend.main.emaFast`) in spec mode and flat names in legacy mode; `_fitness` diagnostics present in spec mode and absent in legacy mode; both modes complete without crashing. Currently **13/13 ✓**.
 
@@ -179,11 +180,71 @@ cleanup item.
   end-to-end test running two GA runs to confirm `run2.preloadCount ===
   run1.savedCount`). Currently **41/41 ✓**.
 
+### 2.6 HTF support in walk-forward + runner spec mode ✅ done
+
+**Goal (achieved):** lift the §2.4 restriction that the spec-mode runner
+threw if `spec.htfs` was non-empty. Multi-TF specs (e.g. a 4H entry
+strategy with a 1D trend filter) are the foundation for useful filter
+blocks (`htfTrendFilter`, `htfTrendRegime`) and are a hard prereq for
+the Phase 6 15-min fork.
+
+**Discovery during implementation:** the `spec.htfs` check in the old
+runner was actually dead code — `validateSpec` never populates a top-
+level `spec.htfs` field. HTF requirements are derived from blocks'
+`indicatorDeps(params).tf` via `computeDataRequirements(spec)` in
+`engine/data-bundle.js`. The runner's `spec.htfs.length > 0` throw
+would have never fired for any realistic spec — it was a false guard
+leaving HTF blocks silently reading base-TF data. Replaced with the
+proper check + transport.
+
+**Changes:**
+
+1. **`optimizer/htf-transport.js`** (new) — shared helpers for packing
+   HTF candles + `htfBarIndex` into SharedArrayBuffers and unpacking
+   them on the worker side. Layout: per HTF, one 6-col Float64 SAB for
+   candles, one Uint32 SAB for `htfBarIndex`. Zero-copy typed-array
+   views on both ends.
+2. **`optimizer/runner.js`** — calls `computeDataRequirements(spec)`
+   to determine required HTFs, loads each via `loadCandles`, computes
+   `makeHtfBarIndex` against the base timeline, packs via
+   `packHtfPayload`, and ships an `htfPayloads` array in `workerData`.
+   Full-data re-eval (`fitnessStartBar > 0` branch) and post-GA
+   walk-forward both reconstruct HTFs from the same payloads.
+3. **`optimizer/island-worker.js`** — unpacks `htfPayloads` via
+   `unpackHtfPayloads` into `specBundle.htfs`, matching the shape
+   `engine/data-bundle.js` produces. `baseTfMin` also threaded through
+   for completeness.
+4. **`optimizer/walk-forward.js`** — `sliceBundle` now calls a new
+   exported `sliceHtfs(htfs, upperBar)` helper that subarrays each
+   HTF's `htfBarIndex` to the base slice length. HTF candle arrays
+   stay full (they're referenced *through* `htfBarIndex`, not by
+   base-bar offset). Module header rewritten to explain the
+   correctness argument.
+5. **`scripts/runner-htf-check.js`** (new, 49 assertions) — gate for
+   the transport + slicing. Sections: (1) `packHtfPayload` round-trip
+   bit-for-bit, (2) `unpackHtfPayloads` keyed by tfMin, (3) `sliceHtfs`
+   zero-copy subarray semantics, (4) `sliceBundle` end-to-end with
+   runtime-parity lookup check (for any base-bar index i < upperBar,
+   `slicedHtf.htfBarIndex[i]` resolves to the same HTF-bar index +
+   close value as the full bundle), (5) no-HTF regression guard.
+
+**What's intentionally deferred:**
+- **End-to-end "run a GA on a multi-TF spec" test** — currently no
+  library block declares an HTF `indicatorDeps` entry. Phase 3's
+  first HTF-using block (e.g. `htfTrendFilter`) will need a test that
+  exercises the full runner→worker→runtime pipeline; until then, the
+  unit-level gate above proves the transport + slicing are correct.
+
 **Exit criterion for Phase 2:** end-to-end GA run on the migration-gate spec
 produces tuned params, a WF report, a regime breakdown, and a scalar fitness —
-all written to disk and visible in the UI. **All 5 verification gates green
-as of 2026-04-15** — Phase 2 functionally complete pending Phase 2.6 (HTF
-support in walk-forward + runner spec mode).
+all written to disk and visible in the UI. Multi-TF specs work in spec-mode
+runner and walk-forward. **All 6 verification gates green**:
+- `fitness-check`: 109/109 ✓
+- `pine-wundertrading-check`: 192/192 ✓
+- `walk-forward-check`: 35/35 ✓
+- `runner-spec-mode-check`: 21/21 ✓
+- `fitness-cache-check`: 41/41 ✓
+- `runner-htf-check`: 49/49 ✓ (new)
 
 ---
 
@@ -1432,15 +1493,21 @@ Motivated by run #58 analysis: IS PF=11, OOS WFE=12.8%, only ~45 real
 entry decisions with 22 free parameters. The GA was curve-fitting because
 it had zero out-of-sample pressure during evolution.
 
-##### ✅ 4.9a — GA train/test split (`gaOosRatio`) — disabled by default.
+##### ⚠️ 4.9a — GA train/test split (`gaOosRatio`) — SUPERSEDED by Phase 6.
 
-Mechanism still available (`spec.fitness.gaOosRatio > 0`) but **default
-changed to 0** (disabled). The split only shrinks the training set —
-the GA overfits to whichever narrow time window the OOS portion covers,
-producing strategies that look great on 30% of data but collapse on the
-full period. The walk-forward report + regime gate are more principled
-overfitting guards and remain active.
+> **SUPERSEDED by Phase 6.** The train/test split within GA evolution is
+> strictly worse than §6.1 (composite fitness with post-hoc robustness terms)
+> + §6.3 (60-window ensemble fitness in the 15-min fork). The split only
+> shrinks the training set; it doesn't pressure the GA toward generalizable
+> genes — it just lets the GA overfit to whichever narrow OOS slice the
+> spec happened to pick. Full context in "Deferred features" below.
+>
+> **Action after Phase 6 lands:** delete the code path
+> (`spec.fitness.gaOosRatio`, `fitnessStartBar` computation in runner,
+> worker hand-off). Default has been `0` since 2026-04; the mechanism is
+> unused.
 
+**Historical record** — the mechanism still compiles:
 - `spec.fitness.gaOosRatio` (default **0**, set >0 to enable)
 - `fitnessStartBar` computed in runner, passed to island-worker → runtime
 - Post-GA: ALL top results re-evaluated on full data (not just the winner)
@@ -1471,14 +1538,18 @@ Config: `fitness.frequencyTarget` (default 100).
   covering half-credit, full-credit, over-target cap, disabled mode,
   and ranking comparison.
 
-##### 4.9c — Complexity penalty (backlog)
+##### ⚠️ 4.9c — Complexity penalty — SUPERSEDED by Phase 6.
 
-AIC/BIC-style penalty for high parameter count. The GA treats a
-5-parameter and 50-parameter spec identically — more free params means
-more room to overfit. A per-active-param tax on fitness would favor
-simpler strategies.
+> **SUPERSEDED by Phase 6.1.** A per-active-param tax is one specific instance
+> of the composite-robustness multiplier that Phase 6.1 builds. Shipping both
+> would stack two competing multiplier systems. If the "more params → more
+> overfit" hypothesis is real, Phase 6.1's bootstrap-P10 and MC-DD-P95 terms
+> catch the same failure mode indirectly (overfit genes have concentrated
+> P/L in a few trades → poor bootstrap P10, poor adversarial split).
+> Full context in "Deferred features" below.
 
-Potential formula: `score *= 1 - complexityPenalty * activeParams / totalParams`
+**Original sketch** (for historical record): AIC/BIC-style penalty,
+`score *= 1 - complexityPenalty * activeParams / totalParams`.
 
 ---
 
@@ -1498,9 +1569,332 @@ Parked until Phases 1–4 are solid. Too many moving parts to start on it now.
 
 ---
 
-## 6. Deferred features
+## 6. Phase 6 — Robustness Selector
+
+**Goal:** make the GA's fitness function itself select for strategies that
+generalize, not just strategies that happen to fit the training window. Today
+the GA optimizes for `fitness(backtest)` and a post-hoc screener filters the
+survivors — but that wastes compute on genes that were never going to pass.
+Rewarding robustness *inside* fitness means the population evolves toward
+generalizable genes directly.
+
+**Framing note on the 15-min fork (§6.3):** 4H × 5y ≈ 11,000 bars = one
+backtest observation per gene. We cannot statistically distinguish a real
+0.3-Sharpe edge from a 5-year coincidence at that sample size. Every other
+technique in this phase (noise tests, bootstraps, permutation) is
+fundamentally a workaround for insufficient data. The 15-min fork *solves*
+the underlying problem by producing ~60 non-overlapping 1-month windows per
+5-year dataset — 60× the information per evaluation. It is the only idea
+here that changes the math, not just the scoring. Treat it as the
+highest-leverage sub-phase.
+
+### 6.0 Prerequisites
+
+Small refactors that unblock the rest of Phase 6. Do these FIRST — total
+cost ~1 day — so 6.1/6.2 don't end up retrofitting them later.
+
+#### 6.0.1 Extract `evaluateGene()` from `island-worker.js`
+
+Today the fitness evaluation lives as a closure inside `createIsland` at
+`optimizer/island-worker.js:175–213`, closing over `spec`, `paramSpace`,
+`specBundle`, `specRunOpts`, and the per-island cache. NTO's staged
+evaluation (§6.2) needs to call `evaluateGene(gene, variantBundle_k)` K
+times — but there's no seam to plug in without rewriting the closure.
+
+**Work:** extract `evaluateGene(gene, bundleOverride?) → {metrics, fitness,
+breakdown}`. Pass dependencies explicitly. The existing code path becomes
+`evaluateGene(gene, /* no override */)`.
+
+**Effort:** ~2 hours.
+
+**Acceptance:** `runner-spec-mode-check.js` still passes; new
+`scripts/evaluate-gene-check.js` exercises the `bundleOverride` path with
+a synthetic variant bundle.
+
+#### 6.0.2 Extend `fitness-cache.js` key schema for noise variants
+
+Cache today keys on `geneKey` → fitness. NTO evaluates the same gene
+against {original + K variants}, producing K+1 different fitnesses per
+gene. Without schema change, the cache either (a) returns a base-fitness
+result when we need median-over-variants, or (b) busts on every run.
+
+**Work:** extend key to `(geneKey, variantId)` → partial result. Add a
+composition helper that returns a cached composite fitness only when all
+K+1 partials are present. Keep `variantId="base"` for non-NTO runs
+(backwards-compat).
+
+**Effort:** ~3 hours.
+
+**Acceptance:** `fitness-cache-check.js` extended with two tests —
+(a) partial-cache miss returns nothing until all K+1 present, (b) non-NTO
+runs use only `variantId="base"` entries.
+
+#### 6.0.3 Decisions (no code)
+
+- **Close §4.9a `gaOosRatio`** (done: marked superseded above). Delete
+  the code path after Phase 6 lands.
+- **Close §4.9c complexity penalty** (done: marked superseded above).
+  Do not ship as a separate multiplier; Phase 6.1 subsumes.
+
+### 6.1 Composite fitness with O(1) robustness terms
+
+All five terms are computed post-hoc on the existing trade list. Zero
+extra backtests per gene. Applied as a multiplier to base fitness so
+hard gates still eliminate genes; this multiplier reorders surviving
+genes by robustness.
+
+**Layout:** new `optimizer/robustness/` directory, one module per term.
+Terms are pure functions over the trade list + basic metrics — testable
+in isolation with synthetic trade lists.
+
+**Terms:**
+
+1. **`mcDdReshuffle.js`** — Monte Carlo trade-order reshuffle. Shuffle
+   the trade list N=1000×, compute maxDD of each, return the **P95
+   drawdown**. Live DD is typically 1.5–2× backtest maxDD; MC-DD-P95 is
+   a more honest DD indicator than the single-realization `maxDDPct`.
+
+2. **`bootstrapP10.js`** — Bootstrap-with-replacement resample, 1000×,
+   compute net return of each, return **P10 net return**. If P10 < 0,
+   the edge depends on a small number of specific trades — not a general
+   effect. Catches the "three lucky trades carry the year" failure mode.
+
+3. **`randomizedOos.js`** — Sample 1000 random 30%-of-bars slices, tally
+   trades entered in each, compute OOS-Sharpe of each. Return the
+   percentile rank of the actual WF-OOS Sharpe in this distribution.
+   Actual should sit in the central 50% — top 5% = lucky OOS period,
+   bottom 5% = harsh. Catches "looked great on our happens-to-be-flat
+   OOS slice."
+
+4. **`paramStabilityCoV.js`** — For each numeric parameter, compute
+   `stdev / mean` across WF window winners. Strategy-level CoV = mean
+   across params. A gene whose parameters jump around window-to-window
+   (`12 → 47 → 23 → 55`) is curve-fit even if WFE passes.
+
+5. **`adversarialSplit.js`** — Randomly bucket each trade into group A
+   or B (50/50). Compute fitness on each group separately. Penalty =
+   `|fit_A − fit_B| / |fit_total|`. If 3 trades carry 80% of profit,
+   A and B diverge wildly; if the edge is real, they're similar. Near
+   impossible to game — the split is random *per gene evaluation*.
+
+**Composition** in `optimizer/fitness.js`:
+
+```js
+base = weighted(PF, 1-maxDD, netReturn)   // existing composite
+mult = geomean(
+  clip(P10_bootstrap / median_net, 0, 1),
+  clip(maxDD_backtest / max(MC_DD_P95, epsilon), 0, 1),
+  clip(1 - param_CoV, 0, 1),
+  clip(1 - adversarial_gap, 0, 1),
+  randOos_percentile_in_central_band ? 1 : 0.7
+)
+fitness = base * mult
+```
+
+**Geomean, not arithmetic mean** — any single weak dimension gets
+penalized; one dimension being great cannot rescue a disastrous other.
+
+**UI:** extend `fitness_breakdown_json` (already rendered by
+`ui/app.js renderFitnessBreakdown`) with a `robustness` sub-object
+containing all five term values. Existing renderer handles this with a
+schema extension; no new card needed.
+
+**Effort:** ~1 week. All cheap on the trade-list side. Integration +
+testing + UI wiring dominate.
+
+**Acceptance:** `fitness-check.js` extended with synthetic trade lists
+exercising each term in isolation; end-to-end test that enabling the
+composite produces a visibly different gene ranking vs disabled (genes
+that pass all 5 terms climb; genes that fail any one drop).
+
+### 6.2 Noise-Test During Optimization (NTO), staged
+
+The single most important upgrade: the GA can no longer climb noise
+spikes. Each variant preserves volatility clustering and return
+distribution but destroys the specific pattern a gene might be fit to —
+if the gene's edge survives K variants, it's probably real.
+
+**Design:**
+
+- **Pre-generate K variants once at run start.** Not per-gene, not
+  per-generation. K=3 or K=5. Every gene evaluated on the *same* fixed
+  variants. Fitness stays **deterministic** for a given gene, which is
+  required for GA convergence. Re-randomizing variants per gene makes
+  fitness stochastic → GA gradient becomes noise → no convergence.
+
+- **Staged evaluation per generation:**
+  1. Every gene → evaluated on base series → `base_fitness`.
+  2. Genes whose `base_fitness` > current generation's P50 → evaluated
+     on K variants → `robust_fitness = median(fitness over K+1 series)`.
+  3. Tournament selection uses `robust_fitness` for stage-2 genes,
+     `base_fitness * (1 − stage1Discount)` for stage-1 genes.
+
+  This caps NTO cost at roughly `1 + 0.5 K` backtests per gene. For K=3,
+  that's **2.5× baseline compute** — absorbable on the 96-worker cluster.
+
+- **Variant generation: block-bootstrap of AR(1) residuals from log-
+  returns.** Block size ~5 bars (preserves short-range autocorrelation).
+  Exponentiate back to synthetic OHLC. **Not pure OHLC jitter** — jitter
+  destroys volatility clustering, which is the most exploitable
+  real-market property; a noise test that destroys it isn't noise, it's
+  a different distribution.
+
+**Dependencies:** §6.0.1 (`evaluateGene` seam) + §6.0.2 (cache schema).
+Skipping those makes integration painful.
+
+**Effort:** 1–2 weeks. Variant generator is the only novel piece;
+everything else is wiring.
+
+**Acceptance:**
+- A/B test on a known-good gene: NTO fitness ≈ non-NTO fitness (real
+  gene passes).
+- A/B test on a known-overfit gene: NTO fitness collapses (overfit gene
+  fails).
+- Per-gene compute overhead ≤ 3× measured on the 96-worker cluster.
+
+### 6.3 Short-horizon fork — 15min / 1-month pipeline
+
+**The highest-leverage sub-phase.** 6.1 and 6.2 are workarounds for
+insufficient data. 6.3 solves the data problem directly.
+
+**Math:**
+
+| Pipeline | Bars per eval | 1-month windows per 5y |
+|----------|---------------|------------------------|
+| 4H / 5y (existing) | ~11,000 | 1 |
+| 15min / 1mo (new)  | ~2,880  | ~60                    |
+
+Sixty windows is the difference between "statistically meaningful" and
+"gut feel."
+
+**What it unlocks:**
+
+- **Ensemble fitness:** `median(window_fitness_i)` across i = 1..60.
+  Profitable in 48/60 windows is a binomial-significant pass rate.
+  "High Sharpe over 5 years" tells us almost nothing about *which* of
+  those 5 years mattered.
+- **Window pass rate** as a primary gate (e.g. ≥80% profitable). Much
+  harder to game than scalar Sharpe.
+- **Cross-window CoV** as a real measurement (N=60, not N=1).
+- **Walk-forward at scale:** 40 training windows, 20 test windows. The
+  WF we always wished we could do.
+- **Empirical validation lab for 6.1 and 6.2.** 60 windows are enough
+  signal to measure "does NTO with K=5 actually produce more robust OOS
+  genes than plain fitness?" The 4H/5y pipeline literally cannot answer
+  this question; the sample is too small.
+
+**Caveats worth planning around:**
+
+- **Different edge class.** 15-min strategies are shorter-horizon
+  (mean-reversion around VWAP, intraday momentum, breakout-retest). This
+  does *not* replace the 4H/5y pipeline — complementary product.
+- **Execution-cost realism matters way more at 15m.** Taker fees +
+  slippage + latency dominate in a way they don't at 4H. Audit
+  `engine/execution-costs.js` for honest taker/maker assumptions and
+  realistic slippage at 15-min tick before trusting any output.
+- **Regime sampling still imperfect.** 60 months of 2022–2026 still
+  underrepresents some regimes. Block-bootstrap sampling *across*
+  windows mitigates.
+- **Strategy grammar probably wants extensions.** Mean-reversion entries
+  (`rsiPullback`, `maPullback` already on the Phase 3 list — promote),
+  session-based filters (NY open, Asian close), possibly spread filters
+  if/when we get the data.
+
+**Work breakdown:**
+
+- `bin/ga-run-short-horizon.js` — new runner variant that iterates over
+  the 60 window slices instead of one big dataset.
+- 15-min candle ingestion for BTCUSDT (and ETH/SOL for cross-market
+  robustness tests in §6.1 if we want them).
+- Fitness variant: `median(window_fit) × pass_rate(windows_with_fit > 0)`.
+- Execution-cost honesty audit on `execution-costs.js`.
+- Likely: promote `rsiPullback` / `maPullback` entry blocks from Phase 3
+  to accompany this phase.
+- Phase 2.6 (HTF support) is a **hard prereq** — 15-min without HTF
+  context is mostly noise.
+
+**Effort:** 3–4 weeks. Parallel track to 6.1/6.2; independent compute
+budget.
+
+**Acceptance:**
+- End-to-end run of 60-window ensemble fitness on a known gene produces
+  a sensible per-window distribution (not all zeros, not all wins).
+- Genes tuned on windows 1–40 retain edge on windows 41–60 with at
+  least 70% pass rate.
+- At least 3 symbols supported (BTC, ETH, SOL).
+
+### 6.4 Multi-objective NSGA-II (optional, later)
+
+Scalar composite fitness forces a weighting choice. Real risk
+preferences are non-uniform — some users accept higher volatility for
+higher return, others won't. NSGA-II keeps the whole Pareto front
+`(raw_fitness, robustness_score)` and the user picks from the front
+based on their own appetite.
+
+**Why optional:** only needed if the scalar composite in §6.1 starts
+feeling constrained. Bigger refactor of `optimizer/ga.js`. Park here so
+the option exists; pull in only when concrete pain appears.
+
+**Effort:** ~1 week if pursued.
+
+### Exit criterion for Phase 6
+
+1. GA runs produce genes that pass external noise/bootstrap validation
+   at ≥80% rate, up from the baseline rate under the current fitness
+   (which we should measure as a control before §6.1 lands).
+2. The 15-min pipeline produces genes profitable in ≥80% of
+   out-of-sample windows.
+3. All five §6.1 terms wired into `fitness.js`, surfaced in the
+   fitness-breakdown UI.
+4. NTO runs at ≤3× compute overhead on the 96-worker cluster.
+5. 15-min fork runs end-to-end on ≥3 symbols (BTC, ETH, SOL).
+
+---
+
+## 7. Deferred features
 
 Things we intentionally postponed from earlier design discussions.
+
+### Superseded: GA train/test split (`gaOosRatio`) — was §4.9a
+
+**Superseded by Phase 6.1 + Phase 6.3.** The train/test split within GA
+evolution only shrinks the training set — it doesn't pressure the GA
+toward generalizable genes. The GA just overfits to whichever narrow
+time window the OOS portion covers, producing strategies that look
+great on 30% of data but collapse on the full period.
+
+The walk-forward report + regime gate are already more principled
+overfitting guards. Phase 6.1's composite robustness multiplier +
+Phase 6.3's 60-window ensemble fitness are strictly stronger than the
+train/test split — they pressure the GA every generation, not just
+post-hoc.
+
+**Status:** mechanism disabled by default since 2026-04. Code path
+survives in `optimizer/runner.js` + `island-worker.js` (`gaOosRatio` /
+`fitnessStartBar`). Slated for **deletion after Phase 6 lands** — no
+value in carrying a third unused overfitting-guard paradigm.
+
+### Superseded: Complexity penalty (AIC/BIC-style) — was §4.9c
+
+**Superseded by Phase 6.1.** The proposed per-active-param tax
+(`score *= 1 − complexityPenalty * activeParams / totalParams`) is one
+specific instance of the composite-robustness multiplier that Phase 6.1
+builds. Shipping both would stack two competing multiplier systems in
+`fitness.js`, producing confusing interactions and double-penalizing
+the same failure mode.
+
+If the "more params → more overfit" hypothesis is correct, Phase 6.1's
+bootstrap-P10 and adversarial-split terms catch it indirectly: overfit
+genes concentrate P/L in a small number of trades → bootstrap P10
+collapses; the same concentration means random A/B splits produce
+divergent fitnesses → adversarial gap is large. No dedicated
+param-count term needed.
+
+**Status:** never implemented. No code to clean up. Documented here so
+future readers understand why there's no complexity penalty in
+`fitness.js`.
+
+### Pyramiding / scale-in entries
 
 ### Pyramiding / scale-in entries
 
@@ -1658,9 +2052,66 @@ isn't urgent — for the migration gate we rely on the GA preferring
 constraint-respecting genomes naturally (small loss on fitness). Revisit
 if we see the population getting stuck against this wall.
 
+### Generic exit block Pine codegen
+
+**Problem:** `pine-codegen.js` hardcodes the strategy-tester and
+indicator exit logic for the three current exit blocks (`atrHardStop`,
+`atrScaleOutTarget`, `structuralExit`). Adding a new exit block (e.g.,
+chandelier trail, fixed-% SL, Keltner exit) requires manually adding a
+case in both `emitExitStateMachine()` (indicator mode) and the strategy
+execution section (strategy mode). The codegen throws on unknown blocks:
+
+```javascript
+const supported = new Set(['atrHardStop', 'atrScaleOutTarget', 'structuralExit']);
+```
+
+The block contract (`engine/blocks/contract.js`) only requires
+`pineTemplate()` for entry/filter/regime blocks. Exit blocks have **no
+mechanism** to declare their TV strategy-tester behavior.
+
+**Why this can't be a simple pineTemplate():** Exit blocks don't just
+produce a boolean signal — they need to declare:
+
+1. **State variables** (`var float pos_entry`, `var bool slTriggered`)
+2. **Indicator series** (`ta.atr(14)`)
+3. **Execution model** — how does this exit fire in TV?
+   - Intra-bar on wick touch → `strategy.exit(stop=X)`
+   - Close-based with deferral → flag → `strategy.close()` next bar
+   - Limit fill → `strategy.exit(limit=X)`
+4. **Cross-block interactions** — breakeven shift after TP1 means the
+   hardStop block needs to know when the target block fills
+5. **Evaluation order** — ESL before TP before close-based SL arming
+
+**Generalization path (when needed):** extend the exit block contract
+with a `pineExitTemplate()` method returning structured hooks:
+
+```javascript
+pineExitTemplate(params, paramRefs) {
+  return {
+    stateVars:  ['var float myStop = na'],
+    indicators: ['myAtr = ta.atr(14)'],
+    onEntry:    ['myStop := close - myAtr * 2'],
+    check:      { model: 'close-deferred', code: 'close <= myStop', tag: '"SL"' },
+    onTpHit:    ['myStop := strat_entry * 1.003'],  // optional
+  }
+}
+```
+
+The codegen orchestrator assembles pieces in the correct execution
+order. Each exit block declares *what* it does; the codegen decides
+*how* to wire it.
+
+**Decision:** keep hardcoded for now. The throw-on-unknown is a safety
+feature — it forces deliberate TV support when adding a block. Extract
+the structured-hook contract when the 4th or 5th block reveals repeated
+patterns from real cases rather than speculation.
+
+**Trigger to revisit:** when adding a new exit block feels like
+copy-pasting 80% of an existing case with minor tweaks.
+
 ---
 
-## 7. Open questions
+## 8. Open questions
 
 Design calls we haven't yet made — flag them when they come up.
 
