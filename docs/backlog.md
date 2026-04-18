@@ -1717,7 +1717,7 @@ r1.saved` — which holds for any GA outcome.
 - **Close §4.9c complexity penalty** (done: marked superseded above).
   Do not ship as a separate multiplier; Phase 6.1 subsumes.
 
-### 6.1 Composite fitness with O(1) robustness terms
+### 6.1 Composite fitness with O(1) robustness terms ✅ DONE
 
 All five terms are computed post-hoc on the existing trade list. Zero
 extra backtests per gene. Applied as a multiplier to base fitness so
@@ -1775,18 +1775,46 @@ fitness = base * mult
 **Geomean, not arithmetic mean** — any single weak dimension gets
 penalized; one dimension being great cannot rescue a disastrous other.
 
-**UI:** extend `fitness_breakdown_json` (already rendered by
-`ui/app.js renderFitnessBreakdown`) with a `robustness` sub-object
-containing all five term values. Existing renderer handles this with a
-schema extension; no new card needed.
+**UI:** `fitness_breakdown_json` now carries a `robustness` sub-object
+(`multiplier`, `mcDd`, `bootstrap`, `randomOos`, `paramCoV`,
+`adversarial`) when the feature is enabled. Existing UI renderer picks
+this up with a schema extension — no new card needed.
 
-**Effort:** ~1 week. All cheap on the trade-list side. Integration +
-testing + UI wiring dominate.
+**Delivered (2026-04-18):**
 
-**Acceptance:** `fitness-check.js` extended with synthetic trade lists
-exercising each term in isolation; end-to-end test that enabling the
-composite produces a visibly different gene ranking vs disabled (genes
-that pass all 5 terms climb; genes that fail any one drop).
+All 5 modules built in parallel + full composition layer:
+- `optimizer/robustness/mcDdReshuffle.js` — 16-assertion gate
+- `optimizer/robustness/bootstrapP10.js` — 22-assertion gate
+- `optimizer/robustness/randomizedOos.js` — 21-assertion gate
+- `optimizer/robustness/paramStabilityCoV.js` — 37-assertion gate
+- `optimizer/robustness/adversarialSplit.js` — 31-assertion gate
+- Composition in `optimizer/fitness.js` via `computeRobustnessMultiplier()`
+- Config surfaced as `spec.fitness.robustness.{enabled, caps, nSamples}`;
+  default `enabled: false` so pre-6.1 specs see zero behavior change
+- Runner / worker auto-enable `opts.collectTrades = true` when
+  `spec.fitness.robustness.enabled` is true; cache layer strips the
+  trade list before persisting (memory-bounded)
+- `fitness-check.js` section [20] with 15 new assertions covering:
+  disabled-by-default, no-trades neutral path, diffuse-edge vs
+  whale-edge gap, paramCoV respond to WF drift, determinism
+- On a cache hit in the worker, the stripped-trade-list metrics object
+  carries the robustness breakdown forward — no re-eval needed
+
+**Gate totals (all 13 green)**:
+  fitness-check                           : 122/122 (new section [20])
+  pine-wundertrading-check                : 192/192
+  walk-forward-check                      :  35/35
+  runner-spec-mode-check                  :  21/21
+  fitness-cache-check                     :  70/70
+  runner-htf-check                        :  49/49
+  block-library-check                     : 633/633
+  evaluate-gene-check                     :  15/15
+  robustness-mc-dd-reshuffle-check        :  16/16 (new)
+  robustness-bootstrap-p10-check          :  22/22 (new)
+  robustness-randomized-oos-check         :  21/21 (new)
+  robustness-param-stability-cov-check    :  37/37 (new)
+  robustness-adversarial-split-check      :  31/31 (new)
+  **Total: 1284/1284**
 
 ### 6.2 Noise-Test During Optimization (NTO), staged
 

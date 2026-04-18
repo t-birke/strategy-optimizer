@@ -574,6 +574,147 @@ console.log('\n[19] computeFitness — annualized return (CAGR) scoring');
   assertClose('fallback normRet = min(2.0, 1.0)/1.0 = 1.0', rFallback.breakdown.normRet, 1.0, 1e-4);
 }
 
+// ─── 20. Robustness multiplier (Phase 6.1) ─────────────────
+// Geomean of 5 post-hoc robustness terms over the trade list + WF report.
+// Off by default; opt-in via spec.fitness.robustness.enabled.
+console.log('\n[20] computeFitness — robustness multiplier (Phase 6.1)');
+{
+  // Stable base metrics; fitness would pass all gates without robustness.
+  const base = {
+    trades: 200, totalPositions: 200, pf: 1.6, maxDDPct: 0.12,
+    netProfitPct: 1.5, annualizedReturnPct: 0.5, periodYears: 3,
+    regimeBreakdown: {
+      bull: { trades: 120, pf: 1.7, net: 80000, wins: 70, grossProfit: 180000, grossLoss: 100000 },
+      bear: { trades:  80, pf: 1.4, net: 40000, wins: 45, grossProfit: 110000, grossLoss:  70000 },
+    },
+  };
+
+  // Synthetic trade list with pnl spread evenly (diffuse edge — all
+  // robustness terms should score high).
+  function buildDiffuseTrades(n = 200, seed = 1) {
+    let s = seed;
+    const trades = [];
+    const startTs = Date.UTC(2022, 0, 1);
+    const barMs   = 4 * 60 * 60 * 1000;
+    for (let i = 0; i < n; i++) {
+      // Deterministic +0.002 / -0.001 winners vs small losers
+      s = (s * 1103515245 + 12345) >>> 0;
+      const pnlPct = (s % 100) < 55 ? 0.003 : -0.0015;
+      trades.push({
+        direction: (i % 2 ? 'Long' : 'Short'),
+        entryTs: startTs + i * barMs * 10,
+        exitTs:  startTs + i * barMs * 10 + barMs * 8,
+        signal: 'Close',
+        entryPrice: 30000, exitPrice: 30000 * (1 + pnlPct),
+        sizeAsset: 0.1, sizeUsdt: 3000, riskUsdt: 300,
+        pnl: 3000 * pnlPct, pnlPct, regime: 'bull',
+      });
+    }
+    return trades;
+  }
+
+  // ── (a) Robustness DISABLED → multiplier invisible, composite unchanged ──
+  const rOff = computeFitness({
+    metrics: { ...base, tradeList: buildDiffuseTrades() },
+    fitnessConfig: DEFAULT_FITNESS,
+  });
+  assertTrue('robustness off → no breakdown.robustness',
+    rOff.breakdown.robustness === undefined);
+
+  // ── (b) Robustness ENABLED but no trade list → all terms neutral (1) ──
+  const configOn = {
+    ...DEFAULT_FITNESS,
+    robustness: { ...DEFAULT_FITNESS.robustness, enabled: true },
+  };
+  const rNoTrades = computeFitness({ metrics: base, fitnessConfig: configOn });
+  assertTrue('robustness on w/o trades → breakdown.robustness present',
+    rNoTrades.breakdown.robustness != null);
+  assertClose('no trades → multiplier = 1 (all terms neutral)',
+    rNoTrades.breakdown.robustness.multiplier, 1, 1e-9);
+
+  // ── (c) Robustness ENABLED with diffuse-edge trades ──
+  const rDiffuse = computeFitness({
+    metrics: { ...base, tradeList: buildDiffuseTrades() },
+    fitnessConfig: configOn,
+  });
+  const br = rDiffuse.breakdown.robustness;
+  assertTrue('diffuse edge: multiplier in [0, 1]',
+    br.multiplier >= 0 && br.multiplier <= 1);
+  assertTrue('diffuse edge: mcDd term present',
+    typeof br.mcDd?.term === 'number' && br.mcDd.term >= 0 && br.mcDd.term <= 1);
+  assertTrue('diffuse edge: bootstrap term present',
+    typeof br.bootstrap?.term === 'number' && br.bootstrap.term >= 0 && br.bootstrap.term <= 1);
+  assertTrue('diffuse edge: randomOos term present (defaulted neutral w/o wfReport)',
+    br.randomOos?.term === 1);
+  assertTrue('diffuse edge: paramCoV degenerate w/o wfReport.windows',
+    br.paramCoV?.degenerate === true && br.paramCoV.term === 1);
+  assertTrue('diffuse edge: adversarial term present',
+    typeof br.adversarial?.term === 'number' && br.adversarial.term >= 0 && br.adversarial.term <= 1);
+
+  // ── (d) Single-whale-trade → adversarial + bootstrap penalize hard ──
+  const whaleTrades = buildDiffuseTrades(20).map((t, i) => ({
+    ...t,
+    pnlPct: i === 0 ? 0.5 : -0.005,  // one huge winner, rest small losers
+  }));
+  const rWhale = computeFitness({
+    metrics: { ...base, tradeList: whaleTrades },
+    fitnessConfig: configOn,
+  });
+  assertTrue('whale-edge: multiplier < diffuse multiplier',
+    rWhale.breakdown.robustness.multiplier < br.multiplier,
+    `whale=${rWhale.breakdown.robustness.multiplier.toFixed(4)} diffuse=${br.multiplier.toFixed(4)}`);
+
+  // ── (e) Multiplier ACTUALLY multiplies composite ──
+  const compDiffuse = rDiffuse.score;
+  const compWhale   = rWhale.score;
+  assertTrue('whale-edge score ≤ diffuse-edge score (same base metrics)',
+    compWhale <= compDiffuse,
+    `whale=${compWhale.toFixed(6)} diffuse=${compDiffuse.toFixed(6)}`);
+
+  // ── (f) paramCoV term fires when wfReport.windows is present ──
+  const wfStable = {
+    wfe: 1.0,
+    windows: [
+      { gene: { emaFast: 20, emaSlow: 50, rsiLen: 14 } },
+      { gene: { emaFast: 21, emaSlow: 51, rsiLen: 14 } },
+      { gene: { emaFast: 19, emaSlow: 49, rsiLen: 14 } },
+    ],
+  };
+  const wfDrifty = {
+    wfe: 1.0,
+    windows: [
+      { gene: { emaFast: 12, emaSlow: 50, rsiLen: 14 } },
+      { gene: { emaFast: 47, emaSlow: 50, rsiLen: 14 } },
+      { gene: { emaFast: 23, emaSlow: 50, rsiLen: 14 } },
+    ],
+  };
+  const rStable  = computeFitness({
+    metrics: { ...base, tradeList: buildDiffuseTrades() },
+    fitnessConfig: configOn,
+    wfReport: wfStable,
+  });
+  const rDrifty  = computeFitness({
+    metrics: { ...base, tradeList: buildDiffuseTrades() },
+    fitnessConfig: configOn,
+    wfReport: wfDrifty,
+  });
+  assertTrue('paramCoV: stable windows → term higher than drifty',
+    rStable.breakdown.robustness.paramCoV.term > rDrifty.breakdown.robustness.paramCoV.term,
+    `stable=${rStable.breakdown.robustness.paramCoV.term.toFixed(4)} drifty=${rDrifty.breakdown.robustness.paramCoV.term.toFixed(4)}`);
+
+  // ── (g) Determinism: same inputs twice → identical breakdown ──
+  const r1 = computeFitness({
+    metrics: { ...base, tradeList: buildDiffuseTrades() },
+    fitnessConfig: configOn,
+  });
+  const r2 = computeFitness({
+    metrics: { ...base, tradeList: buildDiffuseTrades() },
+    fitnessConfig: configOn,
+  });
+  assertClose('determinism: r1.multiplier == r2.multiplier',
+    r1.breakdown.robustness.multiplier, r2.breakdown.robustness.multiplier, 1e-9);
+}
+
 // ─── Summary ────────────────────────────────────────────────
 console.log('\n' + '─'.repeat(60));
 console.log(`RESULT: ${passCount} passed, ${failCount} failed`);

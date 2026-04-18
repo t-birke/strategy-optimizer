@@ -147,7 +147,17 @@ const specBundle = specMode
 
 // GA train/test split: fitnessStartBar is passed via opts to runSpec.
 // When > 0, fitness metrics accumulate only for trades exiting after this bar.
-const specRunOpts = fitnessStartBar > 0 ? { fitnessStartBar } : {};
+//
+// Phase 6.1 — Robustness multiplier. When spec.fitness.robustness.enabled,
+// the runtime emits the trade list so computeFitness can feed the 5
+// robustness terms (MC-DD, bootstrap, random OOS, paramCoV, adversarial).
+// collectTrades has a small per-eval allocation cost; keeping it off by
+// default preserves the pre-6.1 hot path.
+const robustnessOn = specMode && spec?.fitness?.robustness?.enabled === true;
+const specRunOpts = {
+  ...(fitnessStartBar > 0 ? { fitnessStartBar } : {}),
+  ...(robustnessOn ? { collectTrades: true } : {}),
+};
 
 /**
  * Build an isolated island runtime: its own GaIsland, fitness cache,
@@ -209,7 +219,20 @@ function createIsland(cfg) {
     if (fitnessCache.has(key)) return fitnessCache.get(key).fitness;
     state.evalCount++;
     const { fitness: score, metrics } = evaluateGene(gene, evalDeps);
-    fitnessCache.set(key, { fitness: score, metrics });
+    // Drop `tradeList` from the cached metrics: robustness (Phase 6.1)
+    // has already consumed it and the derived `_fitness.breakdown.
+    // robustness` stats on `metrics` carry the useful summary forward.
+    // Keeping the raw trade list would balloon the cache by ~10–50 KB
+    // per gene × 50K entries = 0.5–2.5 GB on disk. The trade list is
+    // re-emitted by the runtime on demand whenever someone actually
+    // wants trade-level detail (walk-forward, UI drill-in, parity
+    // check), so nothing downstream loses information.
+    let cacheMetrics = metrics;
+    if (cacheMetrics && Array.isArray(cacheMetrics.tradeList)) {
+      const { tradeList, ...rest } = cacheMetrics;
+      cacheMetrics = rest;
+    }
+    fitnessCache.set(key, { fitness: score, metrics: cacheMetrics });
     return score;
   }
 

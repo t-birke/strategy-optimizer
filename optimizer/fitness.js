@@ -63,7 +63,178 @@
  * the `worstRegimePfFloor` gate. Chosen conservatively — 5 trades is
  * still noisy, but a 2- or 3-trade regime PF is pure randomness.
  */
+import { mcDdReshuffle }    from './robustness/mcDdReshuffle.js';
+import { bootstrapP10 }     from './robustness/bootstrapP10.js';
+import { randomizedOos }    from './robustness/randomizedOos.js';
+import { paramStabilityCoV } from './robustness/paramStabilityCoV.js';
+import { adversarialSplit } from './robustness/adversarialSplit.js';
+
 export const MIN_REGIME_SAMPLE = 5;
+
+/**
+ * Robustness composition defaults. Each term's "cap" controls how its
+ * raw statistic maps to a [0, 1] per-term score; the geomean of the
+ * five per-term scores is the final multiplier. Tunable via
+ * `spec.fitness.robustness.caps.*`.
+ *
+ *   caps.robustDdPct      — p95 shuffled drawdown ≥ this → 0 credit on that term
+ *   caps.maxParamCoV      — mean WF-window param CoV ≥ this → 0 credit
+ *   caps.outBandMultiplier — penalty applied when the actual WF-OOS metric
+ *                            sits outside randomOos's central P25-P75 band
+ */
+const ROBUSTNESS_CAPS_DEFAULT = Object.freeze({
+  robustDdPct:      0.5,
+  maxParamCoV:      1.0,
+  outBandMultiplier: 0.7,
+});
+
+/** N-samples defaults per robustness term. Override via `spec.fitness.robustness`. */
+const ROBUSTNESS_N_DEFAULT = Object.freeze({
+  mcDdNSamples:     1000,
+  bootstrapNSamples: 1000,
+  randomOosNSamples: 1000,
+});
+
+/** Fixed seed for robustness RNGs. Kept stable within a run so cached
+ *  fitness is deterministic; between different runs/genes, each gene's
+ *  own trade list acts as the "randomness" — same seed produces
+ *  different results because inputs differ. Revisit if the GA learns
+ *  to exploit specific seed/split combinations. */
+const ROBUSTNESS_SEED = 42;
+
+/**
+ * Compute the robustness multiplier. Returns a `{ multiplier, terms }`
+ * record where `multiplier` is the geomean of the 5 per-term scores
+ * (each in [0, 1]) and `terms` is the per-term breakdown for UI/debug.
+ *
+ * Returns `{ multiplier: 1, terms: null }` when `robustness.enabled` is
+ * falsy (i.e. §6.1 opted-out → no behavior change vs pre-Phase-6).
+ *
+ * Degrades gracefully on missing inputs: a term whose data isn't
+ * available (e.g. no trade list, no WF report for paramCoV) contributes
+ * `1` (neutral) rather than eliminating the gene. An actively failing
+ * term contributes a sub-1 factor; the GEOMEAN penalizes any single
+ * bad dimension harder than an arithmetic mean would — "weakest link"
+ * semantics for the [0, 1] multiplier space.
+ */
+function computeRobustnessMultiplier({ metrics, wfReport, config }) {
+  if (!config || config.enabled !== true) {
+    return { multiplier: 1, terms: null };
+  }
+  const caps = { ...ROBUSTNESS_CAPS_DEFAULT, ...(config.caps ?? {}) };
+  const ns   = { ...ROBUSTNESS_N_DEFAULT,    ...(config.nSamples ?? {}) };
+  const seed = numberOr(config.seed, ROBUSTNESS_SEED);
+
+  const trades = Array.isArray(metrics?.tradeList) ? metrics.tradeList : null;
+  const hasTrades = trades && trades.length > 0;
+
+  // ── Term 1: MC drawdown reshuffle (p95) ──
+  // Penalizes strategies whose single-realization maxDD badly understates
+  // the drawdown they'll see on a different trade ordering. Higher p95 →
+  // lower term. At p95 = robustDdPct (default 50%) → 0; at p95 = 0 → 1.
+  let mcDd;
+  if (hasTrades) {
+    const r = mcDdReshuffle(trades, { nSamples: ns.mcDdNSamples, seed });
+    const term = clamp(1 - r.p95DdPct / caps.robustDdPct, 0, 1);
+    mcDd = { p50DdPct: r.p50DdPct, p95DdPct: r.p95DdPct, p99DdPct: r.p99DdPct, term };
+  } else {
+    mcDd = { term: 1 };
+  }
+
+  // ── Term 2: Bootstrap P10 net return ──
+  // Ratio of the 10th-percentile bootstrapped net return to the median.
+  // When both positive: term = p10 / p50 ∈ [0, 1], high when edge is
+  // evenly distributed. When both negative: term = 0 (edge depends on
+  // a few lucky trades). When median ≤ 0 and p10 > 0: degenerate edge
+  // case, fall back to 1.
+  let bootstrap;
+  if (hasTrades) {
+    const r = bootstrapP10(trades, { nSamples: ns.bootstrapNSamples, seed });
+    let term;
+    if (r.p50NetPct > 0) term = clamp(r.p10NetPct / r.p50NetPct, 0, 1);
+    else if (r.p50NetPct <= 0 && r.p10NetPct <= 0) term = 0;
+    else term = 1;
+    bootstrap = { p10NetPct: r.p10NetPct, p50NetPct: r.p50NetPct, p90NetPct: r.p90NetPct, term };
+  } else {
+    bootstrap = { term: 1 };
+  }
+
+  // ── Term 3: Randomized OOS percentile ──
+  // Locates the actual WF-OOS net return in the distribution of possible
+  // random 30% slices of the dataset. In-band (P25-P75) = no penalty;
+  // suspiciously lucky OR unlucky = `outBandMultiplier` penalty (default
+  // 0.7). Needs wfReport.meanOosNetPct (or meanOosNet → normalized) to
+  // have something to locate.
+  let randomOos;
+  if (hasTrades && wfReport && typeof wfReport.meanOosNetPct === 'number') {
+    const startTs = trades[0].entryTs;
+    const endTs   = trades[trades.length - 1].exitTs;
+    const r = randomizedOos(trades, wfReport.meanOosNetPct, {
+      fitnessMetric: 'netPct',
+      sliceFraction: 0.3,
+      startTs, endTs,
+      nSamples: ns.randomOosNSamples, seed,
+    });
+    randomOos = {
+      percentile:    r.percentile,
+      inCentralBand: r.inCentralBand,
+      term:          r.inCentralBand ? 1 : caps.outBandMultiplier,
+    };
+  } else {
+    randomOos = { term: 1 };
+  }
+
+  // ── Term 4: Walk-forward parameter stability CoV ──
+  // A gene whose per-window winning params drift wildly is curve-fit even
+  // if its WFE passes. Term = clamp(1 - meanCoV / maxParamCoV, 0, 1).
+  // Degenerate (< 2 usable windows) → 1.
+  let paramCoV;
+  if (wfReport && Array.isArray(wfReport.windows) && wfReport.windows.length >= 2) {
+    const r = paramStabilityCoV(wfReport);
+    const term = r.degenerate ? 1 : clamp(1 - r.meanCoV / caps.maxParamCoV, 0, 1);
+    paramCoV = {
+      meanCoV:     r.meanCoV,
+      worstParam:  r.worstParam,
+      worstCoV:    r.worstCoV,
+      windowsUsed: r.windowsUsed,
+      degenerate:  r.degenerate,
+      term,
+    };
+  } else {
+    paramCoV = { term: 1, degenerate: true };
+  }
+
+  // ── Term 5: Adversarial 50/50 trade split ──
+  // Random-per-eval A/B split of the trade list; large fitness gap
+  // between halves → edge concentrated in a few trades. term = 1 − gap
+  // (already clipped to [0, 1] by the module).
+  let adversarial;
+  if (hasTrades) {
+    const r = adversarialSplit(trades, { seed });
+    adversarial = { concentration: r.concentration, gap: r.gap, term: 1 - r.concentration };
+  } else {
+    adversarial = { term: 1 };
+  }
+
+  // Geomean of 5 terms, each in [0, 1]. A single-zero term zeros the
+  // multiplier outright — that's the intended "weakest link" behavior.
+  // Callers disable the whole layer via `robustness.enabled=false`; if
+  // it's on, they've opted into strict gating.
+  const product =
+    mcDd.term *
+    bootstrap.term *
+    randomOos.term *
+    paramCoV.term *
+    adversarial.term;
+  const multiplier = Math.pow(product, 1 / 5);
+
+  return {
+    multiplier,
+    terms: { mcDd, bootstrap, randomOos, paramCoV, adversarial },
+  };
+}
+
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 
 /**
  * Score assigned to genes eliminated by a hard gate. Must be strictly
@@ -208,7 +379,21 @@ export function computeFitness({ metrics, fitnessConfig, wfReport = null }) {
   const freqFactor = freqTarget > 0
     ? Math.min(1, positions / freqTarget)
     : 1;
-  const composite = rawComposite * freqFactor;
+
+  // ─── Robustness multiplier (Phase 6.1) ────────────────────
+  // Five post-hoc terms on the trade list + WF report: MC-DD-P95,
+  // bootstrap P10, randomized-OOS percentile, WF param-CoV, adversarial
+  // A/B trade split. Geomean → [0, 1] multiplier. Opt-in via
+  // `spec.fitness.robustness.enabled = true`; off by default so the
+  // pre-6.1 fitness surface is unchanged for existing specs.
+  //
+  // Requires `metrics.tradeList` (runner sets `opts.collectTrades = true`
+  // when robustness is enabled). Missing/incomplete inputs degrade to
+  // `term = 1` (neutral) rather than eliminating the gene.
+  const robustness = computeRobustnessMultiplier({
+    metrics, wfReport, config: fitnessConfig.robustness,
+  });
+  const composite = rawComposite * freqFactor * robustness.multiplier;
 
   const breakdown = {
     normPf,
@@ -218,6 +403,7 @@ export function computeFitness({ metrics, fitnessConfig, wfReport = null }) {
     ...(freqTarget > 0 ? { freqFactor, freqTarget, positions } : {}),
     ...(worstRegimePf !== null ? { worstRegimePf, regimeSource } : {}),
     ...(wfe           !== null ? { wfe }           : {}),
+    ...(robustness.terms ? { robustness: { multiplier: robustness.multiplier, ...robustness.terms } } : {}),
   };
 
   if (gatesFailed.length > 0) {

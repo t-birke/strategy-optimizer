@@ -98,6 +98,23 @@ export const DEFAULT_FITNESS = Object.freeze({
   // composite score is multiplied by freq, so a strategy with 50 positions
   // and target 100 gets half credit. Set 0 to disable.
   frequencyTarget: 100,
+  // Phase 6.1 — Robustness multiplier. When `enabled: true`, the runner
+  // turns on `collectTrades` for every fitness eval and `computeFitness`
+  // multiplies the composite by a geomean of five post-hoc robustness
+  // terms (MC-DD-P95, bootstrap P10, randomized-OOS percentile, WF
+  // parameter CoV, adversarial 50/50 trade split). Off by default so
+  // pre-6.1 specs see zero behavior change.
+  robustness: {
+    enabled: false,
+    // Per-term caps used inside computeFitness. See optimizer/fitness.js
+    // ROBUSTNESS_CAPS_DEFAULT for what each knob controls.
+    caps:     { robustDdPct: 0.5, maxParamCoV: 1.0, outBandMultiplier: 0.7 },
+    // Monte Carlo sample counts. More samples = tighter percentile
+    // estimates but each bumps per-eval cost. 1000 is a reasonable
+    // default; reduce for optimization speed if the 5-term compute ever
+    // shows up hot in profiles.
+    nSamples: { mcDdNSamples: 1000, bootstrapNSamples: 1000, randomOosNSamples: 1000 },
+  },
 });
 
 export const DEFAULT_WALK_FORWARD = Object.freeze({
@@ -591,6 +608,11 @@ function normalizeSpec(spec) {
     gates:            { ...DEFAULT_FITNESS.gates,   ...(clone.fitness?.gates) },
     gaOosRatio:       clone.fitness?.gaOosRatio       ?? DEFAULT_FITNESS.gaOosRatio,
     frequencyTarget:  clone.fitness?.frequencyTarget  ?? DEFAULT_FITNESS.frequencyTarget,
+    robustness: {
+      enabled:  clone.fitness?.robustness?.enabled ?? DEFAULT_FITNESS.robustness.enabled,
+      caps:     { ...DEFAULT_FITNESS.robustness.caps,     ...(clone.fitness?.robustness?.caps) },
+      nSamples: { ...DEFAULT_FITNESS.robustness.nSamples, ...(clone.fitness?.robustness?.nSamples) },
+    },
   };
   clone.walkForward = { ...DEFAULT_WALK_FORWARD, ...(clone.walkForward ?? {}) };
 
