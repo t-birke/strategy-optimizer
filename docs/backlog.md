@@ -1648,23 +1648,67 @@ name rather than by magic number.
   behavior at the call site, and the end-to-end `runner-htf-check`
   exercises the same `createIsland` wiring with the new delegation.
 
-#### 6.0.2 Extend `fitness-cache.js` key schema for noise variants
+#### 6.0.2 Extend `fitness-cache.js` key schema for noise variants ✅ DONE
 
-Cache today keys on `geneKey` → fitness. NTO evaluates the same gene
-against {original + K variants}, producing K+1 different fitnesses per
-gene. Without schema change, the cache either (a) returns a base-fitness
-result when we need median-over-variants, or (b) busts on every run.
+Nested-by-variant shape:
+```
+entries[geneKey] = { variants: { [variantId]: { fitness, metrics } } }
+```
 
-**Work:** extend key to `(geneKey, variantId)` → partial result. Add a
-composition helper that returns a cached composite fitness only when all
-K+1 partials are present. Keep `variantId="base"` for non-NTO runs
-(backwards-compat).
+Non-NTO runs write everything under `variantId="base"` and the on-disk
+file is behaviorally identical to the earlier flat-by-gene shape. NTO
+(§6.2) will write additional variants alongside, and `getComposite()`
+returns a median-aggregated `{fitness, metrics}` only when all expected
+variants are present — partial progress stays cached across restarts.
 
-**Effort:** ~3 hours.
+**New helpers** (all in `optimizer/fitness-cache.js`):
+- `getVariant(entries, geneKey, variantId='base')` — single-variant read.
+- `setVariant(entries, geneKey, variantId, payload)` — mutating write.
+- `hasAllVariants(entries, geneKey, expectedIds)` — completeness check.
+- `getComposite(entries, geneKey, expectedIds, aggregate=median)` —
+  returns `{fitness, metrics}` when complete, null when any variant
+  missing. Median aggregator ties-break to the lowest-indexed variant
+  (the real/base bundle when it's the median).
+- `medianAggregate(variantResults)` — the default aggregator.
+- `flattenToBase(nested)` / `wrapFlat(flat)` — runner↔worker translation
+  helpers. Worker wire protocol stays flat for §6.0.2; NTO will extend
+  the worker side in §6.2.
 
-**Acceptance:** `fitness-cache-check.js` extended with two tests —
-(a) partial-cache miss returns nothing until all K+1 present, (b) non-NTO
-runs use only `variantId="base"` entries.
+**Backwards-compat**: `loadCache` auto-migrates flat on-disk files to
+nested on read. `saveCache` auto-migrates flat inputs too. `mergeCaches`
+deep-merges variants so two snapshots contributing different variants
+for the same gene don't overwrite each other (naive key-level merge
+would wipe out sibling variants).
+
+**Runner wiring** (`optimizer/runner.js`):
+- `cachePreloadNested` — from `loadCache`, used on save.
+- `cachePreloadFlat = flattenToBase(cachePreloadNested)` — shipped to
+  each worker as `fitnessCachePreload` (worker shape unchanged).
+- On save: worker deltas arrive flat → `wrapFlat(delta)` → `mergeCaches`.
+
+**Tests (`scripts/fitness-cache-check.js`)**: grown from 41 to 70
+assertions. New sections:
+- [7b] `getVariant` / `setVariant` / `hasAllVariants` behavior
+- [7c] `getComposite` returns null until complete, median aggregator
+- [7d] `flattenToBase` / `wrapFlat` round-trip
+- [7e] `mergeCaches` deep-merges variants (no sibling wipe)
+- [7f] Legacy flat on-disk file auto-migrated on load
+
+End-to-end [8] test made flake-free: pre-existing assertion `r2.preload
+> 0` was flaky when the tiny 8-gene GA produced all-eliminated run1.
+Replaced with the invariant that actually matters — `r2.preload ===
+r1.saved` — which holds for any GA outcome.
+
+**Gates green** (all 8):
+  fitness-check            : 109/109
+  pine-wundertrading-check : 192/192
+  walk-forward-check       :  35/35
+  runner-spec-mode-check   :  21/21
+  fitness-cache-check      :  70/70 (new: +29 assertions)
+  runner-htf-check         :  49/49
+  block-library-check      : 633/633
+  evaluate-gene-check      :  15/15
+  **Total: 1124/1124**
 
 #### 6.0.3 Decisions (no code)
 

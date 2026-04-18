@@ -36,6 +36,8 @@ import {
   loadCache,
   saveCache,
   mergeCaches,
+  flattenToBase,
+  wrapFlat,
 } from './fitness-cache.js';
 import { walkForward } from './walk-forward.js';
 import { runSpec } from '../engine/runtime.js';
@@ -225,7 +227,15 @@ export async function runOptimization(config) {
   // merged result. `bars` and `lastTs` go into the dataset id so adding
   // candles to the DB invalidates the cache automatically.
   let datasetId = null;
-  let cachePreload = null;
+  // The cache on disk is nested-by-variant (§6.0.2). Workers still use
+  // the legacy flat shape — one `{fitness, metrics}` per gene — so we
+  // keep BOTH here:
+  //   - `cachePreloadNested`: what we loaded, plus deltas; used on save.
+  //   - `cachePreloadFlat`: base-variant-only view shipped to workers.
+  // When NTO lands in §6.2, the worker wire protocol will extend to
+  // per-variant entries and this flat view goes away.
+  let cachePreloadNested = null;
+  let cachePreloadFlat = null;
   let cachePath = null;
   if (specMode) {
     datasetId = computeDatasetId({
@@ -233,7 +243,8 @@ export async function runOptimization(config) {
       bars: len, lastTs: Number(candles.ts[len - 1]),
     });
     const loaded = await loadCache({ specHash: spec.hash, datasetId });
-    cachePreload = loaded.entries;
+    cachePreloadNested = loaded.entries;
+    cachePreloadFlat   = flattenToBase(loaded.entries);
     cachePath = loaded.path;
     console.log(`[runner] Fitness cache: ${loaded.count} entries preloaded from ${cachePath}`);
   }
@@ -462,7 +473,7 @@ export async function runOptimization(config) {
         // cache from this on startup. Each worker gets the SAME preload —
         // they may evaluate disjoint genes during the run, but on cache-hit
         // the answer is identical regardless of which worker serves it.
-        fitnessCachePreload: specMode ? cachePreload : null,
+        fitnessCachePreload: specMode ? cachePreloadFlat : null,
       },
     });
 
@@ -928,9 +939,13 @@ export async function runOptimization(config) {
   if (specMode) {
     // Workers send only NEW entries (delta) — not the full cache — to
     // avoid OOM when many islands each re-serialize the entire preload.
-    // We merge preload + all worker deltas here on the main thread.
+    // Deltas arrive in the legacy flat shape (`{geneKey: {fitness,
+    // metrics}}`); we wrap each one into the nested variants shape
+    // under BASE_VARIANT before merging with the already-nested preload.
+    // `mergeCaches` tolerates either shape but uniform input is cleaner.
     const deltas = await Promise.all(cacheDeltaPromises);
-    const merged = mergeCaches([cachePreload || {}, ...deltas]);
+    const wrappedDeltas = deltas.map(wrapFlat);
+    const merged = mergeCaches([cachePreloadNested || {}, ...wrappedDeltas]);
     try {
       cacheSaveInfo = await saveCache({
         specHash: spec.hash,
@@ -1109,7 +1124,7 @@ export async function runOptimization(config) {
     //   { datasetId, preloadCount, savedCount, droppedCount, path }
     fitnessCache: specMode ? {
       datasetId,
-      preloadCount: cachePreload ? Object.keys(cachePreload).length : 0,
+      preloadCount: cachePreloadNested ? Object.keys(cachePreloadNested).length : 0,
       savedCount:   cacheSaveInfo?.count   ?? 0,
       droppedCount: cacheSaveInfo?.dropped ?? 0,
       path:         cacheSaveInfo?.path ?? cachePath,
