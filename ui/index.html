@@ -11,7 +11,9 @@
     <h1>Strategy Optimizer</h1>
     <a href="#data" class="nav-link active" data-page="data">Data</a>
     <a href="#optimizer" class="nav-link" data-page="optimizer">Optimizer</a>
+    <a href="#specs" class="nav-link" data-page="specs">Specs</a>
     <a href="#run-detail" class="nav-link" data-page="run-detail" id="nav-run-detail" style="display:none">Run Detail</a>
+    <a href="#compare" class="nav-link" data-page="compare" id="nav-compare" style="display:none">Compare Runs</a>
     <span id="tv-badge" class="badge" style="display:none;margin-left:auto;font-size:11px"></span>
   </nav>
 
@@ -57,8 +59,26 @@
 
   <!-- ═══════════ OPTIMIZER PAGE ═══════════ -->
   <div id="page-optimizer" class="page">
-    <div style="display:flex;gap:16px;margin-bottom:16px">
+    <div style="display:flex;gap:16px;margin-bottom:16px;align-items:center">
       <button id="btn-new-run" class="primary">New Run</button>
+      <!-- Phase 4.5b: compare-runs toolbar. `btn-compare-toggle` flips the
+           runs table into select mode (reveals a checkbox column); once
+           2+ rows are checked, `btn-compare-go` navigates to
+           #compare?ids=a,b (bookmarkable URL form). Legacy/non-spec-mode
+           runs can still be selected — the compare page itself surfaces
+           "no WF data" rather than hiding them, which is honest and
+           keeps the table simple. -->
+      <button id="btn-compare-toggle" style="font-size:13px;padding:6px 14px"
+              title="Pick 2+ runs via checkboxes, then click Compare to view their walk-forward reports side-by-side.">
+        Select to compare
+      </button>
+      <button id="btn-compare-go" class="primary"
+              style="font-size:13px;padding:6px 14px;display:none;background:#6e40c9;border-color:#6e40c9">
+        Compare (<span id="compare-count">0</span>)
+      </button>
+      <span id="compare-hint" style="font-size:12px;color:#8b949e;display:none">
+        Check 2 or more rows to enable Compare
+      </span>
     </div>
 
     <!-- Live progress panel -->
@@ -103,6 +123,14 @@
       <table id="runs-table">
         <thead>
           <tr>
+            <!-- Phase 4.5b: compare-select column. Hidden until the user
+                 clicks "Select to compare" (app.js toggles the `.compare-mode`
+                 class on the table). Keeps the default table width unchanged
+                 so non-compare users don't see empty whitespace. -->
+            <th class="compare-col" style="display:none;width:28px">
+              <input type="checkbox" id="compare-select-all"
+                     title="Select/deselect all visible runs" />
+            </th>
             <th>ID</th>
             <th>Symbol</th>
             <th>TF</th>
@@ -127,6 +155,261 @@
     </div>
   </div>
 
+  <!-- ═══════════ SPECS PAGE (Phase 4.3c) ═══════════ -->
+  <!--
+    Spec authoring. The user composes a strategy spec by picking blocks
+    per slot; the live JSON preview on the right-hand side shows exactly
+    what would be written to strategies/<name>.json once POST /api/specs
+    lands in 4.3e. For now the user Copy-JSONs the preview and saves the
+    file by hand.
+
+    Each picker is filtered at runtime (app.js) by the block's `kind`
+    (entry / filter / exit / sizing / regime) and — for the three exit
+    slots — by `exitSlot`. Block lists come from GET /api/blocks.
+
+    Param narrowing (per-param min/max/step/pin) is Phase 4.3d. Until
+    then, the generated JSON emits each block's registry-declared range
+    as-is, which is a valid starting point the user can tighten later.
+  -->
+  <div id="page-specs" class="page">
+    <div style="display:grid;grid-template-columns:minmax(0, 1fr) minmax(320px, 460px);gap:16px">
+      <!-- Left column: editor form -->
+      <div>
+        <div class="card">
+          <h2 id="spec-editor-heading">New Strategy Spec</h2>
+          <div class="form-row" style="margin-bottom:12px;align-items:center">
+            <label style="width:auto;white-space:nowrap">Load existing</label>
+            <select id="spec-load-picker" style="flex:1;min-width:200px">
+              <option value="">— new spec —</option>
+            </select>
+            <button type="button" id="spec-load-btn" style="padding:4px 12px;font-size:13px">Load</button>
+          </div>
+          <div class="form-row">
+            <label>Name</label>
+            <input type="text" id="spec-name" placeholder="e.g. btc-ema-trend-v1" style="flex:1;min-width:200px">
+          </div>
+          <div class="form-row" style="flex-direction:column;align-items:stretch">
+            <label style="margin-bottom:4px">Description</label>
+            <textarea id="spec-desc" rows="3" placeholder="What does this strategy do? Any caveats?"
+              style="padding:6px 12px;border-radius:6px;border:1px solid #30363d;background:#0d1117;color:#e6edf3;font-size:13px;font-family:inherit;resize:vertical"></textarea>
+          </div>
+        </div>
+
+        <!-- Regime slot: optional; 0 or 1 block. Registry currently has
+             no regime blocks — the dropdown shows only "None" until someone
+             registers one. -->
+        <div class="card">
+          <h2>Regime</h2>
+          <div class="form-row">
+            <label>Regime block</label>
+            <select id="spec-regime" style="flex:1;min-width:200px">
+              <option value="">None</option>
+            </select>
+          </div>
+          <div id="spec-regime-desc" class="block-desc" style="font-size:12px;color:#8b949e;margin-left:92px;min-height:14px;line-height:1.5"></div>
+          <div id="spec-regime-params" class="spec-params" style="margin:6px 0 0 92px"></div>
+          <div id="spec-regime-empty" style="font-size:12px;color:#6e7681;margin-left:92px;display:none">
+            No regime blocks registered yet.
+          </div>
+        </div>
+
+        <!-- Entries: multi-block list with mode + threshold. Threshold row
+             is hidden in app.js when mode ≠ 'score'. -->
+        <div class="card">
+          <h2>Entries</h2>
+          <div class="form-row">
+            <label>Mode</label>
+            <select id="spec-entries-mode" style="width:200px">
+              <option value="all">all — every block must fire</option>
+              <option value="any">any — ≥1 block fires</option>
+              <option value="score" selected>score — count, use threshold</option>
+            </select>
+          </div>
+          <div class="form-row" id="spec-entries-threshold-row">
+            <label>Threshold</label>
+            <input type="number" id="spec-entries-threshold-min" value="1" min="1" style="width:60px">
+            <span style="font-size:12px;color:#8b949e">min</span>
+            <input type="number" id="spec-entries-threshold-max" value="3" min="1" style="width:60px">
+            <span style="font-size:12px;color:#8b949e">max (GA-optimized; set min=max to pin)</span>
+          </div>
+          <div id="spec-entries-list" style="margin:8px 0"></div>
+          <button type="button" id="spec-entries-add">+ Add entry block</button>
+        </div>
+
+        <!-- Filters: multi-block with mode. -->
+        <div class="card">
+          <h2>Filters</h2>
+          <div class="form-row">
+            <label>Mode</label>
+            <select id="spec-filters-mode" style="width:200px">
+              <option value="all" selected>all — every filter must pass</option>
+              <option value="any">any — ≥1 filter passes</option>
+            </select>
+          </div>
+          <div id="spec-filters-list" style="margin:8px 0"></div>
+          <button type="button" id="spec-filters-add">+ Add filter block</button>
+          <div id="spec-filters-empty" style="font-size:12px;color:#6e7681;margin-top:6px;display:none">
+            No filter blocks registered yet.
+          </div>
+        </div>
+
+        <!-- Exits: three fixed slots. Each filters to blocks whose
+             exitSlot matches (hardStop / target / trail). -->
+        <div class="card">
+          <h2>Exits</h2>
+          <div class="form-row">
+            <label>Hard Stop</label>
+            <select id="spec-exit-hardstop" style="flex:1;min-width:200px"><option value="">None</option></select>
+          </div>
+          <div id="spec-exit-hardstop-desc" class="block-desc" style="font-size:12px;color:#8b949e;margin-left:92px;min-height:14px;line-height:1.5"></div>
+          <div id="spec-exit-hardstop-params" class="spec-params" style="margin:6px 0 10px 92px"></div>
+          <div class="form-row">
+            <label>Target</label>
+            <select id="spec-exit-target" style="flex:1;min-width:200px"><option value="">None</option></select>
+          </div>
+          <div id="spec-exit-target-desc" class="block-desc" style="font-size:12px;color:#8b949e;margin-left:92px;min-height:14px;line-height:1.5"></div>
+          <div id="spec-exit-target-params" class="spec-params" style="margin:6px 0 10px 92px"></div>
+          <div class="form-row">
+            <label>Trail</label>
+            <select id="spec-exit-trail" style="flex:1;min-width:200px"><option value="">None</option></select>
+          </div>
+          <div id="spec-exit-trail-desc" class="block-desc" style="font-size:12px;color:#8b949e;margin-left:92px;min-height:14px;line-height:1.5"></div>
+          <div id="spec-exit-trail-params" class="spec-params" style="margin:6px 0 0 92px"></div>
+        </div>
+
+        <!-- Sizing: required. Show declared sizingRequirements as a hint
+             so the user knows if the sizing block needs a stop distance
+             (→ hardStop slot must be filled) or trade stats. -->
+        <div class="card">
+          <h2>Sizing</h2>
+          <div class="form-row">
+            <label>Sizing block</label>
+            <select id="spec-sizing" style="flex:1;min-width:200px"></select>
+          </div>
+          <div id="spec-sizing-desc" class="block-desc" style="font-size:12px;color:#8b949e;margin-left:92px;min-height:14px;line-height:1.5"></div>
+          <div id="spec-sizing-req" style="font-size:12px;color:#8b949e;margin-left:92px;min-height:14px;margin-top:4px"></div>
+          <div id="spec-sizing-params" class="spec-params" style="margin:6px 0 0 92px"></div>
+        </div>
+
+        <!-- Fitness: scoring config (Phase 4.4). Weights are sliders
+             that should sum ~1.0; caps clip per-window PF/return; gates
+             veto a genome entirely if violated. All initial values come
+             from GET /api/defaults so the "recommended" chip always
+             matches what engine/spec.js would fill in if omitted. -->
+        <div class="card" id="spec-fitness-card">
+          <h2 style="display:flex;align-items:center;justify-content:space-between">
+            Fitness
+            <button type="button" id="spec-fitness-reset" style="font-size:12px;font-weight:400;padding:4px 10px">
+              Reset to recommended
+            </button>
+          </h2>
+          <p style="font-size:12px;color:#8b949e;margin:0 0 10px 0;line-height:1.5">
+            Weights score a genome; caps clip outlier metrics; gates are
+            hard vetoes. Values shown in grey are the recommended defaults
+            from <code style="background:#0d1117;padding:1px 5px;border-radius:3px">engine/spec.js</code>.
+          </p>
+
+          <!-- Weights: three sliders 0..1 in 0.05 steps. Live sum
+               indicator turns amber if the sum drifts far from 1.0.
+               Every label carries a `title` tooltip explaining the
+               metric so the user doesn't have to read the source. -->
+          <h3 style="font-size:13px;color:#c9d1d9;margin:14px 0 6px 0"
+              title="Relative importance of each metric in the composite fitness score. Weights are renormalized to sum 1.0 at scoring time, but keeping the visible sum near 1.0 makes the ratios obvious.">Weights</h3>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px"
+                   title="PF = gross winning profit / gross losing profit. Weight for the normalized PF term: min(PF, PF cap) / PF cap. Higher weight rewards strategies that win more per dollar risked.">PF (profit factor)</label>
+            <input type="range" id="spec-fitness-w-pf" min="0" max="1" step="0.05" value="0.5" style="flex:1;min-width:120px">
+            <span id="spec-fitness-w-pf-val" style="font-size:13px;color:#e6edf3;width:36px;text-align:right">0.50</span>
+            <span id="spec-fitness-w-pf-def" style="font-size:11px;color:#6e7681;width:80px;text-align:right"></span>
+          </div>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px"
+                   title="Max drawdown as a fraction of equity. Weight for the term (1 − maxDD%) clamped to [0,1] — a higher weight penalises deeper drawdowns more aggressively.">DD (drawdown)</label>
+            <input type="range" id="spec-fitness-w-dd" min="0" max="1" step="0.05" value="0.3" style="flex:1;min-width:120px">
+            <span id="spec-fitness-w-dd-val" style="font-size:13px;color:#e6edf3;width:36px;text-align:right">0.30</span>
+            <span id="spec-fitness-w-dd-def" style="font-size:11px;color:#6e7681;width:80px;text-align:right"></span>
+          </div>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px"
+                   title="Net return. Weight for the normalized term: netPct / ret cap, clipped to [0,1]. Higher weight rewards raw profit regardless of PF/DD.">ret (return)</label>
+            <input type="range" id="spec-fitness-w-ret" min="0" max="1" step="0.05" value="0.2" style="flex:1;min-width:120px">
+            <span id="spec-fitness-w-ret-val" style="font-size:13px;color:#e6edf3;width:36px;text-align:right">0.20</span>
+            <span id="spec-fitness-w-ret-def" style="font-size:11px;color:#6e7681;width:80px;text-align:right"></span>
+          </div>
+          <div id="spec-fitness-w-sum" style="font-size:12px;color:#6e7681;margin-left:140px;margin-top:4px">
+            Sum: 1.00
+          </div>
+
+          <!-- Caps. Keep simple number inputs — these are rarely tuned
+               but need to be visible so the user can trust what's being
+               used. -->
+          <h3 style="font-size:13px;color:#c9d1d9;margin:14px 0 6px 0"
+              title="Ceilings used to normalize raw metrics into [0, 1] before the weighted sum. Caps prevent one outlier term from dominating the whole score.">Caps</h3>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px"
+                   title="PF values at or above this cap score 1.0 on the PF term. Also the ceiling for PF = ∞ (no losing trades) — otherwise a single-trade winner would saturate the whole population. Default 4.0: beyond PF=4 the differences are usually noise.">PF cap</label>
+            <input type="number" id="spec-fitness-cap-pf" min="0" step="0.5" value="4" style="width:90px">
+            <span id="spec-fitness-cap-pf-def" style="font-size:11px;color:#6e7681;margin-left:8px"></span>
+          </div>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px"
+                   title="Net-return value treated as the 100% anchor for the return term. e.g. 2.0 means a +200% return scores 1.0 on ret. Higher returns clip to 1.0.">ret cap</label>
+            <input type="number" id="spec-fitness-cap-ret" min="0" step="0.25" value="2" style="width:90px">
+            <span id="spec-fitness-cap-ret-def" style="font-size:11px;color:#6e7681;margin-left:8px"></span>
+          </div>
+
+          <!-- Gates. Integer min-trades, number floors. Each gate is a
+               hard veto so a genome that violates any one goes to 0. -->
+          <h3 style="font-size:13px;color:#c9d1d9;margin:14px 0 6px 0"
+              title="Hard-veto thresholds. If ANY gate fails, the genome's fitness is forced to 0 and it's eliminated from selection — not just penalised.">Gates</h3>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px"
+                   title="Minimum number of trades a walk-forward window must produce before its metrics are trusted. Genomes with fewer trades (in any window) are eliminated — too few trades is pure noise, not signal.">Min trades / window</label>
+            <input type="number" id="spec-fitness-gate-mintrades" min="0" step="1" value="30" style="width:90px">
+            <span id="spec-fitness-gate-mintrades-def" style="font-size:11px;color:#6e7681;margin-left:8px"></span>
+          </div>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px"
+                   title="If any market regime (with at least 5 trades) has a profit factor below this value, eliminate. Default 1.0 = a strategy that loses money in ANY regime is considered fragile, even if it looks great on aggregate.">Worst regime PF floor</label>
+            <input type="number" id="spec-fitness-gate-regimepf" min="0" step="0.1" value="1" style="width:90px">
+            <span id="spec-fitness-gate-regimepf-def" style="font-size:11px;color:#6e7681;margin-left:8px"></span>
+          </div>
+          <div class="form-row" style="align-items:center">
+            <label style="width:140px"
+                   title="Walk-Forward Efficiency floor. WFE = out-of-sample PF / in-sample PF. A low WFE means the strategy overfit to in-sample data and won't generalize. Default 0.5 = OOS performance must keep at least 50% of the in-sample result. Value must be in [0, 1].">WFE min</label>
+            <input type="number" id="spec-fitness-gate-wfemin" min="0" max="1" step="0.05" value="0.5" style="width:90px">
+            <span id="spec-fitness-gate-wfemin-def" style="font-size:11px;color:#6e7681;margin-left:8px"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right column: live JSON preview + copy button -->
+      <div>
+        <div class="card" style="position:sticky;top:16px">
+          <h2 style="display:flex;align-items:center;justify-content:space-between">
+            JSON Preview
+            <span id="spec-preview-validity" style="font-size:11px;font-weight:400"></span>
+          </h2>
+          <div id="spec-preview-issues" style="font-size:12px;color:#d29922;margin-bottom:8px;min-height:14px"></div>
+          <pre id="spec-json-preview" style="max-height:60vh;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6edf3;white-space:pre;margin:0"></pre>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap">
+            <button type="button" id="spec-save" class="primary">Save</button>
+            <button type="button" id="spec-save-as">Save As…</button>
+            <button type="button" id="spec-copy-json">Copy JSON</button>
+            <span id="spec-copy-status" style="font-size:12px;color:#8b949e"></span>
+          </div>
+          <div id="spec-save-status" style="font-size:12px;color:#8b949e;margin-top:10px;min-height:14px;white-space:pre-wrap;line-height:1.5"></div>
+          <p style="font-size:11px;color:#6e7681;margin-top:12px;line-height:1.5">
+            <strong>Save</strong> overwrites the current spec (or creates a new one).
+            <strong>Save As</strong> creates a variation under a new name.
+            Both validate server-side before writing to
+            <code style="background:#0d1117;padding:1px 5px;border-radius:3px">strategies/</code>.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ═══════════ RUN DETAIL PAGE ═══════════ -->
   <div id="page-run-detail" class="page">
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
@@ -139,6 +422,100 @@
     <div class="card" style="margin-bottom:16px">
       <h3 style="margin:0 0 16px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em">Strategy Parameters</h3>
       <div id="detail-params" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px"></div>
+    </div>
+
+    <!-- Phase 4.6: Pine indicator export. Button is disabled for
+         legacy runs (the codegen needs a hydrated spec). Result area
+         shows a one-line summary with the file path + byte/line count
+         and a <details> collapsible source preview so a user can
+         spot-check the output without leaving the page. -->
+    <div class="card" id="detail-pine-card" style="margin-bottom:16px">
+      <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em"
+          title="Generate a Pine v5 entry-alerts indicator from this run's spec + winning gene. Output is content-addressed by gene hash, so the same inputs always produce the same file.">
+        Pine Export
+      </h3>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button id="btn-pine-export"
+                onclick="generatePine()"
+                style="font-size:12px;padding:6px 14px">
+          Generate Pine indicator
+        </button>
+        <span id="pine-export-status" style="font-size:12px;color:#8b949e"></span>
+      </div>
+      <div id="pine-export-result" style="margin-top:12px"></div>
+    </div>
+
+    <!-- Phase 4.5a: three spec-mode-only cards surface the persisted
+         WF / regime / fitness data that used to be computed-but-hidden.
+         All three start display:none — app.js flips them on only if
+         the run has the backing JSON (i.e. spec-mode run). Legacy GA
+         runs skip them entirely so the page looks unchanged. -->
+
+    <!-- Fitness Breakdown: why the winning gene scored what it did.
+         Surfaces the normalized PF/DD/ret terms, weights used, the
+         final composite score, and — most importantly — which gates
+         the gene passed or failed (the "why did this win?" answer). -->
+    <div class="card" id="detail-fitness-card" style="display:none;margin-bottom:16px">
+      <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em"
+          title="How the winning gene scored. Shows the three normalized metric terms (PF / DD / ret, each in [0,1]) weighted into a composite score, plus which hard-veto gates the gene passed or failed.">
+        Fitness Breakdown
+      </h3>
+      <div id="detail-fitness-body"></div>
+    </div>
+
+    <!-- Walk-Forward Report: table of per-window IS/OOS metrics plus
+         the aggregate WFE. This is the "will it generalize?" answer —
+         a high-WFE strategy earned its in-sample result honestly and
+         holds up out-of-sample. Low WFE = overfit. -->
+    <div class="card" id="detail-wf-card" style="display:none;margin-bottom:16px">
+      <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em"
+          title="Walk-forward analysis. Each window fits the strategy on an in-sample slice, then evaluates it on the next OOS slice. High WFE (OOS PF / IS PF) means the strategy generalizes; low WFE means it overfit to IS data.">
+        Walk-Forward Report
+      </h3>
+      <div id="detail-wf-summary" style="margin-bottom:12px"></div>
+      <div style="overflow-x:auto">
+        <table id="detail-wf-table" style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead>
+            <tr style="color:#8b949e;border-bottom:1px solid #30363d">
+              <th style="text-align:left;padding:6px 8px">Window</th>
+              <th style="text-align:right;padding:6px 8px" title="In-sample trade count">IS trades</th>
+              <th style="text-align:right;padding:6px 8px" title="In-sample profit factor">IS PF</th>
+              <th style="text-align:right;padding:6px 8px" title="In-sample net return %">IS net %</th>
+              <th style="text-align:right;padding:6px 8px" title="Out-of-sample trade count">OOS trades</th>
+              <th style="text-align:right;padding:6px 8px" title="Out-of-sample profit factor">OOS PF</th>
+              <th style="text-align:right;padding:6px 8px" title="Out-of-sample net return %">OOS net %</th>
+            </tr>
+          </thead>
+          <tbody id="detail-wf-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Regime Breakdown: per-regime trade counts and PF. The regime
+         gate rejects strategies that rely on one regime; this table
+         is the evidence — if a regime has PF < the worst-regime-PF
+         gate (default 1.0), the gene should be flagged. -->
+    <div class="card" id="detail-regime-card" style="display:none;margin-bottom:16px">
+      <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em"
+          title="Per-regime performance breakdown. A consistent strategy makes money across regimes; a fragile one relies on one regime being dominant. Regimes with <5 trades are flagged as low-confidence samples.">
+        Regime Breakdown
+      </h3>
+      <div id="detail-regime-source" style="font-size:12px;color:#6e7681;margin-bottom:8px"></div>
+      <div style="overflow-x:auto">
+        <table id="detail-regime-table" style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead>
+            <tr style="color:#8b949e;border-bottom:1px solid #30363d">
+              <th style="text-align:left;padding:6px 8px">Regime</th>
+              <th style="text-align:right;padding:6px 8px">Trades</th>
+              <th style="text-align:right;padding:6px 8px">Wins</th>
+              <th style="text-align:right;padding:6px 8px" title="Win rate = wins / trades">Win %</th>
+              <th style="text-align:right;padding:6px 8px" title="Profit factor = gross wins / gross losses">PF</th>
+              <th style="text-align:right;padding:6px 8px" title="Net P&L in quote currency units">Net</th>
+            </tr>
+          </thead>
+          <tbody id="detail-regime-tbody"></tbody>
+        </table>
+      </div>
     </div>
 
     <!-- Recalculate panel -->
@@ -199,6 +576,7 @@
               <th style="text-align:right;padding:6px 8px">Exit Price</th>
               <th style="text-align:right;padding:6px 8px">Size (Asset)</th>
               <th style="text-align:right;padding:6px 8px">Size (USDT)</th>
+              <th style="text-align:right;padding:6px 8px">Risk $</th>
               <th style="text-align:right;padding:6px 8px">Net P&amp;L</th>
               <th style="text-align:right;padding:6px 8px">P&amp;L %</th>
             </tr>
@@ -209,10 +587,129 @@
     </div>
   </div>
 
+  <!-- ═══════════ COMPARE RUNS PAGE (Phase 4.5b) ═══════════ -->
+  <!--
+    Side-by-side walk-forward comparison. Reached via
+    #compare?ids=<id1>,<id2>. Mirrors the structure of #page-run-detail's
+    Walk-Forward card twice (suffix -a / -b) so renderWalkForwardReport
+    can fill either column with the same helper.
+
+    MVP scope (4.5b):
+      - 2 runs side-by-side. 3+ way compare deferred to 4.5c.
+      - Per-column header strip: spec name, symbol / tf / start_date,
+        fitness score chip.
+      - Walk-Forward Report card per column (summary chips + per-window
+        table).
+      - Cross-column highlights: winner OOS PF green / loser red per
+        window row (only if the gap is >10%), amber banner if scheme
+        or nWindows don't match (comparing apples to oranges).
+
+    Deferred (4.5c+): regime-breakdown diff, fitness-breakdown chip
+    diff, 3+ way grid, "winner dominates" verdict, CSV export.
+  -->
+  <div id="page-compare" class="page">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+      <button onclick="closeCompare()" style="font-size:13px;padding:4px 12px">← Back</button>
+      <h2 style="margin:0;font-size:18px">Compare Runs</h2>
+      <span id="compare-title" style="font-size:13px;color:#8b949e;font-family:monospace"></span>
+    </div>
+
+    <!-- Mismatch banner: shown when the two runs' WF reports disagree
+         on `scheme` or `nWindows`. A silent side-by-side of apples and
+         oranges is worse than an explicit flag. -->
+    <div id="compare-mismatch-banner" class="card cmp-mismatch" style="display:none;margin-bottom:16px">
+      <div id="compare-mismatch-body" style="font-size:13px;color:#e6edf3"></div>
+    </div>
+
+    <!-- Empty-state message when one or both runs has no WF data (legacy
+         GA runs, still-running runs, failed runs). renderWalkForwardReport
+         already hides its card on null input; this line tells the user why. -->
+    <div id="compare-empty-note" style="display:none;margin-bottom:16px;font-size:13px;color:#d29922"></div>
+
+    <div class="compare-grid">
+      <!-- Column A -->
+      <div>
+        <div class="card" id="compare-header-a" style="margin-bottom:16px">
+          <div id="compare-header-body-a"></div>
+        </div>
+
+        <div class="card" id="detail-wf-card-a" style="display:none;margin-bottom:16px">
+          <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em"
+              title="Walk-forward analysis. Each window fits the strategy on an in-sample slice, then evaluates it on the next OOS slice. High WFE (OOS PF / IS PF) means the strategy generalizes; low WFE means it overfit to IS data.">
+            Walk-Forward Report
+          </h3>
+          <div id="detail-wf-summary-a" style="margin-bottom:12px"></div>
+          <div style="overflow-x:auto">
+            <table id="detail-wf-table-a" style="width:100%;font-size:12px;border-collapse:collapse">
+              <thead>
+                <tr style="color:#8b949e;border-bottom:1px solid #30363d">
+                  <th style="text-align:left;padding:6px 8px">Window</th>
+                  <th style="text-align:right;padding:6px 8px" title="In-sample trade count">IS trades</th>
+                  <th style="text-align:right;padding:6px 8px" title="In-sample profit factor">IS PF</th>
+                  <th style="text-align:right;padding:6px 8px" title="In-sample net return %">IS net %</th>
+                  <th style="text-align:right;padding:6px 8px" title="Out-of-sample trade count">OOS trades</th>
+                  <th style="text-align:right;padding:6px 8px" title="Out-of-sample profit factor">OOS PF</th>
+                  <th style="text-align:right;padding:6px 8px" title="Out-of-sample net return %">OOS net %</th>
+                </tr>
+              </thead>
+              <tbody id="detail-wf-tbody-a"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Column B -->
+      <div>
+        <div class="card" id="compare-header-b" style="margin-bottom:16px">
+          <div id="compare-header-body-b"></div>
+        </div>
+
+        <div class="card" id="detail-wf-card-b" style="display:none;margin-bottom:16px">
+          <h3 style="margin:0 0 12px;font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em"
+              title="Walk-forward analysis. Each window fits the strategy on an in-sample slice, then evaluates it on the next OOS slice. High WFE (OOS PF / IS PF) means the strategy generalizes; low WFE means it overfit to IS data.">
+            Walk-Forward Report
+          </h3>
+          <div id="detail-wf-summary-b" style="margin-bottom:12px"></div>
+          <div style="overflow-x:auto">
+            <table id="detail-wf-table-b" style="width:100%;font-size:12px;border-collapse:collapse">
+              <thead>
+                <tr style="color:#8b949e;border-bottom:1px solid #30363d">
+                  <th style="text-align:left;padding:6px 8px">Window</th>
+                  <th style="text-align:right;padding:6px 8px" title="In-sample trade count">IS trades</th>
+                  <th style="text-align:right;padding:6px 8px" title="In-sample profit factor">IS PF</th>
+                  <th style="text-align:right;padding:6px 8px" title="In-sample net return %">IS net %</th>
+                  <th style="text-align:right;padding:6px 8px" title="Out-of-sample trade count">OOS trades</th>
+                  <th style="text-align:right;padding:6px 8px" title="Out-of-sample profit factor">OOS PF</th>
+                  <th style="text-align:right;padding:6px 8px" title="Out-of-sample net return %">OOS net %</th>
+                </tr>
+              </thead>
+              <tbody id="detail-wf-tbody-b"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ═══════════ NEW RUN MODAL ═══════════ -->
+  <!--
+    Layout: header (h2) + scrollable .modal-body + sticky .actions footer.
+    The modal itself is capped at 80vh with 10vh padding above/below from
+    the overlay, so the body scrolls internally and Cancel/Start are
+    always reachable no matter how tall the content grows.
+
+    Body structure:
+      1. Run inputs that apply regardless of strategy: Symbols, Interval,
+         Backtest Period + timeline, Strategy spec picker.
+      2. Tabs (Simulation control / Quality criteria / Islands / Planets)
+         for the knobs that were getting crowded in a single column. Each
+         tab shows a small handful of related fields so the visible area
+         stays short even when content would otherwise overflow.
+  -->
   <div class="modal-overlay" id="modal-new-run">
     <div class="modal">
       <h2>New Optimization Run</h2>
+      <div class="modal-body">
       <div class="form-row">
         <label>Symbols</label>
         <div class="checkbox-group" id="modal-symbols"></div>
@@ -262,78 +759,125 @@
           <div class="tl-hint" id="tl-hint">Select a symbol to see available data range</div>
         </div>
       </div>
-      <div class="form-row">
-        <label>Population</label>
-        <input type="number" id="modal-pop" value="80" min="10" max="200" style="width:80px">
-      </div>
-      <div class="form-row">
-        <label>Generations</label>
-        <input type="number" id="modal-gen" value="80" min="5" max="500" style="width:80px">
-      </div>
-      <div class="form-row">
-        <label>Min Trades</label>
-        <input type="number" id="modal-min-trades" value="30" min="5" max="200" step="5" style="width:80px">
-        <span style="font-size:12px;color:#8b949e">minimum trades for valid strategy</span>
-      </div>
-      <div class="form-row">
-        <label>Max DD% <span id="max-dd-val" style="color:#58a6ff">50</span></label>
-        <input type="range" id="modal-max-dd" min="5" max="80" step="5" value="50" style="width:160px">
-        <span style="font-size:12px;color:#8b949e">max drawdown % before heavy penalty</span>
-      </div>
-      <div class="form-row">
-        <label>Islands</label>
-        <input type="number" id="modal-islands" value="4" min="1" max="16" style="width:80px">
-        <span style="font-size:12px;color:#8b949e">1 = classic, 4-8 recommended</span>
-      </div>
-      <div id="island-options">
-        <div class="form-row">
-          <label>Migration Interval</label>
-          <input type="number" id="modal-mig-interval" value="0" min="0" max="200" style="width:80px">
-          <span style="font-size:12px;color:#8b949e">0 = auto (25% of gens, rare is better)</span>
-        </div>
-        <div class="form-row">
-          <label>Migration Count</label>
-          <input type="number" id="modal-mig-count" value="3" min="1" max="20" style="width:80px">
-          <span style="font-size:12px;color:#8b949e">individuals per event</span>
-        </div>
-        <div class="form-row">
-          <label>Topology</label>
-          <select id="modal-topology" style="width:120px">
-            <option value="ring">Ring (best for diversity)</option>
-            <option value="torus">Torus (balanced)</option>
-            <option value="random">Random</option>
+      <!-- Phase 4.3b: spec picker. "None (legacy mode)" sends a run with no
+           `spec` field, matching pre-4.1 behavior. Any other option sends
+           `spec: <filename>` and the server resolves it under strategies/. -->
+      <div class="form-row" style="flex-direction:column;align-items:stretch">
+        <div style="display:flex;align-items:center;gap:12px">
+          <label style="margin:0">Strategy spec</label>
+          <select id="modal-spec" style="flex:1;min-width:200px">
+            <option value="">None (legacy mode)</option>
           </select>
         </div>
+        <div id="modal-spec-desc" style="font-size:12px;color:#8b949e;margin-top:4px;min-height:14px"></div>
+        <div id="modal-spec-warn" style="font-size:12px;color:#f85149;margin-top:4px;display:none"></div>
+      </div>
+
+      <!-- Tabs: organize the GA knobs into four logical groups. Wiring in
+           app.js toggles `.active` on the matching .tab-btn + .tab-panel. -->
+      <div class="tabs" role="tablist">
+        <button type="button" class="tab-btn active" data-tab="sim" role="tab">Simulation control</button>
+        <button type="button" class="tab-btn" data-tab="quality" role="tab">Quality criteria</button>
+        <button type="button" class="tab-btn" data-tab="islands" role="tab">Islands</button>
+        <button type="button" class="tab-btn" data-tab="planets" role="tab">Planets</button>
+      </div>
+
+      <!-- Simulation control: basic GA shape + gene-knockout sweep (which is
+           a simulation-wide switch — harmless when planets=1 since knockouts
+           only activate on planet > 0). -->
+      <div class="tab-panel active" data-panel="sim">
+        <div class="form-row">
+          <label>Population</label>
+          <input type="number" id="modal-pop" value="80" min="10" max="200" style="width:80px">
+        </div>
+        <div class="form-row">
+          <label>Generations</label>
+          <input type="number" id="modal-gen" value="80" min="5" max="500" style="width:80px">
+        </div>
+        <div class="form-row">
+          <label>Gene Knockouts</label>
+          <select id="modal-knockout-mode" style="width:120px">
+            <option value="none">None</option>
+            <option value="sweep">Sweep (1 gene per planet)</option>
+          </select>
+          <select id="modal-knockout-value" style="width:120px;margin-left:6px">
+            <option value="midpoint">Midpoint value</option>
+            <option value="random">Random value</option>
+          </select>
+          <span style="font-size:12px;color:#8b949e">planet 0 = control; planet N freezes gene N-1 (requires Planets &gt; 1)</span>
+        </div>
+      </div>
+
+      <!-- Quality criteria: fitness gates that penalize/reject strategies. -->
+      <div class="tab-panel" data-panel="quality">
+        <div class="form-row">
+          <label>Min Trades</label>
+          <input type="number" id="modal-min-trades" value="30" min="5" max="200" step="5" style="width:80px">
+          <span style="font-size:12px;color:#8b949e">minimum trades for valid strategy</span>
+        </div>
+        <div class="form-row">
+          <label>Max DD% <span id="max-dd-val" style="color:#58a6ff">50</span></label>
+          <input type="range" id="modal-max-dd" min="5" max="80" step="5" value="50" style="width:160px">
+          <span style="font-size:12px;color:#8b949e">max drawdown % before heavy penalty</span>
+        </div>
+      </div>
+
+      <!-- Islands: island model + migration settings. #island-options wraps
+           only the migration sub-fields so they hide when islands=1. -->
+      <div class="tab-panel" data-panel="islands">
+        <div class="form-row">
+          <label>Islands</label>
+          <input type="number" id="modal-islands" value="4" min="1" max="16" style="width:80px">
+          <span style="font-size:12px;color:#8b949e">1 = classic, 4-8 recommended</span>
+        </div>
+        <div id="island-options">
+          <div class="form-row">
+            <label>Migration Interval</label>
+            <input type="number" id="modal-mig-interval" value="0" min="0" max="200" style="width:80px">
+            <span style="font-size:12px;color:#8b949e">0 = auto (25% of gens, rare is better)</span>
+          </div>
+          <div class="form-row">
+            <label>Migration Count</label>
+            <input type="number" id="modal-mig-count" value="3" min="1" max="20" style="width:80px">
+            <span style="font-size:12px;color:#8b949e">individuals per event</span>
+          </div>
+          <div class="form-row">
+            <label>Topology</label>
+            <select id="modal-topology" style="width:120px">
+              <option value="ring">Ring (best for diversity)</option>
+              <option value="torus">Torus (balanced)</option>
+              <option value="random">Random</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- Planets: multi-planet + cross-planet "space travel" migration.
+           The Space Travel fields stay visible regardless of Planets count
+           so the tab isn't nearly-empty when Planets=1. They're disabled
+           (grayed out) when Planets<=1 because the values are irrelevant
+           with a single planet; the event handler in app.js keeps the
+           disabled state in sync with the Planets input. -->
+      <div class="tab-panel" data-panel="planets">
         <div class="form-row">
           <label>Planets</label>
           <input type="number" id="modal-planets" value="1" min="1" max="8" style="width:80px">
           <span style="font-size:12px;color:#8b949e">1 = off, 2-4 = multi-planet (uses more CPU)</span>
         </div>
-        <div id="planet-options" style="display:none">
+        <div id="planet-options">
           <div class="form-row">
             <label>Space Travel Every</label>
-            <input type="number" id="modal-space-interval" value="2" min="1" max="20" style="width:80px">
-            <span style="font-size:12px;color:#8b949e">island migrations between cross-planet travel</span>
+            <input type="number" id="modal-space-interval" value="2" min="1" max="20" style="width:80px" disabled>
+            <span style="font-size:12px;color:#8b949e">island migrations between cross-planet travel (requires Planets &gt; 1)</span>
           </div>
           <div class="form-row">
             <label>Space Travel Count</label>
-            <input type="number" id="modal-space-count" value="1" min="1" max="5" style="width:80px">
-            <span style="font-size:12px;color:#8b949e">individuals per space travel event</span>
-          </div>
-          <div class="form-row">
-            <label>Gene Knockouts</label>
-            <select id="modal-knockout-mode" style="width:120px">
-              <option value="none">None</option>
-              <option value="sweep">Sweep (1 gene per planet)</option>
-            </select>
-            <select id="modal-knockout-value" style="width:120px;margin-left:6px">
-              <option value="midpoint">Midpoint value</option>
-              <option value="random">Random value</option>
-            </select>
-            <span style="font-size:12px;color:#8b949e">planet 0 = control; planet N freezes gene N-1</span>
+            <input type="number" id="modal-space-count" value="1" min="1" max="5" style="width:80px" disabled>
+            <span style="font-size:12px;color:#8b949e">individuals per space travel event (requires Planets &gt; 1)</span>
           </div>
         </div>
       </div>
+      </div><!-- /.modal-body -->
       <div class="actions">
         <button id="modal-cancel">Cancel</button>
         <button id="modal-start" class="primary">Start</button>

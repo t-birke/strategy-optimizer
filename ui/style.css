@@ -225,6 +225,9 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
   z-index: 100;
   align-items: center;
   justify-content: center;
+  /* 10% vertical breathing room so the modal never hugs the viewport edges.
+     When content is tall the modal itself scrolls internally (see .modal-body). */
+  padding: 10vh 20px;
 }
 
 .modal-overlay.active { display: flex; }
@@ -234,8 +237,15 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
   border: 1px solid #30363d;
   border-radius: 12px;
   padding: 24px;
-  min-width: 520px;
-  max-width: 580px;
+  min-width: 640px;
+  max-width: 780px;
+  width: 100%;
+  /* Fill the overlay's 80vh budget (100vh - 2*10vh padding), then defer
+     overflow to .modal-body so header/footer stay visible. */
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .modal h2 {
@@ -244,6 +254,19 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
   color: #e6edf3;
   text-transform: none;
   letter-spacing: 0;
+  flex-shrink: 0;
+}
+
+/* Everything between the h2 header and .actions footer lives here and
+   scrolls when the content exceeds the modal's height budget. Flex:1 lets
+   it take the remaining space after header/footer lay out. */
+.modal-body {
+  flex: 1;
+  overflow-y: auto;
+  /* Leave a little room so the scrollbar doesn't visually collide with
+     inputs on the right edge. */
+  padding-right: 8px;
+  margin-right: -8px;
 }
 
 .modal .actions {
@@ -251,7 +274,49 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
   justify-content: flex-end;
   gap: 8px;
   margin-top: 20px;
+  flex-shrink: 0;
+  /* Subtle top border so the sticky footer reads as distinct from the
+     scrollable body when content is cut off mid-field. */
+  padding-top: 16px;
+  border-top: 1px solid #21262d;
 }
+
+/* Tabs inside the modal — used by the New Run modal to pack setup params
+   into Simulation / Quality / Islands / Planets groups so the overall
+   modal height stays manageable. */
+.modal .tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid #30363d;
+  margin: 16px 0 16px;
+  flex-shrink: 0;
+}
+
+.modal .tab-btn {
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 8px 14px;
+  color: #8b949e;
+  font-size: 13px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.modal .tab-btn:hover {
+  background: transparent;
+  color: #e6edf3;
+  border-color: transparent;
+}
+
+.modal .tab-btn.active {
+  color: #58a6ff;
+  border-bottom-color: #58a6ff;
+}
+
+.modal .tab-panel { display: none; }
+.modal .tab-panel.active { display: block; }
 
 /* Checkbox group */
 .checkbox-group {
@@ -384,3 +449,172 @@ input:focus, select:focus { outline: none; border-color: #58a6ff; }
 /* TV button */
 .btn-tv { background: #1f6feb; border-color: #1f6feb; }
 .btn-tv:hover { background: #388bfd; }
+
+/* ─── Spec editor param-narrowing controls (Phase 4.3d) ───────────
+   One row per declared param: [name] [mode] [min | max | step] [reset].
+   Kept compact so a block with 4-6 params doesn't blow out the form. */
+.spec-params:empty { display: none; }
+.spec-params .param-row {
+  display: grid;
+  grid-template-columns: 140px 56px repeat(3, 1fr) 28px;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 8px;
+  background: #0d1117;
+  border: 1px solid #21262d;
+  border-radius: 5px;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+.spec-params .param-row .param-name {
+  color: #c9d1d9;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.spec-params .param-row .param-name .param-type {
+  color: #6e7681;
+  margin-left: 4px;
+  font-size: 10px;
+}
+.spec-params .param-row input[type="number"] {
+  width: 100%;
+  min-width: 0;
+  padding: 3px 6px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: #010409;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+}
+.spec-params .param-row input[type="number"]:focus {
+  outline: none;
+  border-color: #1f6feb;
+}
+.spec-params .param-row .param-pin {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  color: #8b949e;
+  user-select: none;
+  cursor: pointer;
+}
+.spec-params .param-row .param-reset {
+  padding: 2px 6px;
+  font-size: 11px;
+  line-height: 1;
+  background: transparent;
+  color: #6e7681;
+  border: 1px solid #30363d;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.spec-params .param-row .param-reset:hover { color: #c9d1d9; border-color: #484f58; }
+.spec-params .param-row.pinned .param-max,
+.spec-params .param-row.pinned .param-step { visibility: hidden; }
+.spec-params .param-row .param-value { grid-column: 3 / span 3; }
+.spec-params .param-row.pinned .param-min { display: none; }
+.spec-params .param-row:not(.pinned) .param-value { display: none; }
+.spec-params .param-row input.invalid { border-color: #f85149; }
+
+/* ─── Specs editor readability tweaks ────────────────────────
+   Picked-block rows (entries/filters) get a dashed grey separator
+   and more vertical breathing room so a list of 4-5 picked blocks
+   doesn't read as one blob. The block's select itself drops its
+   full frame once the user has made a pick — it reads as a label
+   with just a chevron affordance. Hover or click-to-open restores
+   the frame so the dropdown is still obviously interactive. */
+
+#page-specs .spec-block-row {
+  padding: 6px 0 14px 0;
+  margin-bottom: 14px;
+  border-bottom: 1px dashed #30363d;
+}
+#page-specs .spec-block-row:last-child {
+  border-bottom: none;
+  padding-bottom: 4px;
+  margin-bottom: 0;
+}
+
+/* Applies to the fixed-slot selects (regime, 3 exit slots, sizing)
+   AND to the per-row selects inside multi-block lists. The
+   `.param-row` param-control inputs are <input type="number">, so
+   this rule leaves them untouched. */
+#page-specs select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-color: transparent;
+  color: #e6edf3;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 6px 28px 6px 10px;
+  font-size: 15px;
+  font-family: inherit;
+  cursor: pointer;
+  /* Chevron stays visible so the user knows the field is still a dropdown. */
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%238b949e' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  transition: border-color 0.12s, background-color 0.12s;
+}
+#page-specs select:hover,
+#page-specs select:focus {
+  border-color: #30363d;
+  background-color: #0d1117;
+  outline: none;
+}
+#page-specs select option {
+  background: #0d1117;
+  color: #e6edf3;
+  font-size: 14px;
+}
+
+/* Any element carrying a `title` attribute inside the Fitness card gets a
+   help cursor and a subtle dotted underline, so users notice that
+   hovering yields an explanation. Keeps us on native `title` tooltips —
+   no custom popover widget to maintain — while still cueing the user
+   that documentation is a hover away. */
+#spec-fitness-card label[title],
+#spec-fitness-card h3[title],
+#spec-fitness-card h2[title] {
+  cursor: help;
+  text-decoration: underline dotted rgba(139, 148, 158, 0.4);
+  text-underline-offset: 3px;
+}
+
+/* ─── Phase 4.5b: compare-runs page ─────────────────────────────
+   2-up grid for side-by-side run compare. Each column hosts a header
+   card + a Walk-Forward Report card. Past 1440px screens the columns
+   stay readable; below ~900px they stack (single column) so the page
+   remains usable on narrower windows — the per-window tables are the
+   densest elements and they already scroll horizontally inside their
+   own wrappers, so stacking doesn't compromise the data.             */
+.compare-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+@media (max-width: 900px) {
+  .compare-grid { grid-template-columns: 1fr; }
+}
+
+/* Winner/loser per-window row highlights. Applied by
+   highlightCompareWindows() when the OOS PF gap between the two runs
+   on the same window exceeds 10%. Colours match the rest of the app's
+   green = good / red = bad convention, and use a left border instead
+   of a full background wash so the existing per-cell OOS colouring
+   inside the row remains readable. */
+#page-compare tr.cmp-best  { background: rgba(63, 185, 80, 0.08);  border-left: 3px solid #3fb950; }
+#page-compare tr.cmp-worst { background: rgba(248, 81, 73, 0.08);  border-left: 3px solid #f85149; }
+
+/* Mismatch banner card — shown when scheme or nWindows differ between
+   the two runs. Amber matches the "warning" weight already used for
+   abort-pending states and the WFE amber band. */
+.cmp-mismatch {
+  border-color: rgba(210, 153, 34, 0.5) !important;
+  background: rgba(210, 153, 34, 0.06);
+}

@@ -22,7 +22,26 @@
 import os from 'os';
 import { Worker } from 'worker_threads';
 import { loadCandles } from '../db/candles.js';
-import { PARAMS, geneKey, geneShort, randomParam, frozenLabel } from './params.js';
+import {
+  PARAMS as LEGACY_PARAMS,
+  geneKey as legacyGeneKey,
+  geneShort as legacyGeneShort,
+  randomParam as legacyRandomParam,
+  frozenLabel as legacyFrozenLabel,
+} from './params.js';
+import { validateSpec } from '../engine/spec.js';
+import { buildParamSpace } from './param-space.js';
+import {
+  computeDatasetId,
+  loadCache,
+  saveCache,
+  mergeCaches,
+} from './fitness-cache.js';
+import { walkForward } from './walk-forward.js';
+import { runSpec } from '../engine/runtime.js';
+import { computeDataRequirements, makeHtfBarIndex } from '../engine/data-bundle.js';
+import { packHtfPayload, unpackHtfPayloads } from './htf-transport.js';
+import * as registry from '../engine/blocks/registry.js';
 
 const MIN_TRADES = 10;
 const WORKER_URL = new URL('./island-worker.js', import.meta.url);
@@ -57,6 +76,11 @@ function getWorkerCap() {
  * @param {number} [config.spaceTravelCount=1] — individuals per space travel event
  * @param {Function} [config.onProgress]
  * @param {Function} [config.shouldCancel]
+ * @param {Object}   [config.spec]    — when present, runs in **spec mode**:
+ *                                       worker uses runSpec + computeFitness
+ *                                       + dynamic param-space derived from
+ *                                       this spec. Legacy `runStrategy` +
+ *                                       static `params.js` path is bypassed.
  * @returns {Object} results
  */
 export async function runOptimization(config) {
@@ -87,7 +111,42 @@ export async function runOptimization(config) {
     onProgress,
     shouldCancel,
     shouldHypermutate,  // consume-callback: returns true once to trigger
+    spec: rawSpec,
   } = config;
+
+  // ─── Spec-mode wiring ──────────────────────────────────────
+  // When the caller passes a spec, we validate it once on the main thread
+  // (cheap, deterministic — buildParamSpace is called again inside each
+  // worker, which is fine because validateSpec produces the same hash).
+  // The functions in paramSpace are NOT serializable across worker_threads,
+  // so we ship the raw spec object and let the worker rebuild paramSpace.
+  const specMode  = Boolean(rawSpec);
+  if (specMode) {
+    // validateSpec + buildParamSpace touch the block registry via
+    // indicatorDeps and declaredParams. Ensure it's populated on the main
+    // thread so both those calls AND computeDataRequirements (below) work.
+    await registry.ensureLoaded();
+  }
+  const spec      = specMode ? validateSpec(rawSpec)   : null;
+  const paramSpace = specMode ? buildParamSpace(spec) : null;
+  // HTF requirements come from blocks' indicatorDeps, NOT from a top-level
+  // `spec.htfs` field (no such field in the spec schema). Phase 2.6:
+  // compute the needed TFs once on the main thread and package them
+  // alongside the base candles for the workers.
+  const dataReqs  = specMode ? computeDataRequirements(spec) : null;
+  const htfTfMins = specMode ? dataReqs.htfTfMins : [];
+
+  // PARAMS-and-helpers shim. In spec mode they come from paramSpace; in
+  // legacy mode from the static params.js. Everything below this line is
+  // mode-agnostic.
+  const PARAMS       = specMode ? paramSpace.PARAMS       : LEGACY_PARAMS;
+  const randomParam  = specMode ? paramSpace.randomParam  : legacyRandomParam;
+  const geneShort    = specMode
+    ? (g) => Object.entries(g).slice(0, 6).map(([k, v]) => `${k}=${v}`).join(' ')
+    : legacyGeneShort;
+  const frozenLabel  = specMode
+    ? (fg) => Object.keys(fg).map(k => `${k}=${fg[k]}`).join(',')
+    : legacyFrozenLabel;
 
   // Logical island count — preserved for GA quality (migration topology,
   // population diversity). Physical worker threads are capped separately
@@ -142,21 +201,134 @@ export async function runOptimization(config) {
     if (candles.ts[i] >= startTs) { tradingStartBar = i; break; }
   }
 
+  // GA train/test split: fitnessStartBar marks where the OOS (scoring)
+  // region begins.  Indicators compute on ALL bars; the bar loop runs
+  // from tradingStartBar; but fitness metrics only accumulate for trades
+  // whose exit bar >= fitnessStartBar.  Set gaOosRatio = 0 (or omit) to
+  // disable the split and score on the full data.
+  const gaOosRatio = specMode && spec?.fitness?.gaOosRatio > 0
+    ? spec.fitness.gaOosRatio
+    : 0;
+  const tradingBars = len - tradingStartBar;
+  const fitnessStartBar = gaOosRatio > 0
+    ? tradingStartBar + Math.floor(tradingBars * (1 - gaOosRatio))
+    : 0;
+
   if (len < 100) {
     throw new Error(`Insufficient data: ${len} bars for ${symbol} ${timeframe}min from ${startDate}`);
   }
 
-  console.log(`[runner] Flat sizing fitness: minTrades=${minTrades}, maxDD=${maxDrawdownPct * 100}%`);
-  status('config', `Flat sizing fitness: PF×√trades×(1-ddPenalty), min ${minTrades} trades, max DD ${maxDrawdownPct * 100}%`);
+  // Spec-mode persistent fitness cache: keyed by spec.hash + dataset
+  // identity. Preload entries from disk so a re-run of the same spec on
+  // the same data starts warm. Workers hydrate their in-memory caches
+  // from this preload and report back at the end so we can persist the
+  // merged result. `bars` and `lastTs` go into the dataset id so adding
+  // candles to the DB invalidates the cache automatically.
+  let datasetId = null;
+  let cachePreload = null;
+  let cachePath = null;
+  if (specMode) {
+    datasetId = computeDatasetId({
+      symbol, timeframe, startDate, endDate: endDate || null,
+      bars: len, lastTs: Number(candles.ts[len - 1]),
+    });
+    const loaded = await loadCache({ specHash: spec.hash, datasetId });
+    cachePreload = loaded.entries;
+    cachePath = loaded.path;
+    console.log(`[runner] Fitness cache: ${loaded.count} entries preloaded from ${cachePath}`);
+  }
 
-  // 2. Create SharedArrayBuffer — zero-copy sharing with workers
-  //    Layout: [open|high|low|close|volume] × len Float64s each
-  const sab = new SharedArrayBuffer(len * 5 * 8);
-  new Float64Array(sab, len * 0 * 8, len).set(candles.open);
-  new Float64Array(sab, len * 1 * 8, len).set(candles.high);
-  new Float64Array(sab, len * 2 * 8, len).set(candles.low);
-  new Float64Array(sab, len * 3 * 8, len).set(candles.close);
-  new Float64Array(sab, len * 4 * 8, len).set(candles.volume);
+  if (specMode) {
+    console.log(`[runner] Spec mode: spec.hash=${spec.hash?.slice(0, 12)}, datasetId=${datasetId.slice(0, 12)}, ${PARAMS.length} genes from spec`);
+    status('config', `Spec mode (computeFitness gates: ${JSON.stringify(spec.fitness?.gates ?? {})})`);
+  } else {
+    console.log(`[runner] Flat sizing fitness: minTrades=${minTrades}, maxDD=${maxDrawdownPct * 100}%`);
+    status('config', `Flat sizing fitness: PF×√trades×(1-ddPenalty), min ${minTrades} trades, max DD ${maxDrawdownPct * 100}%`);
+  }
+
+  // 2. Create SharedArrayBuffer — zero-copy sharing with workers.
+  //
+  //    Legacy layout: [open|high|low|close|volume]            (5 cols × len Float64s)
+  //    Spec layout:   [ts|open|high|low|close|volume]         (6 cols × len Float64s)
+  //
+  //    The extra `ts` column in spec mode is needed because runSpec uses
+  //    bundle.base.ts for regime detection and period-year reporting; the
+  //    legacy runStrategy never reads ts, so we don't pay for it there.
+  const cols = specMode ? 6 : 5;
+  const sab = new SharedArrayBuffer(len * cols * 8);
+  if (specMode) {
+    new Float64Array(sab, len * 0 * 8, len).set(candles.ts);
+    new Float64Array(sab, len * 1 * 8, len).set(candles.open);
+    new Float64Array(sab, len * 2 * 8, len).set(candles.high);
+    new Float64Array(sab, len * 3 * 8, len).set(candles.low);
+    new Float64Array(sab, len * 4 * 8, len).set(candles.close);
+    new Float64Array(sab, len * 5 * 8, len).set(candles.volume);
+  } else {
+    new Float64Array(sab, len * 0 * 8, len).set(candles.open);
+    new Float64Array(sab, len * 1 * 8, len).set(candles.high);
+    new Float64Array(sab, len * 2 * 8, len).set(candles.low);
+    new Float64Array(sab, len * 3 * 8, len).set(candles.close);
+    new Float64Array(sab, len * 4 * 8, len).set(candles.volume);
+  }
+
+  // 2b. Phase 2.6 — HTF candle transport.
+  //
+  //   For each HTF the spec's blocks require, load the full-period candles
+  //   (with block-declared warmup), compute the per-base-bar last-closed
+  //   index, and pack both into SharedArrayBuffers. Workers reassemble
+  //   these into the `bundle.htfs[tfMin]` shape `engine/data-bundle.js`
+  //   produces, so the runtime sees no difference between a main-thread
+  //   bundle and a worker-assembled one.
+  //
+  //   Schema per HTF:
+  //     - candleBuffer (Float64):  6 cols × htfLen = [ts|open|high|low|close|volume]
+  //     - htfBarIndexBuffer (Uint32): baseLen entries, one per base bar
+  //       (HTF_NONE sentinel = 0xFFFFFFFF for "no HTF bar closed yet")
+  //
+  //   We could have crammed everything into one big SAB with a header, but
+  //   separate SABs per HTF keep the unpacking code obvious in the worker
+  //   and there's no measurable per-SAB cost at these sizes (each HTF is
+  //   tens of KB).
+  const htfPayloads = [];  // [{ tfMin, tfMs, htfLen, candleBuffer, htfBarIndexBuffer }]
+  if (specMode && htfTfMins.length > 0) {
+    status('loading', `Loading ${htfTfMins.length} HTF timeframe${htfTfMins.length === 1 ? '' : 's'}: ${htfTfMins.map(m => `${m}min`).join(', ')}`);
+    const baseTsView = candles.ts;  // Float64Array from the base load
+    for (const htfTfMin of htfTfMins) {
+      const htfWarmupBars = dataReqs.warmupBarsByTf.get(htfTfMin) ?? 0;
+      const htfTfMs = htfTfMin * 60_000;
+      const htfPreloadTs = startTs - htfWarmupBars * htfTfMs;
+      let htfCandles = await loadCandles(symbol, htfTfMin, htfPreloadTs);
+      if (htfCandles.close.length === 0) {
+        throw new Error(`HTF ${htfTfMin}min: no data for ${symbol} from ${new Date(htfPreloadTs).toISOString()}`);
+      }
+      // Trim HTF tail to base end (symmetry with base trim above).
+      if (endTs < Infinity) {
+        let lastIdx = htfCandles.close.length;
+        for (let i = 0; i < htfCandles.close.length; i++) {
+          if (htfCandles.ts[i] > endTs) { lastIdx = i; break; }
+        }
+        if (lastIdx < htfCandles.close.length) {
+          htfCandles = {
+            ts:     htfCandles.ts.slice(0, lastIdx),
+            open:   htfCandles.open.slice(0, lastIdx),
+            high:   htfCandles.high.slice(0, lastIdx),
+            low:    htfCandles.low.slice(0, lastIdx),
+            close:  htfCandles.close.slice(0, lastIdx),
+            volume: htfCandles.volume.slice(0, lastIdx),
+          };
+        }
+      }
+      const htfLen = htfCandles.close.length;
+      const htfBarIndex = makeHtfBarIndex(baseTsView, htfCandles.ts, htfTfMs);
+      htfPayloads.push(packHtfPayload({
+        tfMin: htfTfMin,
+        tfMs:  htfTfMs,
+        candles: htfCandles,
+        htfBarIndex,
+      }));
+      console.log(`[runner] HTF ${htfTfMin}min: ${htfLen} bars packed (warmup ${htfWarmupBars})`);
+    }
+  }
 
   const actualStartTs = candles.ts[tradingStartBar];
   const actualEndTs = candles.ts[len - 1];
@@ -266,12 +438,31 @@ export async function runOptimization(config) {
       workerData: {
         candleBuffer: sab,
         candleLength: len,
+        candleCols: cols,
         tradingStartBar,
+        fitnessStartBar,
         populationSize,
         islands: myIslands,
         minTrades,
         maxDrawdownPct,
         autoHyperEnabled,
+        // Spec mode payload (null in legacy mode). The worker rebuilds
+        // paramSpace itself — functions don't survive structured-clone.
+        specMode,
+        spec: specMode ? rawSpec : null,
+        periodYears: specMode ? periodYears : null,
+        baseTfMin: specMode ? timeframe : null,
+        // Phase 2.6 — HTF transport. Each entry is
+        //   { tfMin, tfMs, htfLen, candleBuffer, htfBarIndexBuffer }.
+        // Worker reassembles into bundle.htfs[tfMin] matching
+        // engine/data-bundle.js shape.
+        htfPayloads: specMode ? htfPayloads : [],
+        // Persistent-cache preload (spec mode only). Plain object of
+        // geneKey → { fitness, metrics }. Workers hydrate their in-mem
+        // cache from this on startup. Each worker gets the SAME preload —
+        // they may evaluate disjoint genes during the run, but on cache-hit
+        // the answer is identical regardless of which worker serves it.
+        fitnessCachePreload: specMode ? cachePreload : null,
       },
     });
 
@@ -517,6 +708,8 @@ export async function runOptimization(config) {
                   profit: best.metrics?.netProfit ?? null,
                   trades: best.metrics?.trades ?? null,
                   pf: best.metrics?.pf ?? null,
+                  score: best.metrics?._fitness?.score ?? null,
+                  freqFactor: best.metrics?._fitness?.breakdown?.freqFactor ?? null,
                   mutationRate: pm?.mutationRate ?? null,
                   perGeneMut: pm?.perGeneMut ?? null,
                   mutationMul: pm?.mutationMul ?? null,
@@ -531,6 +724,7 @@ export async function runOptimization(config) {
                 totalGens: generations,
                 best: globalBest.fitness,
                 metrics: globalBest.metrics,
+                gene: globalBest.gene ? { ...globalBest.gene } : null,
                 config: geneShort(globalBest.gene),
                 evalCount: workerEvals.reduce((a, b) => a + b, 0),
                 cacheSize: workerCaches.reduce((a, b) => a + b, 0),
@@ -549,6 +743,7 @@ export async function runOptimization(config) {
                   profit: ib?.metrics?.netProfit ?? null,
                   trades: ib?.metrics?.trades ?? null,
                   pf: ib?.metrics?.pf ?? null,
+                  score: ib?.metrics?._fitness?.score ?? null,
                   evals: workerEvals[i],
                   hyperActive: islandHyperActive[i],
                   hyperSource: islandHyperSource[i],
@@ -699,11 +894,57 @@ export async function runOptimization(config) {
       w.on('message', handler);
     }));
   }
+
+  // Spec mode: one `cache_delta` per worker (new entries only, excluding
+  // preload). Set up listeners BEFORE sending `get_results` so messages
+  // aren't dropped.
+  const cacheDeltaPromises = [];
+  if (specMode) {
+    for (const w of workers) {
+      cacheDeltaPromises.push(new Promise(resolve => {
+        const handler = (msg) => {
+          if (msg.type === 'cache_delta') {
+            w.off('message', handler);
+            resolve(msg.delta);
+          }
+        };
+        w.on('message', handler);
+      }));
+    }
+  }
+
   for (const w of workers) {
     w.postMessage({ type: 'get_results' });
   }
 
   const finalResults = await Promise.all(resultPromises);
+
+  // Persist the merged fitness cache (spec mode only). We do this BEFORE
+  // worker termination is awaited so a slow disk doesn't hold up release;
+  // the writes are atomic (write-tmp + rename) so a crash mid-write can't
+  // corrupt the file. Cancelled runs still persist what they computed —
+  // partial results are useful for the next run.
+  let cacheSaveInfo = null;
+  if (specMode) {
+    // Workers send only NEW entries (delta) — not the full cache — to
+    // avoid OOM when many islands each re-serialize the entire preload.
+    // We merge preload + all worker deltas here on the main thread.
+    const deltas = await Promise.all(cacheDeltaPromises);
+    const merged = mergeCaches([cachePreload || {}, ...deltas]);
+    try {
+      cacheSaveInfo = await saveCache({
+        specHash: spec.hash,
+        datasetId,
+        entries: merged,
+      });
+      console.log(`[runner] Fitness cache saved: ${cacheSaveInfo.count} entries → ${cacheSaveInfo.path}` +
+        (cacheSaveInfo.dropped > 0 ? ` (${cacheSaveInfo.dropped} eliminated/over-cap dropped)` : ''));
+    } catch (err) {
+      // Cache persistence is best-effort. A failed save degrades the next
+      // run's startup latency but doesn't invalidate this run's results.
+      console.warn(`[runner] Fitness cache save failed: ${err.message}`);
+    }
+  }
 
   if (cancelSent && onProgress) {
     onProgress({
@@ -721,11 +962,12 @@ export async function runOptimization(config) {
   await Promise.all(workers.map(w => w.terminate()));
 
   // 7. Merge results across all workers
-
-  let finalBest = { fitness: -Infinity };
-  for (const r of finalResults) {
-    if (r.best.fitness > finalBest.fitness) finalBest = r.best;
-  }
+  //
+  // Build topResults from the CACHE (all evaluations ever), not just the
+  // current GA population. The population can lose a good gene to
+  // crossover/mutation, so the cache is the authoritative ranking.
+  // finalBest is then picked from topResults[0] to guarantee consistency
+  // between the stored winner and the ranking table.
 
   const seen = new Set();
   const topResults = finalResults
@@ -744,8 +986,106 @@ export async function runOptimization(config) {
       return { gene, fitness: r.fitness, metrics: r.metrics };
     });
 
+  // Pick finalBest from topResults (cache-sourced) when available, falling
+  // back to the population best for legacy mode or empty-cache edge cases.
+  let finalBest = { fitness: -Infinity };
+  if (topResults.length > 0) {
+    finalBest = topResults[0];
+  } else {
+    for (const r of finalResults) {
+      if (r.best.fitness > finalBest.fitness) finalBest = r.best;
+    }
+  }
+
   const totalEvaluations = finalResults.reduce((sum, r) => sum + r.evalCount, 0);
   const totalCacheSize = finalResults.reduce((sum, r) => sum + r.cacheSize, 0);
+
+  // When a GA OOS split was active (fitnessStartBar > 0), the cached
+  // metrics reflect only the OOS portion. Re-evaluate ALL top results on
+  // the FULL data so the stored bestMetrics AND the ranking table show the
+  // complete backtest. GA fitness scores (used for ranking) are kept from
+  // the OOS run — only the display metrics change.
+  if (specMode && fitnessStartBar > 0) {
+    // Reconstruct HTFs from payloads so the full-data re-eval sees the same
+    // HTF shape the workers did (otherwise blocks that resolve HTF deps
+    // would throw "TF N min not loaded in bundle").
+    const fullBundle = {
+      base:  candles,
+      htfs:  unpackHtfPayloads(htfPayloads),
+      tradingStartBar,
+      periodYears: periodYears ?? 0,
+    };
+    for (const entry of topResults) {
+      if (!entry.gene) continue;
+      try {
+        const fullMetrics = runSpec({ spec, paramSpace, bundle: fullBundle, gene: entry.gene });
+        // Preserve the OOS fitness breakdown for display/diagnostics.
+        fullMetrics._fitness = entry.metrics?._fitness ?? null;
+        entry.metrics = fullMetrics;
+      } catch (err) {
+        console.warn(`[runner] Full-data re-eval failed for a top gene, keeping OOS metrics: ${err.message}`);
+      }
+    }
+    // finalBest points into topResults[0], so it's already updated.
+  }
+
+  // ─── Phase 4.1b: post-GA walk-forward on the winner ─────────
+  // Quantify how the shipped gene generalizes across time by freezing
+  // the full-data winner and re-evaluating it on nWindows IS/OOS slices
+  // (see optimizer/walk-forward.js for the design rationale). The
+  // `optimize` callback returns the winner for every window — the WF
+  // harness then runs `runSpec` on each IS + OOS slice to produce the
+  // per-window PFs and aggregate WFE.
+  //
+  // Spec mode only: legacy mode doesn't have a validated spec/paramSpace
+  // to hand to walkForward, and the UI surfaces for the WF report are
+  // going to be spec-native anyway (Phase 4.5 results view).
+  //
+  // Best-effort: a failed WF step (e.g. insufficient bars for nWindows)
+  // must not fail the whole run. We log a warning and return wfReport=null.
+  //
+  // Cancelled runs skip WF: the user asked us to stop, finishing with a
+  // ~5×single-backtest coda would be hostile.
+  let wfReport = null;
+  if (specMode && !cancelSent && finalBest.gene) {
+    try {
+      const wfStart = Date.now();
+
+      // Rebuild an in-process bundle for walk-forward. Reconstruct HTFs
+      // from the same payloads we packed for workers — zero-copy views
+      // over the SABs.
+      const htfs = unpackHtfPayloads(htfPayloads);
+
+      const bundle = {
+        symbol,
+        baseTfMin: timeframe,
+        baseTfMs:  timeframe * 60_000,
+        base:      candles,
+        htfs,
+        tradingStartBar,
+        periodYears,
+        n:         len,
+        warmup:    tradingStartBar,
+      };
+      wfReport = await walkForward({
+        spec,
+        paramSpace,
+        bundle,
+        optimize: () => finalBest.gene,
+        scheme:   spec.walkForward?.scheme   ?? 'anchored',
+        nWindows: spec.walkForward?.nWindows ?? 5,
+      });
+      console.log(
+        `[runner] Walk-forward: ${wfReport.validWindows}/${wfReport.nWindows} valid windows, ` +
+        `meanIsPf=${wfReport.meanIsPf.toFixed(3)}, meanOosPf=${wfReport.meanOosPf.toFixed(3)}, ` +
+        `WFE=${Number.isFinite(wfReport.wfe) ? wfReport.wfe.toFixed(3) : 'NaN'} ` +
+        `(${((Date.now() - wfStart) / 1000).toFixed(1)}s)`
+      );
+    } catch (err) {
+      console.warn(`[runner] Walk-forward skipped: ${err.message}`);
+      wfReport = null;
+    }
+  }
 
   return {
     symbol,
@@ -765,5 +1105,18 @@ export async function runOptimization(config) {
     candleBars: len,
     config: { populationSize, generations, mutationRate, numIslands, numPlanets, migrationInterval, migrationCount, migrationTopology, spaceTravelInterval, spaceTravelCount, knockoutMode, knockoutValueMode },
     planetFrozen,
+    // Spec-mode persistent-cache info (null in legacy mode):
+    //   { datasetId, preloadCount, savedCount, droppedCount, path }
+    fitnessCache: specMode ? {
+      datasetId,
+      preloadCount: cachePreload ? Object.keys(cachePreload).length : 0,
+      savedCount:   cacheSaveInfo?.count   ?? 0,
+      droppedCount: cacheSaveInfo?.dropped ?? 0,
+      path:         cacheSaveInfo?.path ?? cachePath,
+    } : null,
+    // Spec-mode walk-forward report on the winning gene (null in legacy
+    // mode, null if the WF step failed, null for cancelled runs).
+    // Shape: WalkForwardReport — see optimizer/walk-forward.js.
+    wfReport,
   };
 }

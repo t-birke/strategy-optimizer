@@ -94,6 +94,7 @@ export function runStrategy(candles, params, opts = {}) {
   let entryPrice = 0;
   let entryBar = 0;
   let entryAtr = 0;
+  let entryRisk = 0;       // $ at risk for the whole position at open
   let tp1Hit = false;      // Used for breakeven SL calculation
   let tp1HitBar = -1;      // Bar on which TP1 filled (1-bar delay matching Pine's detection)
 
@@ -134,6 +135,11 @@ export function runStrategy(candles, params, opts = {}) {
     tradeReturns.push(pnl / initialCapital);
 
     if (collectTrades) {
+      // riskUsdt: pro-rata share of the position's total risk at entry.
+      const totalPosUnits = subs.reduce((s, sb) => s + sb.units, 0);
+      const subRisk = (entryRisk > 0 && totalPosUnits > 0)
+        ? entryRisk * (subUnits / totalPosUnits)
+        : null;
       tradeList.push({
         direction: isLong ? 'Long' : 'Short',
         entryTs:   candles.ts ? Number(candles.ts[entryBar]) : null,
@@ -143,6 +149,7 @@ export function runStrategy(candles, params, opts = {}) {
         exitPrice,
         sizeAsset: subUnits,
         sizeUsdt:  subUnits * exitPrice,
+        riskUsdt:  subRisk,
         pnl,
         pnlPct:    pnl / initialCapital,
       });
@@ -227,6 +234,7 @@ export function runStrategy(candles, params, opts = {}) {
           entryPrice = fillPrice;
           entryBar = i;
           entryAtr = pe.atr;
+          entryRisk = units * slDist; // $ at risk for the whole position
           tp1Hit = false;
           tp1HitBar = -1;
         }

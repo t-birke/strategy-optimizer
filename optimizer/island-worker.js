@@ -8,33 +8,82 @@
  * migration boundaries, where the main thread synchronizes them before
  * starting the next batch.
  *
- * Fitness: single full-period evaluation with flat position sizing.
- * Flat sizing makes every trade independent of prior P&L, so metrics
- * like win rate, profit factor, and drawdown are inherently consistent
- * across any time slice — no window evaluation needed.
+ * Two fitness paths:
  *
- * Formula: profitFactor * sqrt(trades) * (1 - ddPenalty)
+ *  - **Legacy mode** (default, unchanged): single full-period evaluation
+ *    with flat position sizing using the hand-coded `runStrategy`.
+ *    Score = `profitScore * (1 - ddPenalty)` after a soft trade-count
+ *    penalty. Used by the existing UI runner contract.
+ *
+ *  - **Spec mode** (when `workerData.spec` is supplied): runs `runSpec`
+ *    on the spec + a freshly-built paramSpace, then `computeFitness`
+ *    on the resulting metrics + the spec's `fitness` config. Score is
+ *    `fit.score * 1000` (or `-1000` when eliminated by a hard gate),
+ *    keeping it in roughly the same magnitude as the legacy fitness so
+ *    elite-preservation heuristics behave the same.
  */
 
 import { parentPort, workerData } from 'worker_threads';
 import { GaIsland, best } from 'ga-island';
 import { runStrategy } from '../engine/strategy.js';
-import {
-  PARAMS, randomIndividual, crossover,
-  enforceConstraints, clamp, geneKey, applyFrozen,
-} from './params.js';
+import { runSpec } from '../engine/runtime.js';
+import { computeFitness } from './fitness.js';
+import { validateSpec } from '../engine/spec.js';
+import { buildParamSpace } from './param-space.js';
+import { unpackHtfPayloads } from './htf-transport.js';
+import * as registry from '../engine/blocks/registry.js';
+import * as legacyParams from './params.js';
 
 const {
-  candleBuffer, candleLength, tradingStartBar,
+  candleBuffer, candleLength, candleCols, tradingStartBar,
+  fitnessStartBar = 0,
   populationSize,
   islands: islandConfigs,   // [{ islandIdx, mutationRate, perGeneMut }, ...]
   minTrades,
   maxDrawdownPct,
   autoHyperEnabled = true,
+  // Spec-mode payload. When `specMode` is true the worker rebuilds the
+  // paramSpace from `spec` and uses runSpec + computeFitness. Otherwise
+  // it falls through to the legacy runStrategy path verbatim.
+  specMode = false,
+  spec: rawSpec = null,
+  periodYears = null,
+  baseTfMin = null,
+  // Phase 2.6 — HTF payloads from the runner. Each entry is
+  // { tfMin, tfMs, htfLen, candleBuffer, htfBarIndexBuffer } where
+  // candleBuffer is a 6-col Float64 SAB [ts|open|high|low|close|volume]
+  // and htfBarIndexBuffer is a Uint32 SAB of length candleLength (base).
+  htfPayloads = [],
+  // Persistent fitness-cache preload (spec mode only). Plain object of
+  // geneKey → { fitness, metrics }. Each island hydrates its own Map
+  // from this on startup so a re-run of the same spec on the same data
+  // starts warm.
+  fitnessCachePreload = null,
 } = workerData;
 
 const MIN_TRADES = minTrades ?? 30;
 const MAX_DD_PCT = maxDrawdownPct ?? 0.5;
+
+// ─── Mode-dependent param-space + ops ──────────────────────
+// Both branches expose the same shape so the rest of the file (mutation,
+// crossover, hypermutation, frozen-gene handling) is mode-agnostic.
+let spec = null;
+let paramSpace = null;
+let PARAMS, randomIndividual, crossover, enforceConstraints, clamp, geneKey, applyFrozen;
+
+if (specMode) {
+  if (!rawSpec) throw new Error('island-worker: specMode=true requires workerData.spec');
+  // Each Worker has a fresh module graph, so the block registry is empty
+  // even if the runner already populated its own copy on the main thread.
+  // Load it here BEFORE validateSpec — otherwise every block reference
+  // in the spec fails the "block not registered" check.
+  await registry.ensureLoaded();
+  spec       = validateSpec(rawSpec);
+  paramSpace = buildParamSpace(spec);
+  ({ PARAMS, randomIndividual, crossover, enforceConstraints, clamp, geneKey, applyFrozen } = paramSpace);
+} else {
+  ({ PARAMS, randomIndividual, crossover, enforceConstraints, clamp, geneKey, applyFrozen } = legacyParams);
+}
 
 // ─── Hypermutation tuning ──────────────────────────────────
 // A "catastrophe" mechanism that fights premature convergence:
@@ -51,14 +100,56 @@ const HYPER_ELITE_COUNT     = 3;     // top individuals preserved
 const HYPER_IMMIGRANT_PCT   = 0.25;  // bottom % replaced with random
 const DIVERSITY_THRESHOLD   = 0.04;  // below this (normalized stdev) → auto-trigger
 
-// Reconstruct candle Float64Array views from SharedArrayBuffer (zero-copy)
-const candles = {
-  open:   new Float64Array(candleBuffer, 0, candleLength),
-  high:   new Float64Array(candleBuffer, candleLength * 8, candleLength),
-  low:    new Float64Array(candleBuffer, candleLength * 2 * 8, candleLength),
-  close:  new Float64Array(candleBuffer, candleLength * 3 * 8, candleLength),
-  volume: new Float64Array(candleBuffer, candleLength * 4 * 8, candleLength),
-};
+// Reconstruct candle Float64Array views from SharedArrayBuffer (zero-copy).
+//
+// Layout depends on mode:
+//   legacy (5 cols): [open|high|low|close|volume]
+//   spec   (6 cols): [ts|open|high|low|close|volume]
+//
+// The spec-mode runtime needs `ts` for regime detection / period reporting;
+// the legacy runtime never reads ts so we don't pay for it there.
+const cols = candleCols ?? (specMode ? 6 : 5);
+const colOff = (i) => candleLength * i * 8;
+const candles = specMode
+  ? {
+      ts:     new Float64Array(candleBuffer, colOff(0), candleLength),
+      open:   new Float64Array(candleBuffer, colOff(1), candleLength),
+      high:   new Float64Array(candleBuffer, colOff(2), candleLength),
+      low:    new Float64Array(candleBuffer, colOff(3), candleLength),
+      close:  new Float64Array(candleBuffer, colOff(4), candleLength),
+      volume: new Float64Array(candleBuffer, colOff(5), candleLength),
+    }
+  : {
+      open:   new Float64Array(candleBuffer, colOff(0), candleLength),
+      high:   new Float64Array(candleBuffer, colOff(1), candleLength),
+      low:    new Float64Array(candleBuffer, colOff(2), candleLength),
+      close:  new Float64Array(candleBuffer, colOff(3), candleLength),
+      volume: new Float64Array(candleBuffer, colOff(4), candleLength),
+    };
+
+// Phase 2.6 — Reassemble HTF candles + htfBarIndex from SAB payloads into
+// the `bundle.htfs[tfMin]` shape `engine/data-bundle.js` produces. Views
+// are zero-copy over the SABs; the runtime reads from them directly.
+const specHtfs = specMode ? unpackHtfPayloads(htfPayloads) : {};
+
+// Spec-mode bundle is built once and shared across every fitness call.
+// runSpec only reads from `bundle.base` / `bundle.htfs` arrays (no
+// mutation), so reuse is safe. tradingStartBar tells the engine which
+// bar marks "actual trading start" — earlier bars are warmup-only.
+const specBundle = specMode
+  ? {
+      base: candles,
+      htfs: specHtfs,
+      tradingStartBar,
+      periodYears: periodYears ?? 0,
+      baseTfMin:   baseTfMin ?? undefined,
+      baseTfMs:    baseTfMin != null ? baseTfMin * 60_000 : undefined,
+    }
+  : null;
+
+// GA train/test split: fitnessStartBar is passed via opts to runSpec.
+// When > 0, fitness metrics accumulate only for trades exiting after this bar.
+const specRunOpts = fitnessStartBar > 0 ? { fitnessStartBar } : {};
 
 /**
  * Build an isolated island runtime: its own GaIsland, fitness cache,
@@ -66,6 +157,19 @@ const candles = {
  */
 function createIsland(cfg) {
   const fitnessCache = new Map();
+  // Hydrate from the persistent cache preload (spec mode only). The
+  // preload is an Object<geneKey, {fitness, metrics}>; we copy it into
+  // the per-island Map so cache hits work the same as freshly-evaluated
+  // entries. Identical entries land in every island on this worker —
+  // that's intentional: islands are independent populations and may
+  // evaluate disjoint genes, but on cache-hit the answer is identical.
+  if (specMode && fitnessCachePreload && typeof fitnessCachePreload === 'object') {
+    for (const [k, v] of Object.entries(fitnessCachePreload)) {
+      if (v && typeof v === 'object' && typeof v.fitness === 'number') {
+        fitnessCache.set(k, v);
+      }
+    }
+  }
   // Gene-knockout mask for this island. All islands on the same planet
   // share one mask (set in runner.js). Frozen genes are held constant
   // for every individual here — random init, mutation, crossover, and
@@ -93,6 +197,45 @@ function createIsland(cfg) {
 
     state.evalCount++;
 
+    // ── Spec mode: runSpec + computeFitness ──
+    if (specMode) {
+      let m;
+      try {
+        m = runSpec({ spec, paramSpace, bundle: specBundle, gene, opts: specRunOpts });
+      } catch (err) {
+        // A spec-eval crash (bad gene values that slip past constraints,
+        // missing block prepare, etc.) is treated as the worst possible
+        // outcome rather than killing the worker.
+        const score = -10000;
+        fitnessCache.set(key, { fitness: score, metrics: { error: err.message } });
+        return score;
+      }
+      if (!m || m.error) {
+        fitnessCache.set(key, { fitness: -10000, metrics: m || {} });
+        return -10000;
+      }
+      const fit = computeFitness({ metrics: m, fitnessConfig: spec.fitness });
+      // Map computeFitness's [0, 1] to [0, 1000] so it lives in roughly
+      // the same magnitude as the legacy fitness, keeping ga-island's
+      // elite-preservation heuristics behaving the same. Eliminated genes
+      // get a strongly-negative sentinel so they sort below every legitimate
+      // gene without colliding with the legacy soft-penalty band ([-5000,
+      // -1000]).
+      const score = fit.eliminated ? -10000 : fit.score * 1000;
+      // Stamp fitness diagnostics onto the metrics for the runner's later
+      // top-results assembly (so UIs can show "eliminated by which gate").
+      m._fitness = {
+        score:        fit.score,
+        eliminated:   fit.eliminated,
+        gatesFailed:  fit.gatesFailed,
+        breakdown:    fit.breakdown,
+        ...(fit.reason ? { reason: fit.reason } : {}),
+      };
+      fitnessCache.set(key, { fitness: score, metrics: m });
+      return score;
+    }
+
+    // ── Legacy mode (unchanged) ──
     const m = runStrategy(candles, gene, { tradingStartBar, flatSizing: true });
 
     if (!m || m.error) {
@@ -371,7 +514,8 @@ parentPort.on('message', async (msg) => {
     }
 
     case 'get_results': {
-      // One `results` message per owned island
+      // One `results` message per owned island (without cache snapshot —
+      // the per-worker delta is sent separately below to avoid OOM).
       for (const [islandIdx, island] of islands) {
         const b = best(island.ga.options);
         const entry = island.fitnessCache.get(geneKey(b.gene));
@@ -390,6 +534,24 @@ parentPort.on('message', async (msg) => {
           evalCount: island.state.evalCount,
           cacheSize: island.fitnessCache.size,
         });
+      }
+
+      // Spec mode: merge all islands' NEW entries (not in the preload)
+      // into ONE delta snapshot per worker. The old approach sent a full
+      // cache snapshot per island — with a 50K-entry preload and 96
+      // islands that's ~3.8 GB of structured-clone data hitting the main
+      // thread's heap simultaneously, causing an OOM crash. Sending only
+      // the delta keeps the message size proportional to actual new work.
+      if (specMode) {
+        const delta = {};
+        for (const [, island] of islands) {
+          for (const [k, v] of island.fitnessCache.entries()) {
+            if (!fitnessCachePreload || !(k in fitnessCachePreload)) {
+              delta[k] = v;
+            }
+          }
+        }
+        parentPort.postMessage({ type: 'cache_delta', delta });
       }
       break;
     }
