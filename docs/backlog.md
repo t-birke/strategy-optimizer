@@ -249,13 +249,18 @@ runner and walk-forward. **All 6 verification gates green**:
 
 ---
 
-## 3. Phase 3 — Block library expansion
+## 3. Phase 3 — Block library expansion ✅ COMPLETE
 
 **Goal:** enough blocks to express a reasonable breadth of strategies without
 writing new blocks for each one. **Scoped version** — session-dependent
 blocks and new exit blocks are punted to Phase 7 (Prepare Real World
 Launch) so Phase 3 closes as a coherent unit without unblocking the
 generic-exit-Pine-codegen refactor.
+
+**Delivery summary:** 27 total registered blocks (14 → 27 over Phase 3),
+4 new indicators, 1 new lookahead harness, 1 new per-block gate script.
+All 633 assertions green. Runtime filter contract extended (additive)
+to pass `regimeLabel` context, enabling `regimeGate`.
 
 ### 3.A Indicator expansion
 New entries in `engine/indicators.js` + indicator-cache dispatcher:
@@ -308,6 +313,21 @@ New:
 — see §7 for the full list and rationale. The shared dependency is the
 generic-exit-Pine-codegen refactor; lumping them together avoids
 half-shipping an expansion.
+
+**Exit criterion for Phase 3 — met 2026-04-17**:
+- Library grew from 14 → 27 registered blocks.
+- 4 new indicators (`highest`, `lowest`, `adx`, `vwap`) registered.
+- Runtime filter contract extended (additive 5th arg `ctx={regimeLabel}`)
+  so filters can consult regime without duplicating its computation.
+- Lookahead harness + full per-block gate script shipped.
+- All 7 verification gates green:
+  - `fitness-check`: 109/109
+  - `pine-wundertrading-check`: 192/192
+  - `walk-forward-check`: 35/35
+  - `runner-spec-mode-check`: 21/21
+  - `fitness-cache-check`: 41/41
+  - `runner-htf-check`: 49/49
+  - `block-library-check`: 633/633 (new)
 
 ---
 
