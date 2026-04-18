@@ -25,12 +25,10 @@
 
 import { parentPort, workerData } from 'worker_threads';
 import { GaIsland, best } from 'ga-island';
-import { runStrategy } from '../engine/strategy.js';
-import { runSpec } from '../engine/runtime.js';
-import { computeFitness } from './fitness.js';
 import { validateSpec } from '../engine/spec.js';
 import { buildParamSpace } from './param-space.js';
 import { unpackHtfPayloads } from './htf-transport.js';
+import { evaluateGene } from './evaluate-gene.js';
 import * as registry from '../engine/blocks/registry.js';
 import * as legacyParams from './params.js';
 
@@ -191,75 +189,27 @@ function createIsland(cfg) {
     currentPerGeneMut: cfg.perGeneMut,
   };
 
+  // Shared deps object for evaluateGene — fixed across all calls on this
+  // island. Constructed once in createIsland so the hot-path call stays
+  // a single function invocation.
+  //
+  // NOTE: `bundleOverride` is NOT set here. The island's cache is keyed
+  // by geneKey alone, so callers that need NTO (Phase 6.2) override
+  // the bundle must also bypass this closure's caching and compose
+  // their own (gene, variantId) → result map. See Phase 6.0.2.
+  const evalDeps = {
+    specMode,
+    spec, paramSpace, specBundle, specRunOpts,
+    candles, tradingStartBar,
+    minTrades: MIN_TRADES, maxDdPct: MAX_DD_PCT,
+  };
+
   function fitness(gene) {
     const key = geneKey(gene);
     if (fitnessCache.has(key)) return fitnessCache.get(key).fitness;
-
     state.evalCount++;
-
-    // ── Spec mode: runSpec + computeFitness ──
-    if (specMode) {
-      let m;
-      try {
-        m = runSpec({ spec, paramSpace, bundle: specBundle, gene, opts: specRunOpts });
-      } catch (err) {
-        // A spec-eval crash (bad gene values that slip past constraints,
-        // missing block prepare, etc.) is treated as the worst possible
-        // outcome rather than killing the worker.
-        const score = -10000;
-        fitnessCache.set(key, { fitness: score, metrics: { error: err.message } });
-        return score;
-      }
-      if (!m || m.error) {
-        fitnessCache.set(key, { fitness: -10000, metrics: m || {} });
-        return -10000;
-      }
-      const fit = computeFitness({ metrics: m, fitnessConfig: spec.fitness });
-      // Map computeFitness's [0, 1] to [0, 1000] so it lives in roughly
-      // the same magnitude as the legacy fitness, keeping ga-island's
-      // elite-preservation heuristics behaving the same. Eliminated genes
-      // get a strongly-negative sentinel so they sort below every legitimate
-      // gene without colliding with the legacy soft-penalty band ([-5000,
-      // -1000]).
-      const score = fit.eliminated ? -10000 : fit.score * 1000;
-      // Stamp fitness diagnostics onto the metrics for the runner's later
-      // top-results assembly (so UIs can show "eliminated by which gate").
-      m._fitness = {
-        score:        fit.score,
-        eliminated:   fit.eliminated,
-        gatesFailed:  fit.gatesFailed,
-        breakdown:    fit.breakdown,
-        ...(fit.reason ? { reason: fit.reason } : {}),
-      };
-      fitnessCache.set(key, { fitness: score, metrics: m });
-      return score;
-    }
-
-    // ── Legacy mode (unchanged) ──
-    const m = runStrategy(candles, gene, { tradingStartBar, flatSizing: true });
-
-    if (!m || m.error) {
-      fitnessCache.set(key, { fitness: -10000, metrics: m || {} });
-      return -10000;
-    }
-
-    if (m.trades < 3) {
-      const score = -5000;
-      fitnessCache.set(key, { fitness: score, metrics: m });
-      return score;
-    }
-    if (m.trades < MIN_TRADES) {
-      const score = -1000 + m.trades * 10;
-      fitnessCache.set(key, { fitness: score, metrics: m });
-      return score;
-    }
-
-    const profitScore = m.netProfitPct * 100;
-    const ddRatio = m.maxDDPct > 0 ? Math.min(m.maxDDPct / MAX_DD_PCT, 1) : 0;
-    const ddPenalty = 0.3 * ddRatio * ddRatio;
-    const score = profitScore * (1 - ddPenalty);
-
-    fitnessCache.set(key, { fitness: score, metrics: m });
+    const { fitness: score, metrics } = evaluateGene(gene, evalDeps);
+    fitnessCache.set(key, { fitness: score, metrics });
     return score;
   }
 

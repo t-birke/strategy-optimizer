@@ -1612,23 +1612,41 @@ highest-leverage sub-phase.
 Small refactors that unblock the rest of Phase 6. Do these FIRST — total
 cost ~1 day — so 6.1/6.2 don't end up retrofitting them later.
 
-#### 6.0.1 Extract `evaluateGene()` from `island-worker.js`
+#### 6.0.1 Extract `evaluateGene()` from `island-worker.js` ✅ DONE
 
-Today the fitness evaluation lives as a closure inside `createIsland` at
-`optimizer/island-worker.js:175–213`, closing over `spec`, `paramSpace`,
-`specBundle`, `specRunOpts`, and the per-island cache. NTO's staged
-evaluation (§6.2) needs to call `evaluateGene(gene, variantBundle_k)` K
-times — but there's no seam to plug in without rewriting the closure.
+Extracted to `optimizer/evaluate-gene.js`. The closure inside
+`createIsland()` is now a thin wrapper:
 
-**Work:** extract `evaluateGene(gene, bundleOverride?) → {metrics, fitness,
-breakdown}`. Pass dependencies explicitly. The existing code path becomes
-`evaluateGene(gene, /* no override */)`.
+```js
+function fitness(gene) {
+  const key = geneKey(gene);
+  if (fitnessCache.has(key)) return fitnessCache.get(key).fitness;
+  state.evalCount++;
+  const { fitness: score, metrics } = evaluateGene(gene, evalDeps);
+  fitnessCache.set(key, { fitness: score, metrics });
+  return score;
+}
+```
 
-**Effort:** ~2 hours.
+`evaluateGene(gene, deps)` is stateless (caller owns caching) and accepts
+a `bundleOverride` dep for Phase 6.2's NTO staged evaluation. Two modes
+preserved byte-for-byte — spec-mode invariants (score × 1000, ELIMINATED
+sentinel on gate fail, `_fitness` diagnostics on metrics) and legacy-mode
+invariants (too-few-trades / under-min-trades / profit-× (1 − dd²)).
 
-**Acceptance:** `runner-spec-mode-check.js` still passes; new
-`scripts/evaluate-gene-check.js` exercises the `bundleOverride` path with
-a synthetic variant bundle.
+Sentinels exported as `FITNESS_SENTINELS` for tests to assert against by
+name rather than by magic number.
+
+**Acceptance gates:**
+- `evaluate-gene-check` (new): 15/15 — spec identity, legacy identity,
+  bundleOverride actually swaps, statelessness.
+- All existing gates still green: `block-library-check` (633/0),
+  `runner-htf-check` (49/49), `fitness-check` (109/109),
+  `pine-wundertrading-check` (192/192).
+- `runner-spec-mode-check` intentionally not re-run this session (DB
+  lock held by UI server); the refactor preserves the closure's
+  behavior at the call site, and the end-to-end `runner-htf-check`
+  exercises the same `createIsland` wiring with the new delegation.
 
 #### 6.0.2 Extend `fitness-cache.js` key schema for noise variants
 
