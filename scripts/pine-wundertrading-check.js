@@ -193,13 +193,29 @@ console.log('\n[1] Codegen output — full spec (TPs + SL + moveToBreakeven)');
   assertTrue(`${activeTranches.length} active tranche(s) in the gene`,
     activeTranches.length > 0);
 
-  for (const { n, mult, pct } of activeTranches) {
+  for (const { n, mult } of activeTranches) {
     assertTrue(`TP${n} price formula uses mult ${mult}`,
       src.includes(`close + wt_atr_tp * ${mult}`) &&
       src.includes(`close - wt_atr_tp * ${mult}`));
-    const frac = (pct / 100).toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
-    assertTrue(`TP${n} portfolio fraction = ${frac}`,
-      src.includes(`"portfolio":${frac}`));
+  }
+
+  // Wundertrading bug-fix regression — the takeProfits portfolio values
+  // in the emitted JSON MUST sum to exactly 1.0 or WT rejects the signal
+  // ("Take profits 'portfolio' values SUM must be equal to 1"). Previously
+  // we emitted raw `pct/100`, producing sums like 0.7 on specs where
+  // tp1+tp2+tp3 ≠ 100. Now the emitter normalizes to sum=1.0 with
+  // last-tranche-carry so 0.1429 + 0.7143 + 0.1428 = 1.0000 exactly.
+  const tpLine = src.split('\n').find(l => l.includes('"takeProfits":['));
+  assertTrue('takeProfits line found', !!tpLine);
+  if (tpLine) {
+    const portfolioValues = [...tpLine.matchAll(/"portfolio":([\d.]+)/g)]
+      .map(m => parseFloat(m[1]));
+    assertTrue(`portfolio values count matches active tranches (${portfolioValues.length})`,
+      portfolioValues.length === activeTranches.length);
+    const sum = portfolioValues.reduce((s, v) => s + v, 0);
+    assertTrue(`portfolio values sum to 1.0 (got ${sum})`,
+      Math.abs(sum - 1.0) < 1e-9,
+      `values: ${portfolioValues.join(',')} sum=${sum}`);
   }
 
   // Verify no INACTIVE tranches are emitted.

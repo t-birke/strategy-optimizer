@@ -724,11 +724,36 @@ export function generateEntryAlertsPine({ spec, hydrated, meta = {}, title: titl
     push(`    string s_order = ',"orderType":"market","amountPerTradeType":"percents","amountPerTrade":' + str.tostring(i_posSize) + ',"leverage":' + str.tostring(i_leverage)`);
 
     if (wt_tranches.length > 0) {
+      // Wundertrading requires the sum of tranche "portfolio" fractions to
+      // equal EXACTLY 1.0 — their validator rejects signals where the sum
+      // is even slightly off (they treat it as "didn't cover 100% of the
+      // position, unsafe"). Emitting raw `pct/100` is wrong here: a spec
+      // with tp1/2/3 = 10/50/10 sums to 0.7, WT bounces the signal.
+      //
+      // Normalize to sum = 1.0 at codegen time (same transformation the
+      // strategy-mode codegen already applies for qty_percent — see the
+      // section below). Round to 4 decimals, then carry the rounding
+      // residue into the last tranche so the emitted literals sum to
+      // exactly 1.0000. Matches the runtime's scale-out semantics:
+      // each tranche takes `pct_i / sum(pct)` of the original position.
+      const pctSum = wt_tranches.reduce((s, t) => s + t.pct, 0);
+      const fracs = wt_tranches.map(t => (pctSum > 0 ? t.pct / pctSum : 0));
+      // Round every fraction to 4 decimals except the last — the last one
+      // gets the residue so the total is exactly 1.0000 after stringification.
+      const round4 = (v) => Math.round(v * 10000) / 10000;
+      let runningSum = 0;
+      const rounded = fracs.map((f, i) => {
+        if (i === fracs.length - 1) return round4(Math.max(0, 1 - runningSum));
+        const r = round4(f);
+        runningSum += r;
+        return r;
+      });
+
       let tpLine = `    string s_tp = ',"takeProfits":['`;
       for (let i = 0; i < wt_tranches.length; i++) {
-        const { n, pct } = wt_tranches[i];
+        const { n } = wt_tranches[i];
         if (i > 0) tpLine += ` + ','`;
-        tpLine += ` + '{"price":' + str.tostring(tp${n}, "#.####") + ',"portfolio":${formatFrac(pct / 100)}}'`;
+        tpLine += ` + '{"price":' + str.tostring(tp${n}, "#.####") + ',"portfolio":${formatFrac(rounded[i])}}'`;
       }
       tpLine += ` + ']'`;
       push(tpLine);
