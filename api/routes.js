@@ -1129,6 +1129,15 @@ router.get('/api/defaults', (_req, res) => {
       weights: { ...DEFAULT_FITNESS.weights },
       caps:    { ...DEFAULT_FITNESS.caps },
       gates:   { ...DEFAULT_FITNESS.gates },
+      // Phase 6.1 — expose the robustness default so the spec editor
+      // can read `enabled` (and eventually surface caps/nSamples if we
+      // add advanced controls). Shallow clone preserves the freeze-ness
+      // only on the top level, which is what the UI needs.
+      robustness: {
+        enabled:  DEFAULT_FITNESS.robustness.enabled,
+        caps:     { ...DEFAULT_FITNESS.robustness.caps },
+        nSamples: { ...DEFAULT_FITNESS.robustness.nSamples },
+      },
     },
     walkForward: { ...DEFAULT_WALK_FORWARD },
   });

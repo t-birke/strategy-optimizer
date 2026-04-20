@@ -380,6 +380,21 @@
             <input type="number" id="spec-fitness-gate-wfemin" min="0" max="1" step="0.05" value="0.5" style="width:90px">
             <span id="spec-fitness-gate-wfemin-def" style="font-size:11px;color:#6e7681;margin-left:8px"></span>
           </div>
+
+          <!--
+            Phase 6.1 — Robustness multiplier. Off by default; flipping
+            this on enables the five-term post-hoc robustness gate
+            (MC-DD, bootstrap P10, randomized OOS, param CoV,
+            adversarial split) that multiplies into the composite.
+            Disabled runs are byte-for-byte identical to pre-6.1 fitness.
+          -->
+          <h3 style="font-size:13px;color:#8b949e;margin:16px 0 8px 0;text-transform:uppercase;letter-spacing:0.05em">Robustness</h3>
+          <div class="form-row" style="align-items:center">
+            <label for="spec-fitness-robustness-enabled" style="width:140px"
+                   title="Phase 6.1 — multiply the composite fitness by the geomean of five post-hoc robustness terms over the trade list + walk-forward report. Off by default: pre-6.1 specs run with zero behavior change. When on, the runner logs the winner's per-term scores and the run-detail page displays them.">Enable</label>
+            <input type="checkbox" id="spec-fitness-robustness-enabled" style="width:16px;height:16px;accent-color:#3fb950">
+            <span style="font-size:12px;color:#8b949e;margin-left:8px">Opt-in gate that rewards robust strategies over lucky curve fits</span>
+          </div>
         </div>
       </div>
 

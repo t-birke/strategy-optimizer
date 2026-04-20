@@ -3493,6 +3493,12 @@ function readFitnessFromUi() {
   };
   const round2 = (n) => Math.round(n * 100) / 100;
   const d = fitnessDefaults; // module-level cache, see loadFitnessDefaults
+  // Phase 6.1 — robustness is the only field that's a boolean (a
+  // checkbox, not a number). `readBool` mirrors `numOr`/`intOr` style.
+  const readBool = (id, fallback) => {
+    const el = document.getElementById(id);
+    return el ? !!el.checked : !!fallback;
+  };
   return {
     weights: {
       pf:  round2(numOr('spec-fitness-w-pf',  d.weights.pf)),
@@ -3508,6 +3514,13 @@ function readFitnessFromUi() {
       worstRegimePfFloor: numOr('spec-fitness-gate-regimepf',  d.gates.worstRegimePfFloor),
       wfeMin:             numOr('spec-fitness-gate-wfemin',    d.gates.wfeMin),
     },
+    // Phase 6.1 — robustness multiplier. Only emit the enabled flag;
+    // caps and nSamples are covered by spec.js DEFAULT_FITNESS.robustness
+    // and only need to appear in the saved JSON if the user overrode
+    // them (no UI for that yet — advanced users edit JSON directly).
+    robustness: {
+      enabled: readBool('spec-fitness-robustness-enabled', d.robustness?.enabled),
+    },
   };
 }
 
@@ -3522,6 +3535,10 @@ let fitnessDefaults = {
   weights: { pf: 0.5, dd: 0.3, ret: 0.2 },
   caps:    { pf: 4.0, ret: 2.0 },
   gates:   { minTradesPerWindow: 30, worstRegimePfFloor: 1.0, wfeMin: 0.5 },
+  // Phase 6.1 — robustness defaults (mirrors engine/spec.js DEFAULT_FITNESS.robustness).
+  // Only `enabled` is user-facing in the editor today; caps/nSamples are
+  // filled in server-side by `normalizeSpec`.
+  robustness: { enabled: false },
 };
 
 /**
@@ -3554,6 +3571,8 @@ async function loadFitnessDefaults() {
  */
 function setFitnessInputs(fit) {
   const put = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+  // Phase 6.1 — boolean checkboxes need `.checked`, not `.value`.
+  const putBool = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
   put('spec-fitness-w-pf',  fit.weights.pf);
   put('spec-fitness-w-dd',  fit.weights.dd);
   put('spec-fitness-w-ret', fit.weights.ret);
@@ -3562,6 +3581,7 @@ function setFitnessInputs(fit) {
   put('spec-fitness-gate-mintrades', fit.gates.minTradesPerWindow);
   put('spec-fitness-gate-regimepf',  fit.gates.worstRegimePfFloor);
   put('spec-fitness-gate-wfemin',    fit.gates.wfeMin);
+  putBool('spec-fitness-robustness-enabled', fit.robustness?.enabled);
   updateWeightLabels();
 }
 
@@ -3677,6 +3697,9 @@ function renderSpecPreview() {
  'spec-fitness-w-pf',  'spec-fitness-w-dd',  'spec-fitness-w-ret',
  'spec-fitness-cap-pf', 'spec-fitness-cap-ret',
  'spec-fitness-gate-mintrades', 'spec-fitness-gate-regimepf', 'spec-fitness-gate-wfemin',
+ // Phase 6.1: robustness toggle re-renders the preview so the user
+ // sees `"robustness": { "enabled": true }` land in the JSON live.
+ 'spec-fitness-robustness-enabled',
 ].forEach(id => {
   const el = document.getElementById(id);
   if (!el) return;
@@ -3937,10 +3960,21 @@ function loadSpecIntoEditor(spec, filename = null) {
         worstRegimePfFloor: fit.gates?.worstRegimePfFloor ?? 1.0,
         wfeMin:             fit.gates?.wfeMin ?? 0.5,
       },
+      // Phase 6.1 — respect the loaded spec's robustness.enabled, falling
+      // back to false for specs authored before the feature existed.
+      robustness: { enabled: fit.robustness?.enabled === true },
     });
     // Preserve fields that the UI doesn't have controls for yet
     // (gaOosRatio, frequencyTarget, etc.) so they survive a round-trip.
-    const knownKeys = new Set(['weights', 'caps', 'gates']);
+    //
+    // `robustness` is intentionally in the known set even though the UI
+    // only exposes `enabled` today — on save, readFitnessFromUi emits
+    // only `{enabled}` and the server's `normalizeSpec` fills in default
+    // caps/nSamples. Users who hand-edit `caps.robustDdPct` should NOT
+    // round-trip through the UI save button; their custom values would
+    // be replaced with defaults. (Future work: surface caps as advanced
+    // controls in the editor so hand-edits survive the UI.)
+    const knownKeys = new Set(['weights', 'caps', 'gates', 'robustness']);
     for (const k of Object.keys(fit)) {
       if (!knownKeys.has(k)) loadedFitnessExtras[k] = fit[k];
     }

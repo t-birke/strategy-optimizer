@@ -239,6 +239,19 @@ async function main() {
           new RegExp(`<label[^>]*title="[^"]{20,}"[^>]*>\\s*${lbl}\\s*<\\/label>`).test(fitSlice));
       }
 
+      // Phase 6.1 — Robustness section with the enable checkbox. A
+      // dedicated <h3>Robustness</h3> header + a checkbox input whose
+      // id matches the one readFitnessFromUi reads. Tooltip on the
+      // label must explain what the multiplier does (≥ 20 chars
+      // matches the convention used for every other fitness label).
+      assertTrue('Robustness <h3> header present',
+        /<h3[^>]*>\s*Robustness\s*<\/h3>/.test(fitSlice));
+      assertTrue('robustness checkbox input present',
+        /<input[^>]*id="spec-fitness-robustness-enabled"[^>]*type="checkbox"/.test(fitSlice) ||
+        /<input[^>]*type="checkbox"[^>]*id="spec-fitness-robustness-enabled"/.test(fitSlice));
+      assertTrue('robustness Enable label has title tooltip',
+        /<label[^>]*for="spec-fitness-robustness-enabled"[^>]*title="[^"]{20,}"[^>]*>\s*Enable\s*<\/label>/.test(fitSlice));
+
       // WFE min in particular: make sure the tooltip actually spells
       // out the acronym. If it ever drifts back to just "WFE" with no
       // explanation, flag it — this is the knob users were most
@@ -427,6 +440,9 @@ async function main() {
       'spec-fitness-w-pf', 'spec-fitness-w-dd', 'spec-fitness-w-ret',
       'spec-fitness-cap-pf', 'spec-fitness-cap-ret',
       'spec-fitness-gate-mintrades', 'spec-fitness-gate-regimepf', 'spec-fitness-gate-wfemin',
+      // Phase 6.1 — robustness checkbox is in the same re-render loop
+      // so the JSON preview updates live when the user toggles it.
+      'spec-fitness-robustness-enabled',
     ]) {
       assertTrue(`'${id}' is wired to renderSpecPreview`,
         new RegExp(`'${id}'`).test(js));
@@ -438,6 +454,18 @@ async function main() {
     // Weight sliders update the live value labels on input.
     assertTrue('weight sliders update label on input',
       /spec-fitness-w-(pf|dd|ret)[\s\S]{0,300}updateWeightLabels/.test(js));
+
+    // ── Phase 6.1 — Robustness toggle plumbing ──
+    // readFitnessFromUi must emit a `robustness.enabled` key so the
+    // saved JSON contains the boolean; setFitnessInputs must handle
+    // the checkbox via `.checked` (not `.value`) on load.
+    assertTrue('readFitnessFromUi emits robustness.enabled',
+      /function\s+readFitnessFromUi\b[\s\S]{0,3000}robustness\s*:\s*\{\s*enabled\s*:/.test(js));
+    assertTrue('setFitnessInputs handles robustness checkbox via .checked',
+      /function\s+setFitnessInputs\b[\s\S]{0,2000}putBool\s*\(\s*['"]spec-fitness-robustness-enabled['"]/.test(js));
+    // Loader: openSpec / load path reads robustness from loaded spec.
+    assertTrue('load path syncs robustness.enabled into setFitnessInputs',
+      /setFitnessInputs\(\s*\{[\s\S]{0,600}robustness\s*:\s*\{\s*enabled\s*:/.test(js));
   }
 
   // ── 3. Server contract: GET /api/blocks shape matches editor reads ──
