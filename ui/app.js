@@ -1625,6 +1625,11 @@ window.openRunDetail = async (id) => {
     renderWalkForwardReport(run.wf_report_json);
     renderRegimeBreakdown(run.regime_breakdown_json, run.fitness_breakdown_json);
 
+    // Seed the custom-window date pickers with the run's original dates
+    // so Recalculate defaults to the same window the GA used. The user
+    // can override either picker to extend lookback or narrow the slice.
+    initRecalcDatePickers({ ...run, config: cfg });
+
     // Render parameter cards. Spec-mode genes use qualified-ID keys
     // (`emaTrend.main.emaFast`) rather than the flat legacy keys in
     // PARAM_LABELS, so looking up by legacy key returns null for every
@@ -2388,14 +2393,26 @@ window.recalcRun = async () => {
   const btn = document.getElementById('btn-recalc');
   const status = document.getElementById('recalc-status');
   const metricsDiv = document.getElementById('recalc-metrics');
+  const windowInfo = document.getElementById('recalc-window-info');
   btn.disabled = true;
   status.textContent = 'Recalculating…';
   metricsDiv.innerHTML = '';
+  if (windowInfo) windowInfo.textContent = '';
   document.getElementById('detail-trades-card').style.display = 'none';
   document.getElementById('detail-periodic-card').style.display = 'none';
 
+  // Custom-window picker values. Empty-string → server falls back to the
+  // run's own startDate / endDate. Both-dates-set → server uses those.
+  // The input type="date" emits YYYY-MM-DD which the server parses
+  // directly into millis via `new Date(s).getTime()`.
+  const startEl = document.getElementById('recalc-start-date');
+  const endEl   = document.getElementById('recalc-end-date');
+  const qs = new URLSearchParams({ sizing: detailSizing });
+  if (startEl?.value) qs.set('startDate', startEl.value);
+  if (endEl?.value)   qs.set('endDate',   endEl.value);
+
   try {
-    const res = await fetch(`/api/runs/${detailRunId}/trades?sizing=${detailSizing}`);
+    const res = await fetch(`/api/runs/${detailRunId}/trades?${qs.toString()}`);
     const data = await res.json();
     if (!res.ok) throw new Error(data.error);
 
@@ -2413,6 +2430,18 @@ window.recalcRun = async () => {
       <div style="font-size:15px;font-weight:700">${v}</div>
     </div>`).join('');
 
+    // Surface the effective window so the user can see they did get the
+    // extended range (e.g. DB has data back to 2020 even if the run was
+    // trained on 2022+). Also flags mismatch if the server clamped the
+    // start because no candles exist earlier.
+    if (windowInfo && data.effectiveWindow) {
+      const w = data.effectiveWindow;
+      const customized = (startEl?.value && startEl.value !== runDefaults.startDate) ||
+                         (endEl?.value   && endEl.value   !== runDefaults.endDate);
+      const tag = customized ? ' · custom window' : '';
+      windowInfo.textContent = `${w.startDate} → ${w.endDate || 'live'} · ${w.candleBars.toLocaleString()} bars${tag}`;
+    }
+
     detailTradeList = data.tradeList ?? [];
     status.textContent = `Done — ${detailTradeList.length} trade executions (${data.sizing})`;
     renderPeriodicPerformance(data.equity ?? [], data.ohlc ?? [], data.sizing);
@@ -2424,6 +2453,51 @@ window.recalcRun = async () => {
     btn.disabled = false;
   }
 };
+
+/**
+ * Remember the run's original (startDate, endDate) so the date pickers
+ * can default to them on open and the Reset button can restore them.
+ * Populated by openRunDetail from the run row.
+ */
+let runDefaults = { startDate: '', endDate: '' };
+
+/**
+ * Seed the custom-window date pickers with the run's original dates.
+ * Called from openRunDetail once the run metadata is in hand. Also
+ * wires the "Reset to run dates" button to restore them without
+ * needing a re-fetch.
+ */
+function initRecalcDatePickers(run) {
+  // run.start_date is always present; run.config.endDate may be null
+  // (live / open-ended run). Both inputs accept YYYY-MM-DD.
+  const toIso = (d) => {
+    if (!d) return '';
+    const t = new Date(d).getTime();
+    if (!Number.isFinite(t)) return '';
+    return new Date(t).toISOString().slice(0, 10);
+  };
+  runDefaults = {
+    startDate: toIso(run.start_date),
+    endDate:   toIso(run.config?.endDate ?? null),
+  };
+  const startEl = document.getElementById('recalc-start-date');
+  const endEl   = document.getElementById('recalc-end-date');
+  if (startEl) startEl.value = runDefaults.startDate;
+  if (endEl)   endEl.value   = runDefaults.endDate;
+}
+
+// Reset button: restore the run's original dates.
+document.addEventListener('DOMContentLoaded', () => {
+  const resetBtn = document.getElementById('btn-recalc-reset-dates');
+  if (resetBtn) {
+    resetBtn.addEventListener('click', () => {
+      const startEl = document.getElementById('recalc-start-date');
+      const endEl   = document.getElementById('recalc-end-date');
+      if (startEl) startEl.value = runDefaults.startDate;
+      if (endEl)   endEl.value   = runDefaults.endDate;
+    });
+  }
+});
 
 /**
  * Phase 4.6: Generate a Pine v5 entry-alerts indicator for the currently-

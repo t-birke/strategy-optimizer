@@ -139,6 +139,18 @@ async function main() {
       /id="detail-wf-card"[\s\S]{0,1500}<h3[^>]*title="[^"]{20,}"/.test(slice));
     assertTrue('Regime Breakdown h3 has tooltip',
       /id="detail-regime-card"[\s\S]{0,1500}<h3[^>]*title="[^"]{20,}"/.test(slice));
+
+    // Custom-window picker — extend lookback on a frozen gene without
+    // re-running the GA. Two date inputs (start + end), a reset button,
+    // and an info span that shows the effective window after recalc.
+    assertTrue('recalc-start-date input present',
+      contains(slice, 'id="recalc-start-date"') && /type="date"[^>]*id="recalc-start-date"|id="recalc-start-date"[^>]*type="date"/.test(slice));
+    assertTrue('recalc-end-date input present',
+      contains(slice, 'id="recalc-end-date"')   && /type="date"[^>]*id="recalc-end-date"|id="recalc-end-date"[^>]*type="date"/.test(slice));
+    assertTrue('btn-recalc-reset-dates button present',
+      contains(slice, 'id="btn-recalc-reset-dates"'));
+    assertTrue('recalc-window-info span present',
+      contains(slice, 'id="recalc-window-info"'));
   }
 
   // ── 2. JS wiring in app.js ───────────────────────────────────
@@ -238,6 +250,30 @@ async function main() {
     // the exact structure so a refactor doesn't silently drop it.
     assertTrue('renderRobustnessBreakdown shows score-formula hint',
       /function\s+renderRobustnessBreakdown\b[\s\S]{0,6000}base\s*×\s*freqFactor/.test(js));
+
+    // ── Custom-window recalc: JS wiring ──
+    // recalcRun reads both date inputs, adds them to the fetch URL
+    // when non-empty, and surfaces the effective window returned by
+    // the server in recalc-window-info.
+    assertTrue('recalcRun reads recalc-start-date',
+      /recalcRun[\s\S]{0,3000}getElementById\(['"]recalc-start-date['"]\)/.test(js));
+    assertTrue('recalcRun reads recalc-end-date',
+      /recalcRun[\s\S]{0,3000}getElementById\(['"]recalc-end-date['"]\)/.test(js));
+    assertTrue('recalcRun passes startDate / endDate as query params',
+      /URLSearchParams[\s\S]{0,500}(startDate|endDate)/.test(js));
+    assertTrue('recalcRun surfaces effectiveWindow from server response',
+      /effectiveWindow/.test(js));
+
+    // initRecalcDatePickers seeds the pickers with the run's defaults
+    // so Recalculate matches the original window out of the box.
+    assertTrue('defines initRecalcDatePickers helper',
+      /function\s+initRecalcDatePickers\b/.test(js));
+    assertTrue('openRunDetail calls initRecalcDatePickers',
+      /openRunDetail[\s\S]{0,5000}initRecalcDatePickers\(/.test(js));
+
+    // Reset button restores the run's original dates.
+    assertTrue('btn-recalc-reset-dates listener wired',
+      /btn-recalc-reset-dates[\s\S]{0,400}addEventListener\(\s*['"]click['"]/.test(js));
 
     // ── Winner-config helper (4.5a follow-up) ─────────────────
     //

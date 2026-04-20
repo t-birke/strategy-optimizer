@@ -134,6 +134,20 @@ async function main() {
     // replaced it altogether.
     assertTrue('legacy branch still calls runStrategy',
       /runStrategy\(\s*candles\s*,\s*run\.best_gene/.test(handler));
+
+    // ── Custom-window support ──
+    // Optional startDate / endDate query params override the run's
+    // original window so the UI can re-evaluate the frozen gene on an
+    // extended lookback or a narrower slice. Missing params fall back
+    // to the run's own dates — default behavior is preserved.
+    assertTrue('handler parses req.query.startDate',
+      /req\.query\.startDate/.test(handler));
+    assertTrue('handler parses req.query.endDate',
+      /req\.query\.endDate/.test(handler));
+    assertTrue('handler rejects start >= end with 400',
+      /startTs\s*>=\s*endTs[\s\S]{0,300}status\(400\)/.test(handler));
+    assertTrue('handler returns effectiveWindow in both branches',
+      (handler.match(/effectiveWindow:/g) || []).length >= 2);
   }
 
   // ── 2. app.js: spec-mode gene card renderer ─────────────────

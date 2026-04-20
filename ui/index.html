@@ -548,6 +548,32 @@
         <span id="recalc-status" style="font-size:13px;color:#8b949e"></span>
         <div id="recalc-metrics" style="display:flex;gap:24px;flex-wrap:wrap"></div>
       </div>
+
+      <!--
+        Custom-window picker: override the run's original (startDate, endDate)
+        to validate the frozen gene on an extended lookback or a narrower
+        slice. Leave blank to use the run's own dates (default behavior).
+        Same-symbol only — cross-symbol is a separate tool.
+      -->
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px;padding-top:12px;border-top:1px solid #21262d">
+        <span style="font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em">Custom window</span>
+        <label style="font-size:12px;color:#8b949e;display:flex;align-items:center;gap:6px">
+          From
+          <input type="date" id="recalc-start-date"
+                 style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px 8px;font-size:12px;font-family:inherit">
+        </label>
+        <label style="font-size:12px;color:#8b949e;display:flex;align-items:center;gap:6px">
+          To
+          <input type="date" id="recalc-end-date"
+                 style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px 8px;font-size:12px;font-family:inherit">
+        </label>
+        <button type="button" id="btn-recalc-reset-dates"
+                style="font-size:11px;color:#8b949e;background:transparent;border:1px solid #30363d;border-radius:6px;padding:4px 10px;cursor:pointer"
+                title="Reset to the run's original startDate / endDate">
+          Reset to run dates
+        </button>
+        <span id="recalc-window-info" style="font-size:11px;color:#6e7681;margin-left:auto"></span>
+      </div>
     </div>
 
     <!-- Periodic Performance (year / month breakdown) -->

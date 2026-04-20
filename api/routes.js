@@ -382,8 +382,27 @@ router.get('/api/runs/:id/trades', async (req, res) => {
     if (!run.best_gene) return res.status(400).json({ error: 'Run has no best gene yet' });
 
     const config = run.config || {};
-    const startTs = new Date(run.start_date).getTime();
-    const endTs = config.endDate ? new Date(config.endDate).getTime() : Infinity;
+    // Optional startDate / endDate query params override the run's
+    // original window so the UI can re-evaluate the frozen gene on an
+    // extended lookback or a different slice. When omitted, fall back
+    // to the run's own dates — the old default behavior is preserved.
+    // Invalid date strings parse to NaN, which we coerce back to the
+    // run defaults rather than propagating NaN into candle loading.
+    const parseTsOr = (s, fallback) => {
+      if (typeof s !== 'string' || s.length === 0) return fallback;
+      const t = new Date(s).getTime();
+      return Number.isFinite(t) ? t : fallback;
+    };
+    const defaultStartTs = new Date(run.start_date).getTime();
+    const defaultEndTs   = config.endDate ? new Date(config.endDate).getTime() : Infinity;
+    const startTs = parseTsOr(req.query.startDate, defaultStartTs);
+    const endTs   = parseTsOr(req.query.endDate,   defaultEndTs);
+    // Sanity: startTs must precede endTs; if the client swaps them, 400.
+    if (endTs !== Infinity && startTs >= endTs) {
+      return res.status(400).json({
+        error: `startDate must be strictly before endDate (got start=${new Date(startTs).toISOString().slice(0,10)}, end=${new Date(endTs).toISOString().slice(0,10)})`,
+      });
+    }
     const flatSizing = req.query.sizing === 'flat';
 
     // ── Spec-mode branch ────────────────────────────────────
@@ -447,6 +466,12 @@ router.get('/api/runs/:id/trades', async (req, res) => {
         tradeList: metrics.tradeList ?? [],
         ohlc,
         equity,
+        // Echo back the effective window so the UI can show it.
+        effectiveWindow: {
+          startDate: new Date(startTs).toISOString().slice(0, 10),
+          endDate:   endTs === Infinity ? null : new Date(endTs).toISOString().slice(0, 10),
+          candleBars: base.close.length,
+        },
       });
     }
 
@@ -506,6 +531,11 @@ router.get('/api/runs/:id/trades', async (req, res) => {
       tradeList: metrics.tradeList ?? [],
       ohlc,
       equity,
+      effectiveWindow: {
+        startDate: new Date(startTs).toISOString().slice(0, 10),
+        endDate:   endTs === Infinity ? null : new Date(endTs).toISOString().slice(0, 10),
+        candleBars: candles.close.length,
+      },
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
