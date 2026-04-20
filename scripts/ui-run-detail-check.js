@@ -207,6 +207,38 @@ async function main() {
     assertTrue('renderRegimeBreakdown flags trades < 5 as low-confidence',
       /function\s+renderRegimeBreakdown\b[\s\S]{0,3000}trades\s*<\s*5/.test(js));
 
+    // ── Phase 6.1 — Robustness breakdown renderer ──
+    // A secondary card rendered inside renderFitnessBreakdown that
+    // surfaces the 5 robustness terms + the geomean multiplier. Only
+    // activates when fitness_breakdown_json.breakdown.robustness is
+    // present (i.e. the run had spec.fitness.robustness.enabled=true).
+    // All 5 term labels must appear so the UI always labels the 5
+    // modules even if one term degenerates to "—".
+    assertTrue('defines renderRobustnessBreakdown helper',
+      /function\s+renderRobustnessBreakdown\b/.test(js));
+    assertTrue('renderRobustnessBreakdown returns empty string when robustness missing',
+      /function\s+renderRobustnessBreakdown\b[\s\S]{0,400}return\s+['"`]['"`]/.test(js));
+    assertTrue('renderFitnessBreakdown invokes renderRobustnessBreakdown',
+      /function\s+renderFitnessBreakdown\b[\s\S]{0,5000}renderRobustnessBreakdown\(/.test(js));
+
+    // All 5 term labels present in the robustness renderer.
+    for (const label of ['MC-DD P95', 'Bootstrap', 'Random OOS', 'Param CoV', 'Adversarial']) {
+      assertTrue(`renderRobustnessBreakdown emits "${label}" row`,
+        new RegExp(`function\\s+renderRobustnessBreakdown\\b[\\s\\S]{0,6000}['"\`]${label.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}['"\`]`).test(js));
+    }
+
+    // The multiplier chip is added to the chips row at the top of
+    // renderFitnessBreakdown when breakdown.robustness is present.
+    // Guard against regression of the "Robustness ×" chip label.
+    assertTrue('renderFitnessBreakdown emits Robustness × chip when present',
+      /function\s+renderFitnessBreakdown\b[\s\S]{0,5000}Robustness\s*×/.test(js));
+
+    // Score-formula footnote below the robustness table — helps users
+    // see WHERE the multiplier enters the composite. Regression-guard
+    // the exact structure so a refactor doesn't silently drop it.
+    assertTrue('renderRobustnessBreakdown shows score-formula hint',
+      /function\s+renderRobustnessBreakdown\b[\s\S]{0,6000}base\s*×\s*freqFactor/.test(js));
+
     // ── Winner-config helper (4.5a follow-up) ─────────────────
     //
     // Before this fix, the runs-list expand panel inlined

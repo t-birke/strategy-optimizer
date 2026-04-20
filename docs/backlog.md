@@ -1777,8 +1777,16 @@ penalized; one dimension being great cannot rescue a disastrous other.
 
 **UI:** `fitness_breakdown_json` now carries a `robustness` sub-object
 (`multiplier`, `mcDd`, `bootstrap`, `randomOos`, `paramCoV`,
-`adversarial`) when the feature is enabled. Existing UI renderer picks
-this up with a schema extension — no new card needed.
+`adversarial`) when the feature is enabled. The run-detail page renders
+it as a secondary card below the base-fitness table (see
+`renderRobustnessBreakdown` in `ui/app.js`): geomean multiplier chip at
+the top, 5-term table with raw stat + `[0,1]` score, and a score-formula
+footnote showing where the multiplier slots into composite.
+
+**Runner log line:** after walk-forward, the runner re-evaluates the
+winner with `collectTrades=true` and the fresh `wfReport`, then prints a
+one-liner with all 5 term scores — useful for calibrating `caps.*`
+without waiting for a UI refresh.
 
 **Delivered (2026-04-18):**
 

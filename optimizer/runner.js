@@ -40,6 +40,7 @@ import {
   wrapFlat,
 } from './fitness-cache.js';
 import { walkForward } from './walk-forward.js';
+import { computeFitness } from './fitness.js';
 import { runSpec } from '../engine/runtime.js';
 import { computeDataRequirements, makeHtfBarIndex } from '../engine/data-bundle.js';
 import { packHtfPayload, unpackHtfPayloads } from './htf-transport.js';
@@ -1099,6 +1100,62 @@ export async function runOptimization(config) {
     } catch (err) {
       console.warn(`[runner] Walk-forward skipped: ${err.message}`);
       wfReport = null;
+    }
+  }
+
+  // ─── Phase 6.1 — WF-aware robustness recompute on the winner ───
+  // During GA evaluation, only 3 of 5 robustness terms can score
+  // (mcDd / bootstrap / adversarial — all trade-list-dependent). The
+  // other two (paramCoV, randomOos) need the WF report which doesn't
+  // exist until AFTER the GA finishes. This block re-runs the winner's
+  // backtest with collectTrades and then calls computeFitness with
+  // wfReport so the stored fitness breakdown includes all 5 terms for
+  // the UI. ~50 ms overhead (single backtest).
+  //
+  // No-op when robustness is disabled — computeFitness returns
+  // multiplier=1 and no `breakdown.robustness` sub-object, matching
+  // the GA-time output for non-robustness runs.
+  if (specMode && spec.fitness?.robustness?.enabled && finalBest.gene) {
+    try {
+      const fullBundle = {
+        symbol, baseTfMin: timeframe, baseTfMs: timeframe * 60_000,
+        base: candles, htfs: unpackHtfPayloads(htfPayloads),
+        tradingStartBar,
+        periodYears: periodYears ?? 0,
+      };
+      const withTrades = runSpec({
+        spec, paramSpace, bundle: fullBundle, gene: finalBest.gene,
+        opts: { collectTrades: true },
+      });
+      const fit = computeFitness({
+        metrics: withTrades,
+        fitnessConfig: spec.fitness,
+        wfReport,
+      });
+      withTrades._fitness = {
+        score:        fit.score,
+        eliminated:   fit.eliminated,
+        gatesFailed:  fit.gatesFailed,
+        breakdown:    fit.breakdown,
+        ...(fit.reason ? { reason: fit.reason } : {}),
+      };
+      // Strip the trade list before persisting — the breakdown carries
+      // the useful summary forward; raw trades would balloon the run row.
+      const { tradeList: _tl, ...rest } = withTrades;
+      finalBest.metrics = rest;
+
+      const r = fit.breakdown?.robustness;
+      if (r) {
+        const f = v => (Number.isFinite(v) ? v.toFixed(3) : 'n/a');
+        console.log(
+          `[runner] Robustness (winner): multiplier=${f(r.multiplier)}  ` +
+          `mcDd=${f(r.mcDd?.term)}  bootstrap=${f(r.bootstrap?.term)}  ` +
+          `randomOos=${f(r.randomOos?.term)}  paramCoV=${f(r.paramCoV?.term)}  ` +
+          `adversarial=${f(r.adversarial?.term)}`
+        );
+      }
+    } catch (err) {
+      console.warn(`[runner] Robustness recompute failed: ${err.message}`);
     }
   }
 

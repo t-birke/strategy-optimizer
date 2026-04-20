@@ -1946,6 +1946,23 @@ function renderFitnessBreakdown(fit) {
     extras += `<div style="font-size:12px;color:#f85149;margin-top:10px;padding:8px 12px;background:#f8514916;border-left:3px solid #f85149;border-radius:4px">${fit.reason}</div>`;
   }
 
+  // Robustness multiplier (Phase 6.1): five post-hoc terms geomean'd
+  // into a single [0, 1] multiplier applied to the composite score.
+  // Only present when spec.fitness.robustness.enabled was true.
+  const robustnessBlock = renderRobustnessBreakdown(b.robustness);
+
+  // Multiplier chip (shown in the top row alongside Score / Status / Gates)
+  // when a robustness breakdown is present. Colour-coded like Score —
+  // green ≥ 0.7 (healthy), amber 0.4–0.7 (something weak), red < 0.4
+  // (at least one term is struggling).
+  const multiplierChip = b.robustness
+    ? (() => {
+        const m = typeof b.robustness.multiplier === 'number' ? b.robustness.multiplier : 0;
+        const c = m >= 0.7 ? '#3fb950' : m >= 0.4 ? '#d29922' : '#f85149';
+        return chip('Robustness ×', m.toFixed(3), c);
+      })()
+    : '';
+
   body.innerHTML = `
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">
       ${chip('Score',  score.toFixed(3), scoreColor)}
@@ -1954,6 +1971,7 @@ function renderFitnessBreakdown(fit) {
         <div style="font-size:11px;color:#8b949e;margin-bottom:4px">Gates failed</div>
         <div style="font-size:13px">${gatesHtml}</div>
       </div>
+      ${multiplierChip}
     </div>
     <table style="font-size:12px;border-collapse:collapse;min-width:320px">
       <thead><tr style="color:#8b949e;border-bottom:1px solid #30363d">
@@ -1969,8 +1987,96 @@ function renderFitnessBreakdown(fit) {
       </tbody>
     </table>
     ${extras}
+    ${robustnessBlock}
   `;
   card.style.display = '';
+}
+
+/**
+ * Phase 6.1 — Robustness breakdown renderer.
+ *
+ * Shows a secondary card with the 5 robustness terms, their raw
+ * statistic, and their [0, 1] term contribution to the geomean.
+ * A final row shows how the multiplier slots into the composite
+ * score formula for orientation.
+ *
+ * Returns an empty string when `r` is missing (i.e. robustness was
+ * disabled for this run) so the parent card just hides the section.
+ */
+function renderRobustnessBreakdown(r) {
+  if (!r || typeof r !== 'object') return '';
+
+  // Format helpers — `?.` guards so a degenerate term (e.g. paramCoV
+  // when no WF windows were available) renders cleanly as "—".
+  const fmtN   = v => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(3) : '—');
+  const fmtPct = v => (typeof v === 'number' && Number.isFinite(v) ? (v * 100).toFixed(2) + '%' : '—');
+  const termColor = v =>
+    typeof v !== 'number' ? '#8b949e'
+    : v >= 0.7 ? '#3fb950'
+    : v >= 0.4 ? '#d29922'
+    : '#f85149';
+
+  const row = (name, rawLabel, rawValue, term, title) => {
+    const c = termColor(term);
+    return `<tr title="${title}">
+      <td style="padding:4px 8px;color:#c9d1d9">${name}</td>
+      <td style="padding:4px 8px;color:#8b949e;font-size:11px">${rawLabel}</td>
+      <td style="padding:4px 8px;text-align:right;font-family:monospace">${rawValue}</td>
+      <td style="padding:4px 8px;text-align:right;font-family:monospace;color:${c}">${fmtN(term)}</td>
+    </tr>`;
+  };
+
+  // ── Raw-statistic formatters per term ──
+  const mcDdRaw = r.mcDd
+    ? `p95 DD = ${fmtPct(r.mcDd.p95DdPct)}`
+    : '—';
+  const bootstrapRaw = r.bootstrap
+    ? `p10 = ${fmtPct(r.bootstrap.p10NetPct)} / p50 = ${fmtPct(r.bootstrap.p50NetPct)}`
+    : '—';
+  const randomOosRaw = r.randomOos
+    ? (typeof r.randomOos.percentile === 'number'
+        ? `percentile = ${r.randomOos.percentile.toFixed(1)} ${r.randomOos.inCentralBand ? '(in band)' : '(outside band)'}`
+        : '—')
+    : '—';
+  const paramCoVRaw = r.paramCoV?.degenerate
+    ? 'no WF windows yet'
+    : r.paramCoV
+      ? `meanCoV = ${fmtN(r.paramCoV.meanCoV)}${r.paramCoV.worstParam ? ` · worst: ${r.paramCoV.worstParam}` : ''}`
+      : '—';
+  const adversarialRaw = r.adversarial
+    ? `concentration = ${fmtN(r.adversarial.concentration)}`
+    : '—';
+
+  const multiplier = typeof r.multiplier === 'number' ? r.multiplier : 0;
+  const multColor = multiplier >= 0.7 ? '#3fb950' : multiplier >= 0.4 ? '#d29922' : '#f85149';
+
+  return `
+    <div style="margin-top:16px;padding-top:12px;border-top:1px solid #30363d">
+      <div style="font-size:13px;color:#c9d1d9;font-weight:600;margin-bottom:6px">
+        Robustness multiplier
+        <span style="color:${multColor};font-family:monospace;margin-left:6px">×${multiplier.toFixed(3)}</span>
+        <span style="font-size:11px;color:#6e7681;margin-left:6px">(geomean of 5 terms below)</span>
+      </div>
+      <table style="font-size:12px;border-collapse:collapse;min-width:480px">
+        <thead><tr style="color:#8b949e;border-bottom:1px solid #30363d">
+          <th style="text-align:left;padding:4px 8px">Term</th>
+          <th style="text-align:left;padding:4px 8px">Raw stat</th>
+          <th style="text-align:right;padding:4px 8px">Value</th>
+          <th style="text-align:right;padding:4px 8px">Score [0,1]</th>
+        </tr></thead>
+        <tbody>
+          ${row('MC-DD P95',   'shuffled-order DD', mcDdRaw,        r.mcDd?.term,       'Monte Carlo trade-order reshuffle p95 drawdown vs cap. Low live DD → high score.')}
+          ${row('Bootstrap',   'P10 / P50',         bootstrapRaw,   r.bootstrap?.term,  'Worst-10% bootstrapped net as share of median. Catches "3 lucky trades carry the year".')}
+          ${row('Random OOS',  'slice percentile',  randomOosRaw,   r.randomOos?.term,  'Actual WF-OOS metric located in null distribution of random 30% slices. In central band → full credit.')}
+          ${row('Param CoV',   'WF window drift',   paramCoVRaw,    r.paramCoV?.term,   'stdev / |mean| of winner params across walk-forward windows. Low drift → high score.')}
+          ${row('Adversarial', 'A/B 50/50 gap',     adversarialRaw, r.adversarial?.term,'Random 50/50 trade-list split; small A-vs-B gap = diffuse edge, large gap = concentrated.')}
+        </tbody>
+      </table>
+      <div style="font-size:11px;color:#6e7681;margin-top:6px">
+        score = base × freqFactor × <span style="color:${multColor}">${multiplier.toFixed(3)}</span>
+        <span style="margin-left:6px">(geomean; any single near-zero term drags the whole multiplier down)</span>
+      </div>
+    </div>`;
 }
 
 /**
