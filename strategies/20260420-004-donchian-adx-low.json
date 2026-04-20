@@ -1,0 +1,99 @@
+{
+  "name": "20260420-004-donchian-adx-low",
+  "description": "Community strategy #6 from research batch 2 — Quantified Strategies' BTC Donchian Breakout with counter-intuitive ADX<25 filter. Catches the START of new trends (breakouts FROM quiet markets) rather than chasing already-extended trending moves. Source: https://www.quantifiedstrategies.com/how-we-built-a-bitcoin-trend-following-strategy-using-chatgpt/ (Jul 2025). All lookback periods 5–100 days tested profitable; lookback=15 offered best risk/reward. 4h timeframe primary. Single-entry, single-filter, trend-following with ATR exits. Different hypothesis than pullback specs — uses donchianBreakout + adxFilter to test whether quiet-market breakouts produce better edge than trend-aligned ones.",
+
+  "regime": null,
+
+  "entries": {
+    "mode": "all",
+    "blocks": [
+      {
+        "block": "donchianBreakout",
+        "version": 1,
+        "instanceId": "main",
+        "params": {
+          "period": { "min": 10, "max": 25, "step": 1 }
+        }
+      }
+    ]
+  },
+
+  "filters": {
+    "mode": "all",
+    "blocks": [
+      {
+        "block": "adxFilter",
+        "version": 1,
+        "instanceId": "main",
+        "params": {
+          "adxLen": { "min": 10, "max": 20, "step": 1 },
+          "minAdx": { "value": 0 },
+          "maxAdx": { "min": 15, "max": 35, "step": 1 }
+        }
+      }
+    ]
+  },
+
+  "exits": {
+    "hardStop": {
+      "block": "atrHardStop",
+      "version": 1,
+      "instanceId": "main",
+      "params": {
+        "atrLen":         { "min": 10, "max": 20, "step": 1 },
+        "atrSL":          { "min": 1.5, "max": 3.0, "step": 0.25 },
+        "emergencySlPct": { "value": 15 }
+      }
+    },
+    "target": {
+      "block": "atrScaleOutTarget",
+      "version": 1,
+      "instanceId": "main",
+      "params": {
+        "atrLen":  { "min": 10, "max": 20, "step": 1 },
+        "tp1Mult": { "min": 2.0, "max": 3.5, "step": 0.25 },
+        "tp1Pct":  { "value": 40 },
+        "tp2Mult": { "min": 3.5, "max": 5.0, "step": 0.25 },
+        "tp2Pct":  { "value": 30 },
+        "tp3Mult": { "min": 5.0, "max": 8.0, "step": 0.5 },
+        "tp3Pct":  { "value": 30 },
+        "tp4Mult": { "value": 0.5 }, "tp4Pct": { "value": 0 },
+        "tp5Mult": { "value": 0.5 }, "tp5Pct": { "value": 0 },
+        "tp6Mult": { "value": 0.5 }, "tp6Pct": { "value": 0 }
+      }
+    },
+    "trail": {
+      "block": "structuralExit",
+      "version": 1,
+      "instanceId": "main",
+      "params": {
+        "stochLen":  { "min": 10, "max": 20, "step": 1 },
+        "stochSmth": { "min": 2, "max": 5, "step": 1 },
+        "rsiLen":    { "min": 10, "max": 20, "step": 1 },
+        "maxBars":   { "min": 30, "max": 100, "step": 10 }
+      }
+    }
+  },
+
+  "sizing": {
+    "block": "atrRisk",
+    "version": 1,
+    "instanceId": "main",
+    "params": {
+      "riskPct":           { "min": 0.5, "max": 1.5, "step": 0.1 },
+      "useInitialCapital": { "value": 0 }
+    }
+  },
+
+  "constraints": [],
+
+  "fitness": {
+    "weights": { "pf": 0.3, "dd": 0.25, "ret": 0.45 },
+    "caps":    { "pf": 4, "ret": 1.0 },
+    "gates":   { "minTradesPerWindow": 20, "worstRegimePfFloor": 0.9, "wfeMin": 0.4 },
+    "frequencyTarget": 40,
+    "robustness": { "enabled": true }
+  },
+
+  "walkForward": { "nWindows": 5, "scheme": "anchored" }
+}

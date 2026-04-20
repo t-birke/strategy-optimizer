@@ -22,6 +22,7 @@ import htfTrendFilter     from './filter/htf-trend-filter.js';
 import volatilityFloor    from './filter/volatility-floor.js';
 import volumeFilter       from './filter/volume-filter.js';
 import regimeGate         from './filter/regime-gate.js';
+import adxFilter          from './filter/adx-filter.js';
 
 // ── Regime ──────────────────────────────────────────────────
 import htfTrendRegime     from './regime/htf-trend-regime.js';
@@ -59,6 +60,7 @@ const BLOCKS = [
   volatilityFloor,
   volumeFilter,
   regimeGate,
+  adxFilter,
   // Regimes
   htfTrendRegime,
   volRegime,
